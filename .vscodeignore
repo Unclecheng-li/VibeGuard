@@ -1,8 +1,17 @@
 src/**
 tests/**
 node_modules/**
+out/**
 .vscode-test/**
+.vscode/**
+.github/**
+scripts/**
+.gitignore
 tsconfig.json
 *.map
+dist/**/*.map
 coverage/**
 VibeGuard-PRD.md
+package-lock.json
+action.yml
+*.vsix

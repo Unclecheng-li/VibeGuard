@@ -1,5 +1,5 @@
 name: "VibeGuard Security Scan"
-description: "Scan AI-generated code risks: hallucinated packages, hardcoded secrets, unsafe config, and lightweight SAST findings."
+description: "Scan AI-generated code risks: hallucinated packages, hardcoded secrets, unsafe config, lightweight SAST findings, and optional semantic gaps."
 author: "VibeGuard"
 inputs:
   path:
@@ -14,18 +14,62 @@ inputs:
     description: "Package verification mode: seed, remote, or off."
     required: false
     default: "seed"
+  mode:
+    description: "Scan mode: full-scan or ai-code-scan."
+    required: false
+    default: "full-scan"
+  ai_detection:
+    description: "AI code detection strategy for ai-code-scan: author, message, or aggressive."
+    required: false
+    default: "author"
+  base_ref:
+    description: "Optional base git ref/SHA for ai-code-scan."
+    required: false
+    default: ""
+  head_ref:
+    description: "Optional head git ref/SHA for ai-code-scan."
+    required: false
+    default: ""
   l2:
     description: "Enable lightweight L2 SAST rules."
     required: false
     default: "true"
+  l3:
+    description: "Enable local L3 semantic endpoint checks."
+    required: false
+    default: "false"
+  github_annotations:
+    description: "Emit GitHub workflow annotations for active findings."
+    required: false
+    default: "true"
+  sarif:
+    description: "Optional path for a SARIF report file."
+    required: false
+    default: ""
   ignore_rules:
     description: "Optional path to ignore-rules.yml."
+    required: false
+    default: ""
+  custom_rules:
+    description: "Optional path to custom VibeGuard YAML rules."
     required: false
     default: ""
   no_ignore:
     description: "Disable ignore-rules.yml processing."
     required: false
     default: "false"
+  package_index:
+    description: "Optional path to package-index.json."
+    required: false
+    default: ""
+  storage:
+    description: "Package storage mode: auto, json, or sqlite."
+    required: false
+    default: "auto"
+  sqlite_db:
+    description: "Optional path to packages.db when storage is sqlite."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -33,16 +77,43 @@ runs:
       shell: bash
       working-directory: ${{ github.action_path }}
       run: npm ci
-    - name: Compile VibeGuard
+    - name: Build VibeGuard
       shell: bash
       working-directory: ${{ github.action_path }}
-      run: npm run compile
+      run: npm run build
     - name: Run VibeGuard scan
       shell: bash
       run: |
         extra_args=()
+        if [ "${{ inputs.mode }}" != "full-scan" ]; then
+          extra_args+=("--mode" "${{ inputs.mode }}")
+        fi
+        extra_args+=("--ai-detection" "${{ inputs.ai_detection }}")
+        base_ref="${{ inputs.base_ref }}"
+        head_ref="${{ inputs.head_ref }}"
+        if [ -z "$base_ref" ]; then
+          base_ref="${{ github.event.pull_request.base.sha }}"
+        fi
+        if [ -z "$head_ref" ]; then
+          head_ref="${{ github.event.pull_request.head.sha }}"
+        fi
+        if [ -n "$base_ref" ]; then
+          extra_args+=("--base-ref" "$base_ref")
+        fi
+        if [ -n "$head_ref" ]; then
+          extra_args+=("--head-ref" "$head_ref")
+        fi
         if [ "${{ inputs.l2 }}" != "true" ]; then
           extra_args+=("--no-l2")
+        fi
+        if [ "${{ inputs.l3 }}" = "true" ]; then
+          extra_args+=("--l3")
+        fi
+        if [ "${{ inputs.github_annotations }}" = "true" ]; then
+          extra_args+=("--github-annotations")
+        fi
+        if [ -n "${{ inputs.sarif }}" ]; then
+          extra_args+=("--sarif" "${{ inputs.sarif }}")
         fi
         if [ "${{ inputs.no_ignore }}" = "true" ]; then
           extra_args+=("--no-ignore")
@@ -50,7 +121,17 @@ runs:
         if [ -n "${{ inputs.ignore_rules }}" ]; then
           extra_args+=("--ignore-rules" "${{ inputs.ignore_rules }}")
         fi
-        node "${{ github.action_path }}/out/src/cli.js" scan "${{ inputs.path }}" \
+        if [ -n "${{ inputs.custom_rules }}" ]; then
+          extra_args+=("--custom-rules" "${{ inputs.custom_rules }}")
+        fi
+        if [ -n "${{ inputs.package_index }}" ]; then
+          extra_args+=("--package-index" "${{ inputs.package_index }}")
+        fi
+        extra_args+=("--storage" "${{ inputs.storage }}")
+        if [ -n "${{ inputs.sqlite_db }}" ]; then
+          extra_args+=("--sqlite-db" "${{ inputs.sqlite_db }}")
+        fi
+        node "${{ github.action_path }}/dist/cli.js" scan "${{ inputs.path }}" \
           --fail-on "${{ inputs.fail_on }}" \
           --package-verification "${{ inputs.package_verification }}" \
           "${extra_args[@]}"

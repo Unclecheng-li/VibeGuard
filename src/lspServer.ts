@@ -11,9 +11,10 @@ import {
   type InitializeResult
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
+import { loadCustomRules } from "./customRules";
 import { defaultIgnoreRulesPath, loadIgnoreRules } from "./ignore";
-import { JsonPackageCache, defaultCachePath } from "./package/cache";
 import { PackageVerifier } from "./package/packageVerifier";
+import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
 import type { Finding, Severity } from "./types";
 
@@ -21,19 +22,24 @@ interface LspSettings {
   enabled: boolean;
   packageVerification: "off" | "seed" | "remote";
   enableL2: boolean;
+  enableL3: boolean;
+  customRules?: string[];
   ignoreRulesPath?: string;
 }
 
 const defaultSettings: LspSettings = {
   enabled: true,
   packageVerification: "seed",
-  enableL2: true
+  enableL2: true,
+  enableL3: false
 };
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
+const storage = createPackageStorage({ kind: "auto" });
 const verifier = new PackageVerifier({
-  cache: new JsonPackageCache(defaultCachePath())
+  cache: storage.cache,
+  packageIndex: storage.packageIndex
 });
 let settings = defaultSettings;
 
@@ -91,7 +97,9 @@ async function validateDocument(document: TextDocument): Promise<void> {
     {
       packageVerification: settings.packageVerification,
       includeSast: settings.enableL2,
+      includeL3: settings.enableL3,
       packageVerifier: verifier,
+      customRules: await loadCustomRules(settings.customRules ?? []),
       ignoreRules: await loadIgnoreRules(settings.ignoreRulesPath?.trim() || defaultIgnoreRulesPath())
     }
   );

@@ -71,6 +71,8 @@ const pythonStdlib = new Set([
   "xml"
 ]);
 
+const rustStdlib = new Set(["alloc", "core", "crate", "self", "std", "super"]);
+
 export function parsePackageReferences(filePath: string, text: string, languageId?: string): PackageReference[] {
   const normalized = filePath.replace(/\\/g, "/");
   const fileName = normalized.split("/").pop()?.toLowerCase() ?? "";
@@ -85,11 +87,29 @@ export function parsePackageReferences(filePath: string, text: string, languageI
   if (fileName === "pyproject.toml") {
     return parsePyproject(filePath, text);
   }
+  if (fileName === "cargo.toml") {
+    return parseCargoToml(filePath, text);
+  }
+  if (fileName === "go.mod") {
+    return parseGoMod(filePath, text);
+  }
+  if (fileName === "pom.xml") {
+    return parsePomXml(filePath, text);
+  }
+  if (fileName === "build.gradle" || fileName === "build.gradle.kts") {
+    return parseGradleBuild(filePath, text);
+  }
   if (["js", "jsx", "ts", "tsx", "mjs", "cjs"].includes(ext) || ["javascript", "typescript", "javascriptreact", "typescriptreact"].includes(languageId ?? "")) {
     return parseJavaScriptImports(filePath, text);
   }
   if (ext === "py" || languageId === "python") {
     return parsePythonImports(filePath, text);
+  }
+  if (ext === "rs" || languageId === "rust") {
+    return parseRustImports(filePath, text);
+  }
+  if (ext === "go" || languageId === "go") {
+    return parseGoImports(filePath, text);
   }
   return [];
 }
@@ -193,6 +213,164 @@ function parsePyproject(filePath: string, text: string): PackageReference[] {
   return dedupeReferences(references);
 }
 
+function parseCargoToml(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  let inDependencySection = false;
+  const lineRegex = /^.*$/gm;
+
+  for (const match of text.matchAll(lineRegex)) {
+    const line = match[0];
+    const lineStart = match.index ?? 0;
+    const stripped = stripTomlComment(line).trim();
+    if (!stripped) {
+      continue;
+    }
+    const section = stripped.match(/^\[([^\]]+)]$/)?.[1];
+    if (section) {
+      inDependencySection = /^(?:workspace\.)?(?:dependencies|dev-dependencies|build-dependencies)$/.test(section)
+        || /^target\.[^.]+(?:\.[^.]+)*\.(?:dependencies|dev-dependencies|build-dependencies)$/.test(section);
+      continue;
+    }
+    if (!inDependencySection) {
+      continue;
+    }
+
+    const dep = stripped.match(/^([A-Za-z0-9_-]+)\s*=/);
+    const packageName = dep?.[1];
+    if (!packageName) {
+      continue;
+    }
+    const column = line.indexOf(packageName);
+    references.push(
+      makeReference(filePath, text, "cargo", packageName, packageName, lineStart + Math.max(0, column), line, "manifest")
+    );
+  }
+
+  return dedupeReferences(references);
+}
+
+function parseRustImports(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const regexes = [
+    /^\s*(?:pub\s+)?use\s+([A-Za-z_][A-Za-z0-9_]*)::/gm,
+    /^\s*extern\s+crate\s+([A-Za-z_][A-Za-z0-9_-]*)/gm
+  ];
+
+  for (const regex of regexes) {
+    for (const match of text.matchAll(regex)) {
+      const packageName = normalizeRustCrate(match[1] ?? "");
+      if (!packageName) {
+        continue;
+      }
+      references.push(makeReference(filePath, text, "cargo", packageName, match[1] ?? "", match.index ?? 0, match[0], "import"));
+    }
+  }
+
+  return dedupeReferences(references);
+}
+
+function parseGoMod(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const lineRegex = /^\s*require\s+([^\s()]+)\s+v[^\s]+/gm;
+  const blockRegex = /^\s*require\s*\(\s*([\s\S]*?)^\s*\)/gm;
+
+  for (const match of text.matchAll(lineRegex)) {
+    addGoReference(references, filePath, text, match[1] ?? "", match.index ?? 0, match[0], "manifest", false);
+  }
+
+  for (const block of text.matchAll(blockRegex)) {
+    const blockStart = block.index ?? 0;
+    const body = block[1] ?? "";
+    const entryRegex = /^\s*([^\s()]+)\s+v[^\s/]+.*$/gm;
+    for (const entry of body.matchAll(entryRegex)) {
+      addGoReference(
+        references,
+        filePath,
+        text,
+        entry[1] ?? "",
+        blockStart + (block[0].indexOf(entry[0]) ?? 0),
+        entry[0],
+        "manifest",
+        false
+      );
+    }
+  }
+
+  return dedupeReferences(references);
+}
+
+function parseGoImports(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const importBlockRegex = /^\s*import\s*\(\s*([\s\S]*?)^\s*\)/gm;
+  const singleImportRegex = /^\s*import\s+(?:[._A-Za-z0-9]+\s+)?["']([^"']+)["']/gm;
+
+  for (const match of text.matchAll(singleImportRegex)) {
+    addGoReference(references, filePath, text, match[1] ?? "", match.index ?? 0, match[0], "import", true);
+  }
+
+  for (const block of text.matchAll(importBlockRegex)) {
+    const blockStart = block.index ?? 0;
+    const body = block[1] ?? "";
+    const stringRegex = /(?:[._A-Za-z0-9]+\s+)?["']([^"']+)["']/g;
+    for (const entry of body.matchAll(stringRegex)) {
+      addGoReference(
+        references,
+        filePath,
+        text,
+        entry[1] ?? "",
+        blockStart + (block[0].indexOf(entry[0]) ?? 0),
+        entry[0],
+        "import",
+        true
+      );
+    }
+  }
+
+  return dedupeReferences(references);
+}
+
+function parsePomXml(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const dependencyRegex = /<dependency\b[\s\S]*?<\/dependency>/gi;
+  for (const match of text.matchAll(dependencyRegex)) {
+    const block = match[0];
+    const groupId = readXmlTag(block, "groupId");
+    const artifactId = readXmlTag(block, "artifactId");
+    if (!groupId || !artifactId || groupId.includes("${") || artifactId.includes("${")) {
+      continue;
+    }
+    const packageName = normalizeMavenCoordinate(groupId, artifactId);
+    const artifactOffset = block.indexOf(artifactId);
+    references.push(
+      makeReference(
+        filePath,
+        text,
+        "maven",
+        packageName,
+        artifactId,
+        (match.index ?? 0) + Math.max(0, artifactOffset),
+        artifactId,
+        "manifest"
+      )
+    );
+  }
+  return dedupeReferences(references);
+}
+
+function parseGradleBuild(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const dependencyRegex =
+    /\b(?:api|annotationProcessor|classpath|compileOnly|implementation|runtimeOnly|testImplementation|testRuntimeOnly)\s*(?:\(\s*)?["']([^:"'\s]+):([^:"'\s]+)(?::[^"']+)?["']/g;
+
+  for (const match of text.matchAll(dependencyRegex)) {
+    const packageName = normalizeMavenCoordinate(match[1] ?? "", match[2] ?? "");
+    const coordinateIndex = (match.index ?? 0) + Math.max(0, match[0].indexOf(match[1] ?? ""));
+    references.push(makeReference(filePath, text, "maven", packageName, packageName, coordinateIndex, packageName, "manifest"));
+  }
+
+  return dedupeReferences(references);
+}
+
 function addPythonReference(
   references: PackageReference[],
   filePath: string,
@@ -207,6 +385,23 @@ function addPythonReference(
     return;
   }
   references.push(makeReference(filePath, text, "pypi", packageName, rawModule, index, evidence, source));
+}
+
+function addGoReference(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  rawModule: string,
+  index: number,
+  evidence: string,
+  source: PackageReference["source"],
+  inferRoot: boolean
+): void {
+  const packageName = normalizeGoModule(rawModule, inferRoot);
+  if (!packageName) {
+    return;
+  }
+  references.push(makeReference(filePath, text, "gomod", packageName, rawModule, index, evidence, source));
 }
 
 function makeReference(
@@ -264,6 +459,36 @@ function normalizePypiPackage(raw: string): string | undefined {
   return packageName;
 }
 
+function normalizeRustCrate(raw: string): string | undefined {
+  const crateName = raw.trim();
+  if (!crateName || rustStdlib.has(crateName)) {
+    return undefined;
+  }
+  return crateName;
+}
+
+function normalizeGoModule(raw: string, inferRoot: boolean): string | undefined {
+  const modulePath = raw.trim();
+  if (!modulePath || modulePath.startsWith(".") || !modulePath.split("/")[0]?.includes(".")) {
+    return undefined;
+  }
+  if (!inferRoot) {
+    return modulePath;
+  }
+  const parts = modulePath.split("/");
+  if (parts[0] === "github.com" || parts[0] === "gitlab.com" || parts[0] === "bitbucket.org") {
+    return parts.length >= 3 ? parts.slice(0, 3).join("/") : modulePath;
+  }
+  if ((parts[0] === "golang.org" || parts[0] === "google.golang.org") && parts[1] === "x") {
+    return parts.length >= 3 ? parts.slice(0, 3).join("/") : modulePath;
+  }
+  return parts.length >= 2 ? parts.slice(0, 2).join("/") : modulePath;
+}
+
+function normalizeMavenCoordinate(groupId: string, artifactId: string): string {
+  return `${groupId.trim()}:${artifactId.trim()}`;
+}
+
 function dedupeReferences(references: PackageReference[]): PackageReference[] {
   const seen = new Set<string>();
   return references.filter((reference) => {
@@ -278,4 +503,25 @@ function dedupeReferences(references: PackageReference[]): PackageReference[] {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripTomlComment(line: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (char === '"' && !inSingle && line[index - 1] !== "\\") {
+      inDouble = !inDouble;
+    } else if (char === "#" && !inSingle && !inDouble) {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+function readXmlTag(block: string, tagName: string): string | undefined {
+  const match = new RegExp(`<${tagName}>\\s*([^<]+?)\\s*</${tagName}>`, "i").exec(block);
+  return match?.[1]?.trim();
 }

@@ -5,12 +5,16 @@
   "version": "0.1.0",
   "publisher": "vibeguard",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vibeguard/vibeguard.git"
+  },
   "private": true,
   "type": "commonjs",
-  "main": "./out/src/extension.js",
+  "main": "./dist/extension.js",
   "bin": {
-    "vibeguard": "./out/src/cli.js",
-    "vibeguard-lsp": "./out/src/lspServer.js"
+    "vibeguard": "./dist/cli.js",
+    "vibeguard-lsp": "./dist/lspServer.js"
   },
   "engines": {
     "vscode": "^1.92.0"
@@ -20,10 +24,14 @@
     "Programming Languages",
     "Security"
   ],
+  "extensionKind": [
+    "workspace"
+  ],
   "activationEvents": [
     "onStartupFinished",
     "onCommand:vibeguard.scanCurrentFile",
     "onCommand:vibeguard.scanWorkspace",
+    "onCommand:vibeguard.applyFix",
     "onView:vibeguardFindings"
   ],
   "contributes": {
@@ -63,6 +71,10 @@
       {
         "command": "vibeguard.ignorePackage",
         "title": "VibeGuard: Ignore Package"
+      },
+      {
+        "command": "vibeguard.applyFix",
+        "title": "VibeGuard: Apply Fix"
       }
     ],
     "menus": {
@@ -122,6 +134,19 @@
           "default": true,
           "description": "Enable lightweight asynchronous SAST rules for SQL injection, XSS, SSRF, path traversal, unsafe deserialization, and command injection."
         },
+        "vibeguard.enableL3": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable local semantic security checks for endpoints missing authentication, rate limiting, validation, or output encoding."
+        },
+        "vibeguard.customRules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Paths to custom VibeGuard YAML rule files. Relative paths resolve from the workspace folder."
+        },
         "vibeguard.showCriticalPopups": {
           "type": "boolean",
           "default": true,
@@ -154,13 +179,18 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "build": "node scripts/build.js",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node --test \"out/tests/**/*.test.js\"",
-    "lint": "tsc --noEmit -p ./"
+    "lint": "tsc --noEmit -p ./",
+    "vscode:prepublish": "npm run build",
+    "package:vsix": "vsce package --out vibeguard-0.1.0.vsix"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.92.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
     "typescript": "^5.5.4"
   },
   "dependencies": {

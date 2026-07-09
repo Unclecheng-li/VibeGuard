@@ -1,4 +1,4 @@
-import type { DetectionLayer, Finding, FindingType, Severity } from "./types";
+import type { CodeFix, DetectionLayer, Finding, FindingType, Severity } from "./types";
 
 export interface Position {
   line: number;
@@ -15,6 +15,7 @@ export interface FindingInput {
   text: string;
   evidence: string;
   suggestion?: string;
+  fix?: CodeFix;
   detectionLayer: DetectionLayer;
   ruleId: string;
   timestamp: number;
@@ -81,6 +82,7 @@ export function createFinding(input: FindingInput): Finding {
     endColumn: end.column,
     evidence: normalizedEvidence,
     suggestion: input.suggestion,
+    fix: input.fix,
     detection_layer: input.detectionLayer,
     detection_rule: input.ruleId,
     timestamp: input.timestamp,
@@ -103,7 +105,7 @@ export function compactEvidence(value: string, maxLength = 160): string {
   if (compact.length <= maxLength) {
     return compact;
   }
-  return `${compact.slice(0, maxLength - 1)}…`;
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 export function lineTextAt(text: string, index: number): string {
@@ -136,7 +138,7 @@ export function redactSecret(value: string): string {
   if (trimmed.length <= 12) {
     return "[redacted]";
   }
-  return `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}`;
+  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
 }
 
 export function isEnvReference(value: string): boolean {

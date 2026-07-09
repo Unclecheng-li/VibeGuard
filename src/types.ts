@@ -66,7 +66,10 @@ export interface ScanOptions {
   };
   packageVerification?: "off" | "seed" | "remote";
   includeSast?: boolean;
+  includeL3?: boolean;
   packageVerifier?: PackageVerifierLike;
+  l3Analyzer?: L3AnalyzerLike;
+  customRules?: CustomRuleLike[];
   ignoreRules?: IgnoreRules;
   now?: number;
 }
@@ -91,7 +94,7 @@ export interface PackageResolution {
   registry: PackageRegistry;
   packageName: string;
   exists: boolean | null;
-  source: "seed" | "cache" | "remote" | "unverified";
+  source: "seed" | "index" | "cache" | "remote" | "unverified";
   lastVerified: number;
   similarPackages?: string[];
   message?: string;
@@ -99,6 +102,34 @@ export interface PackageResolution {
 
 export interface PackageVerifierLike {
   verify(reference: PackageReference, mode: "seed" | "remote"): Promise<PackageResolution>;
+}
+
+export interface L3AnalyzerLike {
+  analyze(source: SourceFile, timestamp: number): Promise<Finding[]> | Finding[];
+}
+
+export interface CustomRuleLike {
+  id: string;
+  pattern: string;
+  flags?: string;
+  severity: Severity;
+  type: FindingType;
+  message: string;
+  suggestion?: string;
+  detectionLayer: DetectionLayer;
+  languages?: string[];
+}
+
+export interface PackageIndexEntry {
+  registry: PackageRegistry;
+  coverage: "partial" | "full";
+  updatedAt: number;
+  packageCount: number;
+}
+
+export interface PackageNameIndexLike {
+  get(registry: PackageRegistry, packageName: string): Promise<boolean | undefined>;
+  coverage(registry: PackageRegistry): Promise<"partial" | "full" | undefined>;
 }
 
 export interface IgnoreRules {

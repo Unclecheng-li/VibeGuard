@@ -1,5 +1,6 @@
 import path from "path";
 import * as vscode from "vscode";
+import { loadCustomRules } from "./customRules";
 import {
   appendIgnoreRule,
   defaultIgnoreRulesPath,
@@ -7,8 +8,8 @@ import {
   expandHome,
   loadIgnoreRules
 } from "./ignore";
-import { JsonPackageCache } from "./package/cache";
 import { PackageVerifier } from "./package/packageVerifier";
+import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
 import type { Finding, Severity } from "./types";
 
@@ -18,6 +19,12 @@ const supportedLanguageIds = new Set([
   "typescript",
   "typescriptreact",
   "python",
+  "rust",
+  "go",
+  "java",
+  "kotlin",
+  "xml",
+  "groovy",
   "json",
   "toml"
 ]);
@@ -30,6 +37,21 @@ let packageVerifier: PackageVerifier;
 const timers = new Map<string, NodeJS.Timeout>();
 const findingsByUri = new Map<string, Finding[]>();
 const popupSeen = new Set<string>();
+const codeActionSelector: vscode.DocumentSelector = [
+  { scheme: "file", language: "javascript" },
+  { scheme: "file", language: "javascriptreact" },
+  { scheme: "file", language: "typescript" },
+  { scheme: "file", language: "typescriptreact" },
+  { scheme: "file", language: "python" },
+  { scheme: "file", language: "rust" },
+  { scheme: "file", language: "go" },
+  { scheme: "file", language: "java" },
+  { scheme: "file", language: "kotlin" },
+  { scheme: "file", language: "xml" },
+  { scheme: "file", language: "groovy" },
+  { scheme: "file", language: "json" },
+  { scheme: "file", language: "toml" }
+];
 
 export function activate(context: vscode.ExtensionContext): void {
   diagnostics = vscode.languages.createDiagnosticCollection("vibeguard");
@@ -42,8 +64,13 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.show();
 
   const cachePath = path.join(context.globalStorageUri.fsPath, "package-cache.json");
+  const storage = createPackageStorage({
+    kind: "auto",
+    cachePath
+  });
   packageVerifier = new PackageVerifier({
-    cache: new JsonPackageCache(cachePath)
+    cache: storage.cache,
+    packageIndex: storage.packageIndex
   });
 
   context.subscriptions.push(
@@ -69,6 +96,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("vibeguard.ignorePackage", (nodeOrFinding: TreeNode | Finding) =>
       ignorePackage(resolveFindingArgument(nodeOrFinding))
     ),
+    vscode.commands.registerCommand("vibeguard.applyFix", (finding: Finding) => applyFindingFix(finding)),
+    vscode.languages.registerCodeActionsProvider(codeActionSelector, new VibeGuardCodeActionProvider(), {
+      providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]
+    }),
     vscode.workspace.onDidOpenTextDocument((document) => scheduleScan(document, 0)),
     vscode.workspace.onDidChangeTextDocument((event) => {
       if (configuration().get<boolean>("scanOnChange", true)) {
@@ -110,7 +141,7 @@ async function scanCurrentFile(): Promise<void> {
 
 async function scanWorkspace(): Promise<void> {
   const files = await vscode.workspace.findFiles(
-    "**/*.{js,jsx,ts,tsx,mjs,cjs,py,json,toml,txt}",
+    "**/*.{js,jsx,ts,tsx,mjs,cjs,py,rs,go,java,kt,kts,json,toml,xml,gradle,txt}",
     "**/{node_modules,.git,out,dist,build,coverage}/**",
     500
   );
@@ -197,7 +228,9 @@ async function scanDocument(document: vscode.TextDocument): Promise<void> {
 
   const packageVerification = configuration().get<"off" | "seed" | "remote">("packageVerification", "seed");
   const enableL2 = configuration().get<boolean>("enableL2", true);
+  const enableL3 = configuration().get<boolean>("enableL3", false);
   const ignoreRules = await loadIgnoreRules(ignoreRulesPath());
+  const customRules = await loadConfiguredCustomRules(document);
   const result = await scanSourceFile(
     {
       filePath: document.uri.fsPath,
@@ -207,7 +240,9 @@ async function scanDocument(document: vscode.TextDocument): Promise<void> {
     {
       packageVerification,
       includeSast: enableL2,
+      includeL3: enableL3,
       packageVerifier,
+      customRules,
       ignoreRules
     }
   );
@@ -265,20 +300,7 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
   const actions = replace ? [replace, "Ignore", "Manage Ignore Rules"] : ["Ignore", "Manage Ignore Rules"];
   void vscode.window.showWarningMessage(`VibeGuard: ${critical.message}`, ...actions).then(async (choice) => {
     if (choice === replace && critical.fix) {
-      const edit = new vscode.WorkspaceEdit();
-      for (const textEdit of critical.fix.edits) {
-        edit.replace(
-          document.uri,
-          new vscode.Range(
-            textEdit.startLine - 1,
-            textEdit.startColumn - 1,
-            textEdit.endLine - 1,
-            textEdit.endColumn - 1
-          ),
-          textEdit.newText
-        );
-      }
-      await vscode.workspace.applyEdit(edit);
+      await applyFindingFix(critical);
     } else if (choice === "Ignore") {
       await ignoreFinding(critical, "line");
       await scanDocument(document);
@@ -286,6 +308,16 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
       await openIgnoreRules();
     }
   });
+}
+
+async function applyFindingFix(finding: Finding | undefined): Promise<void> {
+  if (!finding?.fix) {
+    return;
+  }
+  const uri = vscode.Uri.file(finding.file);
+  await vscode.workspace.applyEdit(workspaceEditForFix(uri, finding));
+  const document = await vscode.workspace.openTextDocument(uri);
+  await scanDocument(document);
 }
 
 function updateStatus(): void {
@@ -313,6 +345,37 @@ function allCurrentFindings(): Finding[] {
     };
     return severityOrder[a.severity] - severityOrder[b.severity] || a.file.localeCompare(b.file) || a.line - b.line;
   });
+}
+
+function findingsForDocument(document: vscode.TextDocument): Finding[] {
+  return findingsByUri.get(document.uri.toString()) ?? [];
+}
+
+function findMatchingFinding(document: vscode.TextDocument, diagnostic: vscode.Diagnostic): Finding | undefined {
+  const diagnosticCode = typeof diagnostic.code === "string" ? diagnostic.code : String(diagnostic.code ?? "");
+  return findingsForDocument(document).find((finding) => {
+    if (finding.dismissed || finding.detection_rule !== diagnosticCode) {
+      return false;
+    }
+    return findingRange(finding).intersection(diagnostic.range) !== undefined;
+  });
+}
+
+function workspaceEditForFix(uri: vscode.Uri, finding: Finding): vscode.WorkspaceEdit {
+  const edit = new vscode.WorkspaceEdit();
+  for (const textEdit of finding.fix?.edits ?? []) {
+    edit.replace(
+      uri,
+      new vscode.Range(
+        textEdit.startLine - 1,
+        textEdit.startColumn - 1,
+        textEdit.endLine - 1,
+        textEdit.endColumn - 1
+      ),
+      textEdit.newText
+    );
+  }
+  return edit;
 }
 
 async function ignoreFinding(finding: Finding | undefined, scope: "line" | "file" | "global"): Promise<void> {
@@ -379,6 +442,28 @@ function ignoreRulesPath(): string {
   return configured ? expandHome(configured) : defaultIgnoreRulesPath();
 }
 
+async function loadConfiguredCustomRules(document: vscode.TextDocument): Promise<Awaited<ReturnType<typeof loadCustomRules>>> {
+  const configured = configuration().get<string[]>("customRules", []);
+  if (configured.length === 0) {
+    return [];
+  }
+  try {
+    return await loadCustomRules(configured.map((item) => resolveWorkspacePath(item, document)));
+  } catch (error) {
+    output.appendLine(`Custom rules error: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+function resolveWorkspacePath(inputPath: string, document: vscode.TextDocument): string {
+  const expanded = expandHome(inputPath);
+  if (path.isAbsolute(expanded)) {
+    return expanded;
+  }
+  const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+  return path.resolve(folder?.uri.fsPath ?? path.dirname(document.uri.fsPath), expanded);
+}
+
 function isSupportedDocument(document: vscode.TextDocument): boolean {
   if (document.uri.scheme !== "file" && document.uri.scheme !== "untitled") {
     return false;
@@ -386,7 +471,7 @@ function isSupportedDocument(document: vscode.TextDocument): boolean {
   if (supportedLanguageIds.has(document.languageId)) {
     return true;
   }
-  return /(?:package\.json|requirements\.txt|pyproject\.toml)$/i.test(document.fileName);
+  return /(?:package\.json|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle|build\.gradle\.kts)$/i.test(document.fileName);
 }
 
 function configuration(): vscode.WorkspaceConfiguration {
@@ -471,4 +556,47 @@ function severityIcon(severity: Severity): vscode.ThemeIcon {
 
 function capitalize(value: string): string {
   return value.slice(0, 1).toUpperCase() + value.slice(1);
+}
+
+class VibeGuardCodeActionProvider implements vscode.CodeActionProvider {
+  provideCodeActions(
+    document: vscode.TextDocument,
+    _range: vscode.Range,
+    context: vscode.CodeActionContext
+  ): vscode.CodeAction[] {
+    const actions: vscode.CodeAction[] = [];
+    for (const diagnostic of context.diagnostics.filter((item) => item.source === "VibeGuard")) {
+      const finding = findMatchingFinding(document, diagnostic);
+      if (!finding) {
+        continue;
+      }
+
+      if (finding.fix) {
+        const action = new vscode.CodeAction(`Apply VibeGuard fix: ${finding.fix.description}`, vscode.CodeActionKind.QuickFix);
+        action.diagnostics = [diagnostic];
+        action.isPreferred = true;
+        action.edit = workspaceEditForFix(document.uri, finding);
+        actions.push(action);
+      }
+
+      actions.push(commandAction("Ignore this VibeGuard finding", "vibeguard.ignoreFinding", finding, diagnostic));
+      actions.push(commandAction("Ignore this rule in this file", "vibeguard.ignoreRuleInFile", finding, diagnostic));
+      actions.push(commandAction("Ignore this rule globally", "vibeguard.ignoreRuleGlobally", finding, diagnostic));
+      if (finding.type === "hallucinated_package") {
+        actions.push(commandAction(`Ignore package "${finding.evidence}"`, "vibeguard.ignorePackage", finding, diagnostic));
+      }
+    }
+    return actions;
+  }
+}
+
+function commandAction(title: string, command: string, finding: Finding, diagnostic: vscode.Diagnostic): vscode.CodeAction {
+  const action = new vscode.CodeAction(title, vscode.CodeActionKind.QuickFix);
+  action.diagnostics = [diagnostic];
+  action.command = {
+    command,
+    title,
+    arguments: [finding]
+  };
+  return action;
 }

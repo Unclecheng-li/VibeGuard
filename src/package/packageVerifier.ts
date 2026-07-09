@@ -1,25 +1,41 @@
-import type { PackageReference, PackageResolution, PackageVerifierLike } from "../types";
+import type { PackageNameIndexLike, PackageReference, PackageResolution, PackageVerifierLike } from "../types";
 import { MemoryPackageCache, type PackageCacheStore } from "./cache";
 import { seedExists, seedSuggestions } from "./seedCatalog";
 
 export interface PackageVerifierOptions {
   cache?: PackageCacheStore;
+  packageIndex?: PackageNameIndexLike;
   timeoutMs?: number;
   ttlMs?: number;
 }
 
 export class PackageVerifier implements PackageVerifierLike {
   private readonly cache: PackageCacheStore;
+  private readonly packageIndex?: PackageNameIndexLike;
   private readonly timeoutMs: number;
   private readonly ttlMs: number;
 
   constructor(options: PackageVerifierOptions = {}) {
     this.cache = options.cache ?? new MemoryPackageCache();
+    this.packageIndex = options.packageIndex;
     this.timeoutMs = options.timeoutMs ?? 3000;
     this.ttlMs = options.ttlMs ?? 24 * 60 * 60 * 1000;
   }
 
   async verify(reference: PackageReference, mode: "seed" | "remote"): Promise<PackageResolution> {
+    const indexed = await this.packageIndex?.get(reference.registry, reference.packageName);
+    if (indexed !== undefined) {
+      return {
+        registry: reference.registry,
+        packageName: reference.packageName,
+        exists: indexed,
+        source: "index",
+        lastVerified: Date.now(),
+        similarPackages: indexed ? [] : seedSuggestions(reference.registry, reference.packageName),
+        message: indexed ? undefined : "Package was absent from a full local package index."
+      };
+    }
+
     const seeded = seedExists(reference.registry, reference.packageName);
     if (seeded !== undefined) {
       return {

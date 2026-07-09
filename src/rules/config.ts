@@ -7,6 +7,7 @@ interface ConfigRule {
   severity: Severity;
   message: string;
   suggestion: string;
+  replacement?: (evidence: string) => string;
 }
 
 const configRules: ConfigRule[] = [
@@ -15,28 +16,32 @@ const configRules: ConfigRule[] = [
     regex: /\bDEBUG\s*=\s*True\b/g,
     severity: "high",
     message: "Django/Flask debug mode is enabled.",
-    suggestion: "Disable debug mode in production and gate it behind an environment variable."
+    suggestion: "Disable debug mode in production and gate it behind an environment variable.",
+    replacement: (evidence) => evidence.replace(/\bTrue\b/, "False")
   },
   {
     id: "insecure_config_app_debug_true",
     regex: /\bapp\.debug\s*=\s*(?:True|true)\b/g,
     severity: "high",
     message: "Application debug mode is enabled.",
-    suggestion: "Disable debug mode outside local development."
+    suggestion: "Disable debug mode outside local development.",
+    replacement: (evidence) => evidence.replace(/\b(?:True|true)\b/, evidence.includes("True") ? "False" : "false")
   },
   {
     id: "insecure_config_allowed_hosts_wildcard",
     regex: /\bALLOWED_HOSTS\s*=\s*\[\s*["']\*["']\s*\]/g,
     severity: "high",
     message: "Django ALLOWED_HOSTS allows every host.",
-    suggestion: "Set ALLOWED_HOSTS to the exact production hostnames."
+    suggestion: "Set ALLOWED_HOSTS to the exact production hostnames.",
+    replacement: () => "ALLOWED_HOSTS = []"
   },
   {
     id: "insecure_config_cors_allow_all",
     regex: /\b(?:CORS_ALLOW_ALL|CORS_ALLOW_ALL_ORIGINS)\s*=\s*True\b/g,
     severity: "high",
     message: "CORS is configured to allow every origin.",
-    suggestion: "Restrict CORS to trusted origins."
+    suggestion: "Restrict CORS to trusted origins.",
+    replacement: (evidence) => evidence.replace(/\bTrue\b/, "False")
   },
   {
     id: "insecure_config_acao_wildcard",
@@ -50,7 +55,8 @@ const configRules: ConfigRule[] = [
     regex: /\bDANGEROUSLY_DISABLE_HOST_CHECK\s*=\s*(?:true|1)\b/gi,
     severity: "high",
     message: "Host header checks are disabled.",
-    suggestion: "Remove DANGEROUSLY_DISABLE_HOST_CHECK and configure trusted hosts explicitly."
+    suggestion: "Remove DANGEROUSLY_DISABLE_HOST_CHECK and configure trusted hosts explicitly.",
+    replacement: (evidence) => evidence.replace(/\b(?:true|1)\b/i, "false")
   },
   {
     id: "insecure_config_csrf_exempt",
@@ -71,7 +77,8 @@ const configRules: ConfigRule[] = [
     regex: /\bsecurity\.disable\s*=\s*true\b/gi,
     severity: "high",
     message: "Spring security appears to be disabled.",
-    suggestion: "Enable Spring Security and use environment-specific test overrides if needed."
+    suggestion: "Enable Spring Security and use environment-specific test overrides if needed.",
+    replacement: (evidence) => evidence.replace(/\btrue\b/i, "false")
   },
   {
     id: "insecure_config_cross_origin_wildcard",
@@ -116,22 +123,38 @@ export function detectInsecureConfig(text: string, filePath: string, timestamp: 
     rule.regex.lastIndex = 0;
     for (const match of text.matchAll(rule.regex)) {
       const index = match.index ?? 0;
-      findings.push(
-        createFinding({
-          type: "insecure_config",
-          severity: rule.severity,
-          message: rule.message,
-          file: filePath,
-          index,
-          endIndex: index + match[0].length,
-          text,
-          evidence: match[0],
-          suggestion: rule.suggestion,
-          detectionLayer: "L1",
-          ruleId: rule.id,
-          timestamp
-        })
-      );
+      const replacement = rule.replacement?.(match[0]);
+      const finding = createFinding({
+        type: "insecure_config",
+        severity: rule.severity,
+        message: rule.message,
+        file: filePath,
+        index,
+        endIndex: index + match[0].length,
+        text,
+        evidence: match[0],
+        suggestion: rule.suggestion,
+        detectionLayer: "L1",
+        ruleId: rule.id,
+        timestamp
+      });
+
+      if (replacement && finding.endLine !== undefined && finding.endColumn !== undefined) {
+        finding.fix = {
+          description: `Replace with ${replacement}`,
+          edits: [
+            {
+              startLine: finding.line,
+              startColumn: finding.column,
+              endLine: finding.endLine,
+              endColumn: finding.endColumn,
+              newText: replacement
+            }
+          ]
+        };
+      }
+
+      findings.push(finding);
     }
   }
   return findings;
