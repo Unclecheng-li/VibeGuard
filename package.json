@@ -1,0 +1,172 @@
+{
+  "name": "vibeguard",
+  "displayName": "VibeGuard",
+  "description": "AI-generated code security scanner for hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes.",
+  "version": "0.1.0",
+  "publisher": "vibeguard",
+  "license": "MIT",
+  "private": true,
+  "type": "commonjs",
+  "main": "./out/src/extension.js",
+  "bin": {
+    "vibeguard": "./out/src/cli.js",
+    "vibeguard-lsp": "./out/src/lspServer.js"
+  },
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages",
+    "Security"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:vibeguard.scanCurrentFile",
+    "onCommand:vibeguard.scanWorkspace",
+    "onView:vibeguardFindings"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "vibeguard.scanCurrentFile",
+        "title": "VibeGuard: Scan Current File"
+      },
+      {
+        "command": "vibeguard.scanWorkspace",
+        "title": "VibeGuard: Scan Workspace"
+      },
+      {
+        "command": "vibeguard.clearFindings",
+        "title": "VibeGuard: Clear Findings"
+      },
+      {
+        "command": "vibeguard.openReport",
+        "title": "VibeGuard: Open Findings Report"
+      },
+      {
+        "command": "vibeguard.openIgnoreRules",
+        "title": "VibeGuard: Open Ignore Rules"
+      },
+      {
+        "command": "vibeguard.ignoreFinding",
+        "title": "VibeGuard: Ignore This Finding"
+      },
+      {
+        "command": "vibeguard.ignoreRuleInFile",
+        "title": "VibeGuard: Ignore Rule in This File"
+      },
+      {
+        "command": "vibeguard.ignoreRuleGlobally",
+        "title": "VibeGuard: Ignore Rule Globally"
+      },
+      {
+        "command": "vibeguard.ignorePackage",
+        "title": "VibeGuard: Ignore Package"
+      }
+    ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "vibeguard.ignoreFinding",
+          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "group": "inline"
+        },
+        {
+          "command": "vibeguard.ignoreRuleInFile",
+          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "group": "navigation"
+        },
+        {
+          "command": "vibeguard.ignoreRuleGlobally",
+          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "group": "navigation"
+        },
+        {
+          "command": "vibeguard.ignorePackage",
+          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "VibeGuard",
+      "properties": {
+        "vibeguard.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable VibeGuard security scanning."
+        },
+        "vibeguard.scanOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan supported documents shortly after edits."
+        },
+        "vibeguard.scanOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan supported documents when they are saved."
+        },
+        "vibeguard.packageVerification": {
+          "type": "string",
+          "enum": [
+            "seed",
+            "remote",
+            "off"
+          ],
+          "default": "seed",
+          "description": "How VibeGuard verifies package names. Seed mode is instant and offline; remote mode also checks npm/PyPI registries."
+        },
+        "vibeguard.enableL2": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable lightweight asynchronous SAST rules for SQL injection, XSS, SSRF, path traversal, unsafe deserialization, and command injection."
+        },
+        "vibeguard.showCriticalPopups": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show warning popups for newly detected critical findings."
+        },
+        "vibeguard.ignoreRulesPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to ignore-rules.yml. Defaults to ~/.vibeguard/ignore-rules.yml."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vibeguard",
+          "title": "VibeGuard",
+          "icon": "media/vibeguard.svg"
+        }
+      ]
+    },
+    "views": {
+      "vibeguard": [
+        {
+          "id": "vibeguardFindings",
+          "name": "Findings"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test \"out/tests/**/*.test.js\"",
+    "lint": "tsc --noEmit -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.92.0",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "minimatch": "^10.2.5",
+    "vscode-languageserver": "^10.1.0",
+    "vscode-languageserver-textdocument": "^1.0.12",
+    "yaml": "^2.9.0"
+  }
+}

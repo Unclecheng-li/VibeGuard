@@ -1,0 +1,8 @@
+src/**
+tests/**
+node_modules/**
+.vscode-test/**
+tsconfig.json
+*.map
+coverage/**
+VibeGuard-PRD.md

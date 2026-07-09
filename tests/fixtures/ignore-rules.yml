@@ -1,0 +1,8 @@
+ignore:
+  - package: "react-virtualized-auto-sizer"
+    registry: "npm"
+    reason: "fixture private package"
+
+  - rule: "insecure_config_debug_true"
+    path: "**/scanner.test.ts"
+    reason: "fixture test debug setting"

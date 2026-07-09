@@ -1,0 +1,56 @@
+name: "VibeGuard Security Scan"
+description: "Scan AI-generated code risks: hallucinated packages, hardcoded secrets, unsafe config, and lightweight SAST findings."
+author: "VibeGuard"
+inputs:
+  path:
+    description: "Path to scan inside the checked-out repository."
+    required: false
+    default: "."
+  fail_on:
+    description: "Minimum severity that fails the action: critical, high, medium, low, info, or none."
+    required: false
+    default: "critical"
+  package_verification:
+    description: "Package verification mode: seed, remote, or off."
+    required: false
+    default: "seed"
+  l2:
+    description: "Enable lightweight L2 SAST rules."
+    required: false
+    default: "true"
+  ignore_rules:
+    description: "Optional path to ignore-rules.yml."
+    required: false
+    default: ""
+  no_ignore:
+    description: "Disable ignore-rules.yml processing."
+    required: false
+    default: "false"
+runs:
+  using: "composite"
+  steps:
+    - name: Install VibeGuard dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm ci
+    - name: Compile VibeGuard
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm run compile
+    - name: Run VibeGuard scan
+      shell: bash
+      run: |
+        extra_args=()
+        if [ "${{ inputs.l2 }}" != "true" ]; then
+          extra_args+=("--no-l2")
+        fi
+        if [ "${{ inputs.no_ignore }}" = "true" ]; then
+          extra_args+=("--no-ignore")
+        fi
+        if [ -n "${{ inputs.ignore_rules }}" ]; then
+          extra_args+=("--ignore-rules" "${{ inputs.ignore_rules }}")
+        fi
+        node "${{ github.action_path }}/out/src/cli.js" scan "${{ inputs.path }}" \
+          --fail-on "${{ inputs.fail_on }}" \
+          --package-verification "${{ inputs.package_verification }}" \
+          "${extra_args[@]}"
