@@ -188,6 +188,96 @@ export const aiPatternRules: AiPatternRule[] = [
     severity: "high",
     message: "Object storage ACL grants public read access.",
     suggestion: "Keep uploaded objects private by default and serve public assets through explicit, reviewed policies."
+  },
+  {
+    id: "ai_pattern_cookie_secure_false",
+    patternRegex: "\\b(?:res|response)\\.cookie\\s*\\(\\s*[^,\\n]+,\\s*[^,\\n]+,\\s*\\{[\\s\\S]{0,240}\\bsecure\\s*:\\s*false\\b",
+    languages: ["javascript", "typescript"],
+    regex: /\b(?:res|response)\.cookie\s*\(\s*[^,\n]+,\s*[^,\n]+,\s*\{[\s\S]{0,240}\bsecure\s*:\s*false\b/gi,
+    severity: "high",
+    message: "Session cookie is explicitly allowed over insecure HTTP.",
+    suggestion: "Set secure: true for cookies used outside a local development environment."
+  },
+  {
+    id: "ai_pattern_cookie_httponly_false",
+    patternRegex: "\\b(?:res|response)\\.cookie\\s*\\(\\s*[^,\\n]+,\\s*[^,\\n]+,\\s*\\{[\\s\\S]{0,240}\\bhttpOnly\\s*:\\s*false\\b",
+    languages: ["javascript", "typescript"],
+    regex: /\b(?:res|response)\.cookie\s*\(\s*[^,\n]+,\s*[^,\n]+,\s*\{[\s\S]{0,240}\bhttpOnly\s*:\s*false\b/gi,
+    severity: "high",
+    message: "Session cookie is readable by client-side scripts.",
+    suggestion: "Set httpOnly: true unless client-side JavaScript must read a non-sensitive cookie."
+  },
+  {
+    id: "ai_pattern_spring_csrf_disabled",
+    patternRegex: "\\.csrf\\s*\\(\\s*\\)\\s*\\.disable\\s*\\(\\s*\\)|\\.csrf\\s*\\(\\s*(?:csrf\\s*->\\s*)?csrf\\.disable\\s*\\(\\s*\\)\\s*\\)|\\.csrf\\s*\\(\\s*AbstractHttpConfigurer::disable\\s*\\)",
+    languages: ["java"],
+    regex: /\.csrf\s*\(\s*\)\s*\.disable\s*\(\s*\)|\.csrf\s*\(\s*(?:csrf\s*->\s*)?csrf\.disable\s*\(\s*\)\s*\)|\.csrf\s*\(\s*AbstractHttpConfigurer::disable\s*\)/g,
+    severity: "high",
+    message: "Spring Security CSRF protection is disabled.",
+    suggestion: "Keep CSRF protection enabled for browser-authenticated flows or add a narrowly reviewed compensating control."
+  },
+  {
+    id: "ai_pattern_jinja_autoescape_disabled",
+    patternRegex: "\\bEnvironment\\s*\\([^\\)\\n]*\\bautoescape\\s*=\\s*False\\b",
+    languages: ["python"],
+    regex: /\bEnvironment\s*\([^\)\n]*\bautoescape\s*=\s*False\b/g,
+    severity: "high",
+    message: "Jinja template autoescaping is disabled.",
+    suggestion: "Keep autoescape enabled for HTML templates and sanitize only the narrowly trusted values that require raw HTML."
+  },
+  {
+    id: "ai_pattern_paramiko_auto_add_host_key",
+    patternRegex: "\\bset_missing_host_key_policy\\s*\\(\\s*paramiko\\.AutoAddPolicy\\s*\\(\\s*\\)\\s*\\)",
+    languages: ["python"],
+    regex: /\bset_missing_host_key_policy\s*\(\s*paramiko\.AutoAddPolicy\s*\(\s*\)\s*\)/g,
+    severity: "high",
+    message: "SSH host key verification accepts unknown hosts automatically.",
+    suggestion: "Verify and pin expected SSH host keys instead of accepting them automatically."
+  },
+  {
+    id: "ai_pattern_object_storage_public_write_acl",
+    patternRegex: "\\b(?:ACL|acl)\\s*[:=]\\s*[\"']public-read-write[\"']|\\.putObjectAcl\\s*\\([\\s\\S]{0,160}public-read-write",
+    languages: ["javascript", "typescript", "python"],
+    regex: /\b(?:ACL|acl)\s*[:=]\s*["']public-read-write["']|\.putObjectAcl\s*\([\s\S]{0,160}public-read-write/gi,
+    severity: "critical",
+    message: "Object storage ACL grants public write access.",
+    suggestion: "Remove public-write access immediately and use private ACLs with reviewed bucket policies."
+  },
+  {
+    id: "ai_pattern_child_process_shell_true",
+    patternRegex: "\\b(?:child_process\\.)?(?:spawn|spawnSync|execFile|execFileSync)\\s*\\([\\s\\S]{0,240}\\bshell\\s*:\\s*true\\b",
+    languages: ["javascript", "typescript"],
+    regex: /\b(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\([\s\S]{0,240}\bshell\s*:\s*true\b/gi,
+    severity: "high",
+    message: "Child process execution enables a shell interpreter.",
+    suggestion: "Use argument arrays with shell: false and strictly allowlist executable paths and arguments."
+  },
+  {
+    id: "ai_pattern_python_weak_random_token",
+    patternRegex: "\\b(?:token|secret|api_key|apikey|reset_token|session_id)\\b\\s*=\\s*random\\.(?:random|randint|choice|choices)\\s*\\(",
+    languages: ["python"],
+    regex: /\b(?:token|secret|api_key|apikey|reset_token|session_id)\b\s*=\s*random\.(?:random|randint|choice|choices)\s*\(/gi,
+    severity: "high",
+    message: "Security token is generated with Python's non-cryptographic random module.",
+    suggestion: "Use secrets.token_urlsafe(), secrets.token_hex(), or secrets.choice() for security-sensitive values."
+  },
+  {
+    id: "ai_pattern_helmet_csp_disabled",
+    patternRegex: "\\bhelmet\\s*\\(\\s*\\{[\\s\\S]{0,240}\\bcontentSecurityPolicy\\s*:\\s*false\\b",
+    languages: ["javascript", "typescript"],
+    regex: /\bhelmet\s*\(\s*\{[\s\S]{0,240}\bcontentSecurityPolicy\s*:\s*false\b/gi,
+    severity: "medium",
+    message: "Helmet disables the Content Security Policy middleware.",
+    suggestion: "Keep Content Security Policy enabled and configure explicit sources for the application."
+  },
+  {
+    id: "ai_pattern_sqlalchemy_text_f_string",
+    patternRegex: "\\b(?:session|db|connection|conn)\\.execute\\s*\\(\\s*(?:sqlalchemy\\.)?text\\s*\\(\\s*f[\"'][^\"']*(?:SELECT|INSERT|UPDATE|DELETE)\\b[^\"']*\\{[^}]+}[^\"']*[\"']",
+    languages: ["python"],
+    regex: /\b(?:session|db|connection|conn)\.execute\s*\(\s*(?:sqlalchemy\.)?text\s*\(\s*f["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)\b[^"']*\{[^}]+}[^"']*["']/gi,
+    severity: "high",
+    message: "SQLAlchemy text() receives an interpolated SQL f-string.",
+    suggestion: "Bind values with SQLAlchemy parameters instead of interpolating them into SQL text."
   }
 ];
 

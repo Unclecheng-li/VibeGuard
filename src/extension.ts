@@ -36,6 +36,7 @@ import type { Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConf
 
 const packageRegistries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
 const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local"];
+const firstRunOnboardingKey = "vibeguard.firstRunOnboardingShown";
 
 const supportedLanguageIds = new Set([
   "javascript",
@@ -159,6 +160,7 @@ export function activate(context: vscode.ExtensionContext): void {
   for (const document of vscode.workspace.textDocuments) {
     scheduleRealtimeScan(document, 0);
   }
+  void maybeShowFirstRunOnboarding();
   void syncPackageCache(false);
 }
 
@@ -353,6 +355,26 @@ async function showLlmStatus(): Promise<void> {
   output.appendLine("");
   output.show();
   void vscode.window.showInformationMessage(`VibeGuard L3 provider: ${provider}; credential: ${source}.`);
+}
+
+async function maybeShowFirstRunOnboarding(): Promise<void> {
+  if (extensionContext.globalState.get<boolean>(firstRunOnboardingKey, false)) {
+    return;
+  }
+  await extensionContext.globalState.update(firstRunOnboardingKey, true);
+  output.appendLine(
+    "VibeGuard first run: L1 secret/config/AI-pattern checks are active now. Package-name cache sync runs in the background for hallucinated-package detection."
+  );
+  const choice = await vscode.window.showInformationMessage(
+    "VibeGuard is active. Secret, config, and AI-pattern checks work immediately; package-name cache sync prepares hallucinated-package detection in the background.",
+    "Sync Now",
+    "Settings"
+  );
+  if (choice === "Sync Now") {
+    await syncPackageCache(true);
+  } else if (choice === "Settings") {
+    await vscode.commands.executeCommand("workbench.action.openSettings", "vibeguard");
+  }
 }
 
 async function openFinding(finding: Finding): Promise<void> {

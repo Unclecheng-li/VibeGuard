@@ -8,6 +8,7 @@ import { JsonPackageNameIndex } from "../src/package/cache";
 import { parsePackageNameList } from "../src/package/importer";
 import { PackageVerifier } from "../src/package/packageVerifier";
 import { SqlitePackageCache, SqlitePackageNameIndex, isSqliteAvailable } from "../src/package/sqliteStore";
+import { aiPatternRules } from "../src/rules/aiPatterns";
 import {
   fetchPackageNames,
   parseCargoCrates,
@@ -361,6 +362,68 @@ app.add_middleware(
   assert.equal(ruleIds.has("ai_pattern_requests_verify_false"), true);
   assert.equal(ruleIds.has("ai_pattern_flask_secret_key_placeholder"), true);
   assert.equal(ruleIds.has("ai_pattern_fastapi_cors_credentials_wildcard"), true);
+});
+
+test("keeps the AI-pattern library above the PRD's 30-rule target", () => {
+  assert.equal(aiPatternRules.length >= 30, true);
+});
+
+test("detects additional high-confidence AI security anti-patterns", async () => {
+  const sources = [
+    {
+      filePath: "server.ts",
+      languageId: "typescript",
+      text: `
+res.cookie("session", value, { secure: false, httpOnly: false });
+spawn("deploy", ["--target", target], { shell: true });
+app.use(helmet({ contentSecurityPolicy: false }));
+s3.putObject({ Bucket, Key, ACL: "public-read-write" });
+`
+    },
+    {
+      filePath: "SecurityConfig.java",
+      languageId: "java",
+      text: `http.csrf(AbstractHttpConfigurer::disable);`
+    },
+    {
+      filePath: "app.py",
+      languageId: "python",
+      text: `
+from jinja2 import Environment
+environment = Environment(autoescape=False)
+client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+reset_token = random.choice(chars)
+session.execute(text(f"SELECT * FROM users WHERE id = {user_id}"))
+`
+    }
+  ];
+
+  const ruleIds = new Set<string>();
+  for (const source of sources) {
+    const result = await scanSourceFile(source, {
+      packageVerification: "off",
+      includeSast: false,
+      now: 1
+    });
+    for (const finding of result.findings) {
+      ruleIds.add(finding.detection_rule);
+    }
+  }
+
+  for (const ruleId of [
+    "ai_pattern_cookie_secure_false",
+    "ai_pattern_cookie_httponly_false",
+    "ai_pattern_child_process_shell_true",
+    "ai_pattern_helmet_csp_disabled",
+    "ai_pattern_object_storage_public_write_acl",
+    "ai_pattern_spring_csrf_disabled",
+    "ai_pattern_jinja_autoescape_disabled",
+    "ai_pattern_paramiko_auto_add_host_key",
+    "ai_pattern_python_weak_random_token",
+    "ai_pattern_sqlalchemy_text_f_string"
+  ]) {
+    assert.equal(ruleIds.has(ruleId), true, `expected ${ruleId}`);
+  }
 });
 
 test("adds code fixes for high-confidence insecure config findings", async () => {

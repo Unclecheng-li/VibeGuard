@@ -17,7 +17,7 @@
 - Local SQLite findings history in `~/.vibeguard/findings.db`, with CLI `findings status/list/prune`, VSCode persistence, and opt-out flags for local/CI scans.
 - CLI `findings summary` now aggregates stored history by severity, finding type, top detection rules, and daily trend for CI summaries and future team dashboards.
 - Findings summaries and dashboards now include dismissal-reason counts so teams can spot false-positive or internal-package patterns.
-- CLI findings storage now records latest git author attribution for files with findings and surfaces developer risk counts/rates in summaries and dashboards.
+- CLI and VSCode findings storage now record latest git author attribution for files with findings and surface developer risk counts/rates in summaries and dashboards.
 - CLI `findings dashboard` can now export the same findings history as a standalone HTML dashboard for offline team trend review.
 - GitHub Action can now generate the standalone findings dashboard during CI with `dashboard: true`, exposing `dashboard_path` for artifact upload.
 - VSCode now exposes `VibeGuard: Export Findings Dashboard` to generate and open the local findings trend dashboard from the command palette.
@@ -26,8 +26,9 @@
 - Package-name remote sync expanded beyond npm/PyPI to Cargo crates, Go module index, and Maven Central search for richer local indexes.
 - Config-driven package index refresh via `vibeguard packages sync-config`, honoring `package_cache.languages`, `update_interval`, and `lightweight_mode`.
 - VSCode startup background package-cache sync with workspace package-manager detection, status-bar progress, output logging, and a manual `VibeGuard: Sync Package Cache` command.
+- VSCode first-run onboarding now explains that L1 secret/config/AI-pattern checks are active immediately while package-cache sync prepares hallucinated-package detection.
 - L3 semantic analysis can now use DeepSeek/OpenAI-compatible, Claude, or local Ollama providers, with CLI/LSP environment-variable credentials, VSCode SecretStorage commands, structured JSON finding parsing, and local fallback.
-- Expanded the L1 AI-pattern rule library from 6 to 21 high-confidence generated-code mistakes, including JWT, CORS, TLS, password hashing, token randomness, framework secret, and object-storage ACL issues, with automatic Semgrep export coverage.
+- Expanded the L1 AI-pattern rule library from 6 to 31 high-confidence generated-code mistakes, including JWT, CORS, TLS, password hashing, token randomness, framework secrets, object-storage ACLs, insecure cookie flags, disabled CSRF/CSP, SSH trust bypasses, and unsafe shell execution, with automatic Semgrep export coverage.
 - PR-friendly Markdown scan reports via CLI `--format markdown` / `--markdown`, plus GitHub Action job-summary output and optional sticky PR comments.
 - Cargo and Maven package-name sync now paginates remote registry/search results for more complete local package indexes while preserving `--limit` lightweight sync behavior.
 - Full and partial local package indexes now provide fuzzy package-name suggestions, improving hallucinated-package quick fixes beyond the built-in seed catalog.
