@@ -4,6 +4,13 @@ const path = require("path");
 
 const root = path.resolve(__dirname, "..");
 const dist = path.join(root, "dist");
+const treeSitterAssets = [
+  ["web-tree-sitter", "tree-sitter.wasm"],
+  ["tree-sitter-wasms", "out", "tree-sitter-javascript.wasm"],
+  ["tree-sitter-wasms", "out", "tree-sitter-typescript.wasm"],
+  ["tree-sitter-wasms", "out", "tree-sitter-tsx.wasm"],
+  ["tree-sitter-wasms", "out", "tree-sitter-python.wasm"]
+];
 
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
@@ -39,6 +46,12 @@ async function build() {
       outfile: path.join(dist, "lspServer.js")
     })
   ]);
+  const assetDirectory = path.join(dist, "tree-sitter");
+  fs.mkdirSync(assetDirectory, { recursive: true });
+  for (const assetSegments of treeSitterAssets) {
+    const source = path.join(root, "node_modules", ...assetSegments);
+    fs.copyFileSync(source, path.join(assetDirectory, assetSegments.at(-1)));
+  }
 }
 
 build().catch((error) => {

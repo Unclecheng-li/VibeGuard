@@ -11,6 +11,7 @@ import {
 } from "./config";
 import { loadCustomRules } from "./customRules";
 import { formatFindingsDashboard } from "./findings/dashboard";
+import { startFindingsDashboardServer } from "./findings/server";
 import {
   defaultFindingsDbPath,
   SqliteFindingStore,
@@ -353,6 +354,10 @@ async function runFindingsCommand(args: string[]): Promise<void> {
   }
   if (subcommand === "dashboard") {
     await writeFindingsDashboard(args);
+    return;
+  }
+  if (subcommand === "serve") {
+    await serveFindingsDashboard(args);
     return;
   }
   if (subcommand === "prune") {
@@ -808,6 +813,79 @@ async function writeFindingsDashboard(args: string[]): Promise<void> {
   } finally {
     store.close();
   }
+}
+
+async function serveFindingsDashboard(args: string[]): Promise<void> {
+  let dbPath = defaultFindingsDbPath();
+  let host = "127.0.0.1";
+  let port = 8787;
+  let days: number | undefined;
+  let topLimit = 10;
+  let token: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--db") {
+      dbPath = path.resolve(expandHome(args[++index] ?? defaultFindingsDbPath()));
+    } else if (arg.startsWith("--db=")) {
+      dbPath = path.resolve(expandHome(arg.slice("--db=".length)));
+    } else if (arg === "--host") {
+      host = args[++index]?.trim() || host;
+    } else if (arg.startsWith("--host=")) {
+      host = arg.slice("--host=".length).trim() || host;
+    } else if (arg === "--port") {
+      port = parseDashboardPort(args[++index]);
+    } else if (arg.startsWith("--port=")) {
+      port = parseDashboardPort(arg.slice("--port=".length));
+    } else if (arg === "--days") {
+      days = parseNonNegativeInteger(args[++index], "--days");
+    } else if (arg.startsWith("--days=")) {
+      days = parseNonNegativeInteger(arg.slice("--days=".length), "--days");
+    } else if (arg === "--top") {
+      topLimit = parsePositiveInteger(args[++index], "--top");
+    } else if (arg.startsWith("--top=")) {
+      topLimit = parsePositiveInteger(arg.slice("--top=".length), "--top");
+    } else if (arg === "--token-env") {
+      token = readDashboardToken(args[++index]);
+    } else if (arg.startsWith("--token-env=")) {
+      token = readDashboardToken(arg.slice("--token-env=".length));
+    } else if (arg === "-h" || arg === "--help") {
+      printFindingsHelp();
+      return;
+    } else {
+      throw new Error(`Unknown findings serve option: ${arg}`);
+    }
+  }
+  const dashboard = await startFindingsDashboardServer({ dbPath, host, port, days, topLimit, token });
+  console.log(`VibeGuard team dashboard listening at ${dashboard.url}`);
+  if (!token) {
+    console.log("Warning: dashboard authentication is disabled. Use --token-env before exposing it beyond localhost.");
+  }
+  const close = async () => {
+    await dashboard.close();
+    process.exit(0);
+  };
+  process.once("SIGINT", () => void close());
+  process.once("SIGTERM", () => void close());
+}
+
+function readDashboardToken(environmentVariable: string | undefined): string {
+  const name = environmentVariable?.trim();
+  if (!name) {
+    throw new Error("--token-env requires an environment variable name.");
+  }
+  const token = process.env[name]?.trim();
+  if (!token) {
+    throw new Error(`Dashboard token environment variable ${name} is empty.`);
+  }
+  return token;
+}
+
+function parseDashboardPort(value: string | undefined): number {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("--port must be an integer between 1 and 65535.");
+  }
+  return port;
 }
 
 async function listStoredFindings(args: string[]): Promise<void> {
@@ -1536,7 +1614,7 @@ Usage:
   vibeguard config path
   vibeguard config ignore-finding <finding-id> [--path path]
   vibeguard config unignore-finding <finding-id> [--path path]
-  vibeguard findings <status|list|summary|dashboard|prune> [--db path] [--json]
+  vibeguard findings <status|list|summary|dashboard|serve|prune> [--db path] [--json]
   vibeguard ignore-rules <add-rule|add-package> ...
   vibeguard packages <import|sync|sync-config|status|check> ...
   vibeguard rules export-semgrep [--output path] [--prefix id-prefix]
@@ -1553,6 +1631,7 @@ Examples:
   vibeguard findings list --limit 20
   vibeguard findings summary --days 30
   vibeguard findings dashboard --days 30 --output vibeguard-dashboard.html
+  VIBEGUARD_DASHBOARD_TOKEN=... vibeguard findings serve --db ./findings.db --token-env VIBEGUARD_DASHBOARD_TOKEN
   vibeguard ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
   vibeguard ignore-rules add-package npm @company/private-utils
   vibeguard config init
@@ -1629,6 +1708,7 @@ Usage:
   vibeguard findings list [--db path] [--limit n] [--all] [--json]
   vibeguard findings summary [--db path] [--days n] [--top n] [--json]
   vibeguard findings dashboard [--db path] [--days n] [--top n] [--output path] [--json]
+  vibeguard findings serve [--db path] [--host 127.0.0.1] [--port 8787] [--days n] [--top n] [--token-env ENV_VAR]
   vibeguard findings prune [--db path] [--days n] [--json]
 
 Scan storage:

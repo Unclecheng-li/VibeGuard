@@ -262,6 +262,15 @@ export const aiPatternRules: AiPatternRule[] = [
     suggestion: "Use secrets.token_urlsafe(), secrets.token_hex(), or secrets.choice() for security-sensitive values."
   },
   {
+    id: "ai_pattern_django_session_cookie_secure_false",
+    patternRegex: "\\bSESSION_COOKIE_SECURE\\s*=\\s*False\\b",
+    languages: ["python"],
+    regex: /\bSESSION_COOKIE_SECURE\s*=\s*False\b/g,
+    severity: "high",
+    message: "Django session cookies are allowed over insecure HTTP.",
+    suggestion: "Set SESSION_COOKIE_SECURE = True outside local development and terminate TLS before the application."
+  },
+  {
     id: "ai_pattern_helmet_csp_disabled",
     patternRegex: "\\bhelmet\\s*\\(\\s*\\{[\\s\\S]{0,240}\\bcontentSecurityPolicy\\s*:\\s*false\\b",
     languages: ["javascript", "typescript"],

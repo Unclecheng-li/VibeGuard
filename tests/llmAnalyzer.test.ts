@@ -42,6 +42,62 @@ app.post("/api/admin/users", (req, res) => {
   assert.equal(findings[0].line, 2);
 });
 
+test("creates a reviewable L3 fix only for an exact evidence replacement", () => {
+  const source = {
+    filePath: "db.ts",
+    languageId: "typescript",
+    text: 'const query = `SELECT * FROM users WHERE id = ${req.query.id}`;'
+  };
+  const findings = parseLlmSecurityFindings(
+    JSON.stringify({
+      findings: [
+        {
+          ruleId: "parameterized query",
+          severity: "high",
+          message: "The query interpolates request input.",
+          evidence: 'const query = `SELECT * FROM users WHERE id = ${req.query.id}`;',
+          suggestion: "Bind the id instead of interpolating it.",
+          replacement: 'const query = "SELECT * FROM users WHERE id = ?";'
+        },
+        {
+          ruleId: "unsafe replacement",
+          severity: "high",
+          message: "This replacement must be rejected.",
+          evidence: "missing evidence",
+          suggestion: "Review it.",
+          replacement: "```typescript\\nmalicious()\\n```"
+        },
+        {
+          ruleId: "diff replacement",
+          severity: "high",
+          message: "This diff must be rejected.",
+          evidence: 'const query = `SELECT * FROM users WHERE id = ${req.query.id}`;',
+          suggestion: "Review it.",
+          replacement: "--- a/db.ts\\n+++ b/db.ts"
+        }
+      ]
+    }),
+    source,
+    1
+  );
+
+  assert.equal(findings.length, 3);
+  assert.deepEqual(findings[0].fix, {
+    description: "Review LLM-generated replacement",
+    edits: [
+      {
+        startLine: 1,
+        startColumn: 1,
+        endLine: 1,
+        endColumn: source.text.length + 1,
+        newText: 'const query = "SELECT * FROM users WHERE id = ?";'
+      }
+    ]
+  });
+  assert.equal(findings[1].fix, undefined);
+  assert.equal(findings[2].fix, undefined);
+});
+
 test("requests OpenAI-compatible LLM providers and converts response content", async () => {
   let requestedUrl = "";
   let authorization = "";
@@ -92,6 +148,7 @@ test("requests OpenAI-compatible LLM providers and converts response content", a
   assert.equal(requestedUrl, "https://llm.example/v1/chat/completions");
   assert.equal(authorization, "Bearer secret-key");
   assert.equal((requestBody as { model: string }).model, "deepseek-test");
+  assert.match(JSON.stringify(requestBody), /replacement/);
   assert.equal(findings.length, 1);
   assert.equal(findings[0].detection_rule, "l3_llm_missing_rate_limiting");
 });

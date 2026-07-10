@@ -1,5 +1,6 @@
 import type { Finding, FindingType, Severity } from "../types";
 import { createFinding } from "../utils";
+import { detectAstSast } from "./astSast";
 
 interface SastRule {
   id: string;
@@ -112,45 +113,82 @@ const sastRules: SastRule[] = [
   }
 ];
 
-export function detectSast(text: string, filePath: string, timestamp: number): Finding[] {
+export async function detectSast(text: string, filePath: string, timestamp: number, languageId?: string): Promise<Finding[]> {
   const findings: Finding[] = [];
+  const astResult = await detectAstSast(text, filePath, languageId);
+  const rulesById = new Map(sastRules.map((rule) => [rule.id, rule]));
+  for (const candidate of astResult.candidates) {
+    const rule = rulesById.get(candidate.ruleId);
+    if (rule) {
+      findings.push(createSastFinding(rule, candidate.index, candidate.endIndex, candidate.evidence, text, filePath, timestamp));
+    }
+  }
+
   for (const rule of sastRules) {
+    if (astResult.handledRuleIds.has(rule.id)) {
+      continue;
+    }
     rule.regex.lastIndex = 0;
     for (const match of text.matchAll(rule.regex)) {
       const index = match.index ?? 0;
-      const replacement = rule.replacement?.(match[0]);
-      const finding = createFinding({
-        type: rule.type,
-        severity: rule.severity,
-        message: rule.message,
-        file: filePath,
-        index,
-        endIndex: index + match[0].length,
-        text,
-        evidence: match[0],
-        suggestion: rule.suggestion,
-        detectionLayer: "L2",
-        ruleId: rule.id,
-        timestamp
-      });
-
-      if (replacement && finding.endLine !== undefined && finding.endColumn !== undefined) {
-        finding.fix = {
-          description: `Replace with ${replacement}`,
-          edits: [
-            {
-              startLine: finding.line,
-              startColumn: finding.column,
-              endLine: finding.endLine,
-              endColumn: finding.endColumn,
-              newText: replacement
-            }
-          ]
-        };
-      }
-
-      findings.push(finding);
+      findings.push(createSastFinding(rule, index, index + match[0].length, match[0], text, filePath, timestamp));
     }
   }
   return findings;
+}
+
+function createSastFinding(
+  rule: SastRule,
+  index: number,
+  endIndex: number,
+  evidence: string,
+  text: string,
+  filePath: string,
+  timestamp: number
+): Finding {
+  if (rule.id === "sast_xss_inner_html") {
+    const propertyAssignment = evidence.match(/\.(?:innerHTML|outerHTML)\s*=\s*[\s\S]+/i);
+    if (propertyAssignment?.index !== undefined && propertyAssignment.index > 0) {
+      return createSastFinding(
+        rule,
+        index + propertyAssignment.index,
+        index + propertyAssignment.index + propertyAssignment[0].length,
+        propertyAssignment[0],
+        text,
+        filePath,
+        timestamp
+      );
+    }
+  }
+  const replacement = rule.replacement?.(evidence);
+  const finding = createFinding({
+    type: rule.type,
+    severity: rule.severity,
+    message: rule.message,
+    file: filePath,
+    index,
+    endIndex,
+    text,
+    evidence,
+    suggestion: rule.suggestion,
+    detectionLayer: "L2",
+    ruleId: rule.id,
+    timestamp
+  });
+
+  if (replacement && finding.endLine !== undefined && finding.endColumn !== undefined) {
+    finding.fix = {
+      description: `Replace with ${replacement}`,
+      edits: [
+        {
+          startLine: finding.line,
+          startColumn: finding.column,
+          endLine: finding.endLine,
+          endColumn: finding.endColumn,
+          newText: replacement
+        }
+      ]
+    };
+  }
+  return finding;
 }

@@ -393,6 +393,7 @@ from jinja2 import Environment
 environment = Environment(autoescape=False)
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 reset_token = random.choice(chars)
+SESSION_COOKIE_SECURE = False
 session.execute(text(f"SELECT * FROM users WHERE id = {user_id}"))
 `
     }
@@ -420,6 +421,7 @@ session.execute(text(f"SELECT * FROM users WHERE id = {user_id}"))
     "ai_pattern_jinja_autoescape_disabled",
     "ai_pattern_paramiko_auto_add_host_key",
     "ai_pattern_python_weak_random_token",
+    "ai_pattern_django_session_cookie_secure_false",
     "ai_pattern_sqlalchemy_text_f_string"
   ]) {
     assert.equal(ruleIds.has(ruleId), true, `expected ${ruleId}`);
@@ -479,6 +481,57 @@ test("detects lightweight L2 SQL injection patterns", async () => {
   assert.equal(result.findings.some((finding) => finding.type === "sql_injection"), true);
 });
 
+test("uses Tree-sitter AST nodes for JavaScript SAST findings", async () => {
+  const result = await scanSourceFile(
+    {
+      filePath: "routes.ts",
+      languageId: "typescript",
+      text: `
+// const query = \`SELECT * FROM users WHERE id = \${req.query.id}\`;
+const copy = "element.innerHTML = req.query.name";
+const query = \`SELECT * FROM users WHERE id = \${req.query.id}\`;
+element.innerHTML = req.query.name;
+`
+    },
+    {
+      packageVerification: "off",
+      includeSast: true,
+      now: 1
+    }
+  );
+
+  const sqlFindings = result.findings.filter((finding) => finding.detection_rule === "sast_sql_template_interpolation");
+  const htmlFindings = result.findings.filter((finding) => finding.detection_rule === "sast_xss_inner_html");
+  assert.equal(sqlFindings.length, 1);
+  assert.equal(htmlFindings.length, 1);
+  assert.match(sqlFindings[0].evidence, /^query/);
+  assert.match(htmlFindings[0].evidence, /^\.innerHTML/);
+});
+
+test("uses Tree-sitter AST nodes for Python f-string SQL detection", async () => {
+  const result = await scanSourceFile(
+    {
+      filePath: "repository.py",
+      languageId: "python",
+      text: `
+# session.execute(f"SELECT * FROM users WHERE id = {user_id}")
+session.execute(
+    f"SELECT * FROM users WHERE id = {user_id}"
+)
+`
+    },
+    {
+      packageVerification: "off",
+      includeSast: true,
+      now: 1
+    }
+  );
+
+  const findings = result.findings.filter((finding) => finding.detection_rule === "sast_sql_python_f_string_execute");
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].evidence, /^session\.execute/);
+});
+
 test("adds code fixes for L2 innerHTML findings", async () => {
   const result = await scanSourceFile(
     {
@@ -513,7 +566,7 @@ test("adds code fixes for L2 unsafe yaml.load findings", async () => {
   );
 
   const finding = result.findings.find((item) => item.detection_rule === "sast_insecure_deserialization_yaml");
-  assert.equal(finding?.fix?.edits[0].newText, "yaml.safe_load(request.data");
+  assert.equal(finding?.fix?.edits[0].newText, "yaml.safe_load(request.data)");
   assert.equal(applyFirstFix("data = yaml.load(request.data)", finding), "data = yaml.safe_load(request.data)");
 });
 

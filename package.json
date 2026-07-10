@@ -37,6 +37,7 @@
     "onCommand:vibeguard.deleteLlmApiKey",
     "onCommand:vibeguard.showLlmStatus",
     "onCommand:vibeguard.applyFix",
+    "onCommand:vibeguard.applyAllSafeFixes",
     "onView:vibeguardFindings"
   ],
   "contributes": {
@@ -100,6 +101,10 @@
       {
         "command": "vibeguard.applyFix",
         "title": "VibeGuard: Apply Fix"
+      },
+      {
+        "command": "vibeguard.applyAllSafeFixes",
+        "title": "VibeGuard: Apply All Safe Fixes in Current File"
       }
     ],
     "menus": {
@@ -320,8 +325,10 @@
   },
   "dependencies": {
     "minimatch": "^10.2.5",
+    "tree-sitter-wasms": "^0.1.13",
     "vscode-languageserver": "^10.1.0",
     "vscode-languageserver-textdocument": "^1.0.12",
+    "web-tree-sitter": "^0.20.8",
     "yaml": "^2.9.0"
   }
 }

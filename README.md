@@ -2,11 +2,12 @@
 
 VibeGuard is an IDE-first security scanner for AI-generated code. It focuses on the mistakes AI tools commonly introduce while you are coding: hallucinated package names, hardcoded secrets, unsafe framework configuration, and high-confidence insecure coding patterns.
 
-This repository currently implements the Phase 1 MVP from `VibeGuard-PRD.md`:
+This repository implements the core `VibeGuard-PRD.md` roadmap through the L3 foundations:
 
 - VSCode extension shell with real-time diagnostics and a findings sidebar
+- JetBrains plugin module that starts the same bundled LSP server for supported source files
 - L1 scanner for npm/PyPI/Cargo/Go/Maven hallucinated packages, hardcoded secrets, loose config, and expanded AI error patterns
-- Lightweight L2 SAST rules for injection, unsafe deserialization, open redirect, and information leakage cases
+- Tree-sitter WASM-backed L2 SAST rules for JavaScript, TypeScript, and Python injection, XSS, unsafe deserialization, redirects, and information leakage, with regex fallback for other languages and incomplete edits
 - Optional L3 semantic checks with DeepSeek, Claude, OpenAI-compatible, or local Ollama providers, plus local heuristic fallback
 - Local package verification cache with offline seed mode and optional remote npm/PyPI checks
 - Local SQLite scan history in `~/.vibeguard/findings.db`
@@ -22,6 +23,54 @@ npm test
 ```
 
 To try the extension in VSCode, open this folder in VSCode and run the extension host from the debugger after building.
+
+## JetBrains Plugin
+
+The JetBrains module reuses `vibeguard-lsp --stdio`, so its diagnostics and mechanical quick fixes match the CLI and
+VSCode extension. It targets JetBrains commercial IDEs with the LSP API, starting from the 2025.2 platform release.
+
+```bash
+cd jetbrains
+./gradlew buildPlugin
+```
+
+The distribution ZIP is written to `jetbrains/build/distributions/`. Node.js 18 or later is required at runtime; use
+`VIBEGUARD_NODE_PATH` or `VIBEGUARD_LSP_PATH` to override the Node executable or LSP script in managed environments.
+See [jetbrains/README.md](jetbrains/README.md) for supported file types and Windows instructions.
+
+## Docker
+
+The Docker image packages the CLI, LSP bundle, and Tree-sitter WASM grammars for a reproducible CI or private deployment
+runtime. Git is included so `ai-code-scan` can inspect repository history.
+
+```bash
+docker build -t vibeguard:local .
+docker run --rm -v "$PWD:/workspace" vibeguard:local scan /workspace --fail-on high
+docker run --rm -v "$PWD:/workspace" vibeguard:local scan /workspace --mode ai-code-scan --ai-detection aggressive
+```
+
+## Team Dashboard
+
+`findings serve` turns the stored findings history into a deployable team dashboard with developer risk, rule, severity,
+dismissal, and trend views. It listens on `127.0.0.1:8787` by default. Use `--host 0.0.0.0` only behind a private network
+or reverse proxy, and provide an environment-backed token before exposing it beyond localhost.
+
+```bash
+VIBEGUARD_DASHBOARD_TOKEN=replace-with-a-long-random-value \
+  node dist/cli.js findings serve --db ~/.vibeguard/findings.db --token-env VIBEGUARD_DASHBOARD_TOKEN
+```
+
+The dashboard is available at `/`, machine-readable summary data is at `/api/summary`, and `/healthz` is unauthenticated
+for container orchestration. A browser can authenticate with a bearer token through a reverse proxy; opening `/?token=…`
+once establishes an HttpOnly session cookie for the dashboard origin.
+
+For a Docker deployment, mount the directory that holds `findings.db` and publish the dashboard port:
+
+```bash
+docker run --rm -p 8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN \
+  -v "$PWD/.vibeguard:/data" vibeguard:local \
+  findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
+```
 
 ## CLI
 
@@ -51,7 +100,7 @@ node dist/cli.js findings dashboard --days 30 --output vibeguard-dashboard.html
 node dist/cli.js rules export-semgrep --output vibeguard-semgrep.yml
 ```
 
-`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM and expects structured JSON findings; without credentials, it falls back to conservative local heuristics for missing authentication, rate limiting, input validation, and output encoding around obvious route handlers. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `VIBEGUARD_LLM_API_KEY`; the CLI intentionally has no plaintext API-key flag.
+`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM and expects structured JSON findings; without credentials, it falls back to conservative local heuristics for missing authentication, rate limiting, input validation, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `VIBEGUARD_LLM_API_KEY`; the CLI intentionally has no plaintext API-key flag.
 
 Provider controls:
 
@@ -328,7 +377,7 @@ Dashboard command:
 
 ## VSCode Quick Fixes
 
-VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, and high-confidence `innerHTML` to `textContent` cases. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
+VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, and high-confidence `innerHTML` to `textContent` cases. `VibeGuard: Apply All Safe Fixes in Current File` applies non-overlapping L1/L2 mechanical fixes in one reviewed operation, prioritizing higher severities and excluding L3 replacements. L3 replacements supplied by an LLM are deliberately non-preferred and require confirmation in VSCode. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
 
 ## Scope Notes
 

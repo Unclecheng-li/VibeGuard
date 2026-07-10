@@ -40,3 +40,9 @@
 - VSCode ignore actions now prompt for a reason (`False positive`, `Not an issue`, `Internal package`, or custom text) and persist that reason into `ignore-rules.yml` for dismissed finding audit trails.
 - CLI `ignore-rules add-rule` and `ignore-rules add-package` commands can now append scoped ignore-rules.yml entries with the same standard reason presets, making CI/team ignores manageable without hand-editing YAML.
 - The LSP server now advertises quickfix code actions and returns workspace edits for findings with safe mechanical fixes, extending package, secret, config, and SAST fixes beyond the VSCode extension shell.
+- Added a JetBrains plugin distribution that packages the shared VibeGuard LSP server, surfaces its diagnostics and quick fixes for supported files, and is built as a CI artifact.
+- Upgraded JavaScript, TypeScript, and Python L2 SAST matching to Tree-sitter WASM syntax trees, avoiding comment and string-literal false positives while retaining regex fallback for unsupported or incomplete code.
+- Added a multi-stage Docker image for reproducible CLI and `ai-code-scan` execution, with Git available for commit attribution and CI container smoke testing.
+- L3 structured responses can now provide a range-validated, review-required replacement for an exact evidence snippet, surfaced through VSCode and LSP Quick Fixes without marking the generated edit as preferred.
+- Added `VibeGuard: Apply All Safe Fixes in Current File` to batch non-overlapping L1/L2 mechanical fixes while excluding generated L3 edits for individual review.
+- Added `vibeguard findings serve` for a token-protected, Docker-ready team dashboard backed by SQLite findings history and a machine-readable summary API.

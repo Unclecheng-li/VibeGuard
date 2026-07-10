@@ -1,0 +1,12 @@
+.agents/
+.git/
+.github/
+.vscode/
+coverage/
+dist/
+jetbrains/
+media/
+node_modules/
+out/
+vibeguard-*.vsix
+*.log

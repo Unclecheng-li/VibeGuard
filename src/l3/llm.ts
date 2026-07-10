@@ -21,6 +21,7 @@ interface LlmFindingPayload {
   message?: unknown;
   evidence?: unknown;
   suggestion?: unknown;
+  replacement?: unknown;
   line?: unknown;
   column?: unknown;
 }
@@ -29,7 +30,8 @@ const systemPrompt = [
   "You are VibeGuard's L3 semantic security reviewer.",
   "Find missing security measures in AI-generated code.",
   "Return only JSON. Do not include markdown.",
-  "Use this schema: {\"findings\":[{\"ruleId\":\"l3_llm_missing_authentication\",\"severity\":\"high\",\"message\":\"...\",\"evidence\":\"exact code snippet\",\"suggestion\":\"...\",\"line\":1,\"column\":1}]}",
+  "Use this schema: {\"findings\":[{\"ruleId\":\"l3_llm_missing_authentication\",\"severity\":\"high\",\"message\":\"...\",\"evidence\":\"exact code snippet\",\"suggestion\":\"...\",\"replacement\":\"optional replacement for exactly the evidence snippet\",\"line\":1,\"column\":1}]}",
+  "Only provide replacement when replacing exactly the evidence snippet is a complete, reviewable fix. Do not use Markdown fences, unified diffs, or edits outside evidence.",
   "Only report actionable issues involving authentication, authorization, rate limiting, input validation, output encoding, parameterized queries, error handling, SSRF, path traversal, insecure deserialization, or secret exposure."
 ].join("\n");
 
@@ -147,6 +149,7 @@ export function buildLlmSecurityReviewPrompt(source: SourceFile): string {
     "Return JSON only. If there are no actionable findings, return {\"findings\":[]}.",
     "Each finding must include: ruleId, severity, message, evidence, suggestion, line, column.",
     "Use exact code snippets for evidence so the editor can place diagnostics.",
+    "Optionally include replacement only when it can replace exactly that evidence snippet without edits elsewhere. Do not include Markdown fences or diffs.",
     "",
     "Code:",
     "```",
@@ -297,7 +300,7 @@ function normalizeLlmFinding(value: unknown, source: SourceFile, timestamp: numb
   const index = findingIndex(source.text, evidence, input.line, input.column);
   const severity = normalizeSeverity(input.severity);
   const ruleId = normalizeRuleId(readNonEmptyString(input.ruleId) ?? readNonEmptyString(input.rule_id));
-  return createFinding({
+  const finding = createFinding({
     type: "missing_security_measure",
     severity,
     message: message.slice(0, 240),
@@ -311,10 +314,53 @@ function normalizeLlmFinding(value: unknown, source: SourceFile, timestamp: numb
     ruleId,
     timestamp
   });
+  const replacement = safeReplacement(input.replacement, evidence, source.text, index);
+  if (replacement) {
+    finding.fix = {
+      description: "Review LLM-generated replacement",
+      edits: [
+        {
+          startLine: finding.line,
+          startColumn: finding.column,
+          endLine: finding.endLine ?? finding.line,
+          endColumn: finding.endColumn ?? finding.column + evidence.length,
+          newText: replacement
+        }
+      ]
+    };
+  }
+  return finding;
+}
+
+function safeReplacement(value: unknown, evidence: string, sourceText: string, index: number): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const replacement = value.trim();
+  if (
+    !replacement ||
+    replacement === evidence ||
+    replacement.length > 8000 ||
+    replacement.length > Math.max(2000, evidence.length * 20) ||
+    replacement.includes("```") ||
+    replacement.startsWith("diff --git") ||
+    replacement.startsWith("--- ") ||
+    replacement.includes("\n@@ ") ||
+    replacement.includes("\u0000") ||
+    sourceText.slice(index, index + evidence.length) !== evidence
+  ) {
+    return undefined;
+  }
+  return replacement;
 }
 
 function parseJsonResponse(raw: string): unknown {
   const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    // Some providers wrap an otherwise valid JSON response in a Markdown fence.
+  }
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
   const candidate = fenced ?? jsonSubstring(trimmed);
   if (!candidate) {

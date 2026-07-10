@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import * as vscode from "vscode";
+import { planSafeBatchFixes } from "./batchFixes";
 import {
   cloneDefaultConfig,
   defaultConfigPath,
@@ -136,6 +137,7 @@ export function activate(context: vscode.ExtensionContext): void {
       ignorePackage(resolveFindingArgument(nodeOrFinding))
     ),
     vscode.commands.registerCommand("vibeguard.applyFix", (finding: Finding) => applyFindingFix(finding)),
+    vscode.commands.registerCommand("vibeguard.applyAllSafeFixes", () => applyAllSafeFixes()),
     vscode.languages.registerCodeActionsProvider(codeActionSelector, new VibeGuardCodeActionProvider(), {
       providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]
     }),
@@ -627,7 +629,7 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
     return;
   }
   popupSeen.add(critical.id);
-  const replace = critical.fix?.description;
+  const replace = critical.detection_layer === "L3" ? undefined : critical.fix?.description;
   const actions = replace ? [replace, "Ignore", "Manage Ignore Rules"] : ["Ignore", "Manage Ignore Rules"];
   void vscode.window.showWarningMessage(`VibeGuard: ${critical.message}`, ...actions).then(async (choice) => {
     if (choice === replace && critical.fix) {
@@ -645,9 +647,47 @@ async function applyFindingFix(finding: Finding | undefined): Promise<void> {
   if (!finding?.fix) {
     return;
   }
+  if (finding.detection_layer === "L3") {
+    const choice = await vscode.window.showWarningMessage(
+      "VibeGuard received this replacement from an LLM. Review the change before applying it.",
+      "Apply replacement"
+    );
+    if (choice !== "Apply replacement") {
+      return;
+    }
+  }
   const uri = vscode.Uri.file(finding.file);
   await vscode.workspace.applyEdit(workspaceEditForFix(uri, finding));
   const document = await vscode.workspace.openTextDocument(uri);
+  await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+}
+
+async function applyAllSafeFixes(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    void vscode.window.showInformationMessage("VibeGuard: no active editor to fix.");
+    return;
+  }
+  const plan = planSafeBatchFixes(findingsForDocument(editor.document));
+  if (plan.findings.length === 0) {
+    void vscode.window.showInformationMessage("VibeGuard: no non-overlapping mechanical fixes are available in this file.");
+    return;
+  }
+  const detail = [
+    `${plan.findings.length} safe fix${plan.findings.length === 1 ? "" : "es"} will be applied.`,
+    plan.skipped.length > 0 ? `${plan.skipped.length} overlapping fix${plan.skipped.length === 1 ? "" : "es"} will be skipped.` : "",
+    plan.excludedL3.length > 0 ? `${plan.excludedL3.length} LLM-generated replacement${plan.excludedL3.length === 1 ? " is" : "s are"} excluded for review.` : ""
+  ].filter(Boolean).join(" ");
+  const choice = await vscode.window.showWarningMessage(`VibeGuard: ${detail}`, "Apply safe fixes");
+  if (choice !== "Apply safe fixes") {
+    return;
+  }
+  const applied = await vscode.workspace.applyEdit(workspaceEditForFindings(editor.document.uri, plan.findings));
+  if (!applied) {
+    void vscode.window.showErrorMessage("VibeGuard could not apply all selected fixes.");
+    return;
+  }
+  const document = await vscode.workspace.openTextDocument(editor.document.uri);
   await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
 }
 
@@ -767,18 +807,24 @@ function findMatchingFinding(document: vscode.TextDocument, diagnostic: vscode.D
 }
 
 function workspaceEditForFix(uri: vscode.Uri, finding: Finding): vscode.WorkspaceEdit {
+  return workspaceEditForFindings(uri, [finding]);
+}
+
+function workspaceEditForFindings(uri: vscode.Uri, findings: Finding[]): vscode.WorkspaceEdit {
   const edit = new vscode.WorkspaceEdit();
-  for (const textEdit of finding.fix?.edits ?? []) {
-    edit.replace(
-      uri,
-      new vscode.Range(
-        textEdit.startLine - 1,
-        textEdit.startColumn - 1,
-        textEdit.endLine - 1,
-        textEdit.endColumn - 1
-      ),
-      textEdit.newText
-    );
+  for (const finding of findings) {
+    for (const textEdit of finding.fix?.edits ?? []) {
+      edit.replace(
+        uri,
+        new vscode.Range(
+          textEdit.startLine - 1,
+          textEdit.startColumn - 1,
+          textEdit.endLine - 1,
+          textEdit.endColumn - 1
+        ),
+        textEdit.newText
+      );
+    }
   }
   return edit;
 }
@@ -1393,8 +1439,16 @@ class VibeGuardCodeActionProvider implements vscode.CodeActionProvider {
       if (finding.fix) {
         const action = new vscode.CodeAction(`Apply VibeGuard fix: ${finding.fix.description}`, vscode.CodeActionKind.QuickFix);
         action.diagnostics = [diagnostic];
-        action.isPreferred = true;
-        action.edit = workspaceEditForFix(document.uri, finding);
+        action.isPreferred = finding.detection_layer !== "L3";
+        if (finding.detection_layer === "L3") {
+          action.command = {
+            command: "vibeguard.applyFix",
+            title: action.title,
+            arguments: [finding]
+          };
+        } else {
+          action.edit = workspaceEditForFix(document.uri, finding);
+        }
         actions.push(action);
       }
 

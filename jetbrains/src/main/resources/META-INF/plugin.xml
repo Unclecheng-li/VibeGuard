@@ -1,0 +1,20 @@
+<idea-plugin>
+  <id>dev.vibeguard.jetbrains</id>
+  <name>VibeGuard</name>
+  <vendor url="https://github.com/vibeguard/vibeguard">VibeGuard</vendor>
+
+  <description><![CDATA[
+    <p>VibeGuard scans AI-generated code for hallucinated dependencies, hardcoded secrets,
+    unsafe configuration, and high-confidence security mistakes.</p>
+    <p>The plugin uses the shared VibeGuard Language Server so diagnostics and safe quick fixes
+    match the VS Code extension and CI scanner.</p>
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.lsp</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <platform.lsp.serverSupportProvider
+        implementation="dev.vibeguard.jetbrains.VibeGuardLspServerSupportProvider"/>
+  </extensions>
+</idea-plugin>

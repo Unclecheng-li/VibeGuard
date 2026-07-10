@@ -12,7 +12,7 @@ export function createCodeActionsForFindings(uri: string, findings: Finding[], d
       title: `Apply VibeGuard fix: ${finding.fix.description}`,
       kind: CodeActionKind.QuickFix,
       diagnostics: [diagnostic],
-      isPreferred: true,
+      isPreferred: finding.detection_layer !== "L3",
       edit: {
         changes: {
           [uri]: finding.fix.edits.map(toLspTextEdit)

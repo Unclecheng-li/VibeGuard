@@ -54,7 +54,7 @@ export async function scanSourceFile(source: SourceFile, options: ScanOptions = 
 
   if (layers.l2) {
     const layerStarted = performance.now();
-    findings.push(...detectSast(source.text, source.filePath, timestamp));
+    findings.push(...(await detectSast(source.text, source.filePath, timestamp, source.languageId)));
     timings.l2Ms = performance.now() - layerStarted;
   }
 

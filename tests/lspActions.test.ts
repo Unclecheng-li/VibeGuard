@@ -33,6 +33,15 @@ test("does not create LSP quick fixes for non-fixable or unrelated diagnostics",
   assert.equal(actions.length, 0);
 });
 
+test("does not mark LLM-generated replacements as preferred", () => {
+  const uri = "file:///repo/app.ts";
+  const diagnostic = diagnosticFor("hardcoded_secret_assignment");
+  const actions = createCodeActionsForFindings(uri, [finding({ detection_layer: "L3" })], [diagnostic]);
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].isPreferred, false);
+});
+
 function finding(overrides: Partial<Finding> = {}): Finding {
   return {
     id: "finding",

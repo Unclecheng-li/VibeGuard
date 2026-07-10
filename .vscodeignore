@@ -5,6 +5,9 @@ out/**
 .vscode-test/**
 .vscode/**
 .github/**
+jetbrains/**
+Dockerfile
+.dockerignore
 scripts/**
 .gitignore
 tsconfig.json

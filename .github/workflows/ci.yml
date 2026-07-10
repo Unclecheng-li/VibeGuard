@@ -15,3 +15,38 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  jetbrains-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - run: npm ci
+      - run: ./gradlew buildPlugin --no-daemon
+        working-directory: jetbrains
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibeguard-jetbrains-plugin
+          path: jetbrains/build/distributions/*.zip
+
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag vibeguard:ci .
+      - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" vibeguard:ci scan /workspace --package-verification off --no-store-findings --fail-on none
+      - run: mkdir -p "$RUNNER_TEMP/vibeguard-dashboard"
+      - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci scan /workspace --package-verification off --findings-db /data/findings.db --fail-on none
+      - run: docker run --detach --name vibeguard-dashboard -p 127.0.0.1:8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN=ci-token -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
+      - run: >-
+          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1
+          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/summary
+      - run: docker rm --force vibeguard-dashboard
