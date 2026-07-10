@@ -25,26 +25,28 @@ export class PackageVerifier implements PackageVerifierLike {
   async verify(reference: PackageReference, mode: "seed" | "remote"): Promise<PackageResolution> {
     const indexed = await this.packageIndex?.get(reference.registry, reference.packageName);
     if (indexed !== undefined) {
+      const similarPackages = indexed ? [] : await this.suggestions(reference.registry, reference.packageName);
       return {
         registry: reference.registry,
         packageName: reference.packageName,
         exists: indexed,
         source: "index",
         lastVerified: Date.now(),
-        similarPackages: indexed ? [] : seedSuggestions(reference.registry, reference.packageName),
+        similarPackages,
         message: indexed ? undefined : "Package was absent from a full local package index."
       };
     }
 
     const seeded = seedExists(reference.registry, reference.packageName);
     if (seeded !== undefined) {
+      const similarPackages = seeded ? [] : await this.suggestions(reference.registry, reference.packageName);
       return {
         registry: reference.registry,
         packageName: reference.packageName,
         exists: seeded,
         source: "seed",
         lastVerified: Date.now(),
-        similarPackages: seeded ? [] : seedSuggestions(reference.registry, reference.packageName)
+        similarPackages
       };
     }
 
@@ -63,7 +65,7 @@ export class PackageVerifier implements PackageVerifierLike {
         exists: null,
         source: "unverified",
         lastVerified: Date.now(),
-        similarPackages: seedSuggestions(reference.registry, reference.packageName),
+        similarPackages: await this.suggestions(reference.registry, reference.packageName),
         message: "Package was not in the local seed catalog."
       };
     }
@@ -93,7 +95,7 @@ export class PackageVerifier implements PackageVerifierLike {
         exists,
         source: "remote",
         lastVerified: Date.now(),
-        similarPackages: exists ? [] : seedSuggestions(reference.registry, reference.packageName),
+        similarPackages: exists ? [] : await this.suggestions(reference.registry, reference.packageName),
         message: exists ? undefined : `Registry returned ${response.status}.`
       };
     } catch (error) {
@@ -103,12 +105,18 @@ export class PackageVerifier implements PackageVerifierLike {
         exists: null,
         source: "unverified",
         lastVerified: Date.now(),
-        similarPackages: seedSuggestions(reference.registry, reference.packageName),
+        similarPackages: await this.suggestions(reference.registry, reference.packageName),
         message: error instanceof Error ? error.message : "Remote package verification failed."
       };
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async suggestions(registry: PackageReference["registry"], packageName: string): Promise<string[]> {
+    const seed = seedSuggestions(registry, packageName);
+    const indexed = (await this.packageIndex?.suggest?.(registry, packageName, 5)) ?? [];
+    return [...new Set([...indexed, ...seed])].slice(0, 3);
   }
 }
 

@@ -35,9 +35,25 @@ inputs:
     required: false
     default: "true"
   l3:
-    description: "Enable local L3 semantic endpoint checks."
+    description: "Enable L3 semantic endpoint checks. Uses an LLM provider when credentials are available, otherwise falls back to local heuristics."
     required: false
     default: "false"
+  llm_provider:
+    description: "LLM provider for L3: deepseek, claude, openai, or local."
+    required: false
+    default: ""
+  llm_model:
+    description: "Optional model override for L3 semantic analysis."
+    required: false
+    default: ""
+  llm_base_url:
+    description: "Optional provider base URL override for L3 semantic analysis."
+    required: false
+    default: ""
+  llm_api_key_env:
+    description: "Optional environment variable name that contains the L3 provider API key."
+    required: false
+    default: ""
   github_annotations:
     description: "Emit GitHub workflow annotations for active findings."
     required: false
@@ -46,12 +62,44 @@ inputs:
     description: "Optional path for a SARIF report file."
     required: false
     default: ""
+  markdown:
+    description: "Optional path for a Markdown report file."
+    required: false
+    default: ""
+  step_summary:
+    description: "Append the Markdown report to the GitHub Actions job summary."
+    required: false
+    default: "true"
+  pr_comment:
+    description: "Create or update a sticky VibeGuard pull request comment with the Markdown report."
+    required: false
+    default: "false"
   ignore_rules:
     description: "Optional path to ignore-rules.yml."
     required: false
     default: ""
   custom_rules:
     description: "Optional path to custom VibeGuard YAML rules."
+    required: false
+    default: ""
+  config:
+    description: "Optional path to VibeGuard config.json. Action inputs override config defaults."
+    required: false
+    default: ""
+  no_config:
+    description: "Disable config.json loading."
+    required: false
+    default: "false"
+  dedup_existing_tools:
+    description: "Dismiss duplicate L2 findings when nearby SonarQube, Snyk, Semgrep, or CodeQL annotations already cover the issue. Use true, false, or leave empty for config defaults."
+    required: false
+    default: ""
+  store_findings:
+    description: "Persist scan runs and findings to a local SQLite findings database."
+    required: false
+    default: "false"
+  findings_db:
+    description: "Optional path to findings.db when store_findings is true."
     required: false
     default: ""
   no_ignore:
@@ -84,7 +132,12 @@ runs:
     - name: Run VibeGuard scan
       shell: bash
       run: |
+        set -euo pipefail
         extra_args=()
+        markdown_report="${{ inputs.markdown }}"
+        if [ -z "$markdown_report" ]; then
+          markdown_report="${RUNNER_TEMP:-.}/vibeguard-report.md"
+        fi
         if [ "${{ inputs.mode }}" != "full-scan" ]; then
           extra_args+=("--mode" "${{ inputs.mode }}")
         fi
@@ -109,12 +162,25 @@ runs:
         if [ "${{ inputs.l3 }}" = "true" ]; then
           extra_args+=("--l3")
         fi
+        if [ -n "${{ inputs.llm_provider }}" ]; then
+          extra_args+=("--llm-provider" "${{ inputs.llm_provider }}")
+        fi
+        if [ -n "${{ inputs.llm_model }}" ]; then
+          extra_args+=("--llm-model" "${{ inputs.llm_model }}")
+        fi
+        if [ -n "${{ inputs.llm_base_url }}" ]; then
+          extra_args+=("--llm-base-url" "${{ inputs.llm_base_url }}")
+        fi
+        if [ -n "${{ inputs.llm_api_key_env }}" ]; then
+          extra_args+=("--llm-api-key-env" "${{ inputs.llm_api_key_env }}")
+        fi
         if [ "${{ inputs.github_annotations }}" = "true" ]; then
           extra_args+=("--github-annotations")
         fi
         if [ -n "${{ inputs.sarif }}" ]; then
           extra_args+=("--sarif" "${{ inputs.sarif }}")
         fi
+        extra_args+=("--markdown" "$markdown_report")
         if [ "${{ inputs.no_ignore }}" = "true" ]; then
           extra_args+=("--no-ignore")
         fi
@@ -124,6 +190,24 @@ runs:
         if [ -n "${{ inputs.custom_rules }}" ]; then
           extra_args+=("--custom-rules" "${{ inputs.custom_rules }}")
         fi
+        if [ -n "${{ inputs.config }}" ]; then
+          extra_args+=("--config" "${{ inputs.config }}")
+        fi
+        if [ "${{ inputs.no_config }}" = "true" ]; then
+          extra_args+=("--no-config")
+        fi
+        if [ "${{ inputs.dedup_existing_tools }}" = "true" ]; then
+          extra_args+=("--dedup-existing-tools")
+        fi
+        if [ "${{ inputs.dedup_existing_tools }}" = "false" ]; then
+          extra_args+=("--no-dedup-existing-tools")
+        fi
+        if [ "${{ inputs.store_findings }}" != "true" ]; then
+          extra_args+=("--no-store-findings")
+        fi
+        if [ -n "${{ inputs.findings_db }}" ]; then
+          extra_args+=("--findings-db" "${{ inputs.findings_db }}")
+        fi
         if [ -n "${{ inputs.package_index }}" ]; then
           extra_args+=("--package-index" "${{ inputs.package_index }}")
         fi
@@ -131,7 +215,56 @@ runs:
         if [ -n "${{ inputs.sqlite_db }}" ]; then
           extra_args+=("--sqlite-db" "${{ inputs.sqlite_db }}")
         fi
+        set +e
         node "${{ github.action_path }}/dist/cli.js" scan "${{ inputs.path }}" \
           --fail-on "${{ inputs.fail_on }}" \
           --package-verification "${{ inputs.package_verification }}" \
           "${extra_args[@]}"
+        scan_status=$?
+        set -e
+
+        if [ "${{ inputs.step_summary }}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$markdown_report" ]; then
+          cat "$markdown_report" >> "$GITHUB_STEP_SUMMARY"
+          printf '\n' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        if [ "${{ inputs.pr_comment }}" = "true" ] && [ -f "$markdown_report" ]; then
+          pr_number="${{ github.event.pull_request.number }}"
+          repo="${GITHUB_REPOSITORY:-${{ github.repository }}}"
+          token="${GITHUB_TOKEN:-${{ github.token }}}"
+          if [ -n "$pr_number" ] && [ -n "$repo" ] && [ -n "$token" ]; then
+            marker="<!-- vibeguard-pr-comment -->"
+            comment_payload="${RUNNER_TEMP:-.}/vibeguard-comment.json"
+            node -e 'const fs = require("fs"); const [markdownPath, payloadPath, marker] = process.argv.slice(1); const markdown = fs.readFileSync(markdownPath, "utf8"); fs.writeFileSync(payloadPath, JSON.stringify({ body: `${marker}\n${markdown}` }));' "$markdown_report" "$comment_payload" "$marker"
+            comments_file="${RUNNER_TEMP:-.}/vibeguard-comments.json"
+            if curl -fsSL \
+              -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$repo/issues/$pr_number/comments?per_page=100" \
+              -o "$comments_file"; then
+              comment_id="$(node -e 'const fs = require("fs"); const [commentsPath, marker] = process.argv.slice(1); const comments = JSON.parse(fs.readFileSync(commentsPath, "utf8")); const match = Array.isArray(comments) ? comments.find((comment) => String(comment.body || "").includes(marker)) : undefined; process.stdout.write(match ? String(match.id) : "");' "$comments_file" "$marker")"
+              if [ -n "$comment_id" ]; then
+                curl -fsSL -X PATCH \
+                  -H "Authorization: Bearer $token" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "https://api.github.com/repos/$repo/issues/comments/$comment_id" \
+                  --data-binary "@$comment_payload" >/dev/null || echo "VibeGuard warning: failed to update PR comment." >&2
+              else
+                curl -fsSL -X POST \
+                  -H "Authorization: Bearer $token" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "https://api.github.com/repos/$repo/issues/$pr_number/comments" \
+                  --data-binary "@$comment_payload" >/dev/null || echo "VibeGuard warning: failed to create PR comment." >&2
+              fi
+            else
+              echo "VibeGuard warning: failed to list PR comments." >&2
+            fi
+          else
+            echo "VibeGuard warning: PR comment requested outside a pull_request event or without a token." >&2
+          fi
+        fi
+
+        exit "$scan_status"

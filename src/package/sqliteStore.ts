@@ -9,6 +9,7 @@ import type {
   PackageResolution
 } from "../types";
 import type { PackageCacheStore } from "./cache";
+import { suggestPackageNames, suggestionSearchTerms } from "./suggestions";
 
 type SqliteModule = typeof import("node:sqlite");
 
@@ -108,6 +109,31 @@ class SqlitePackageDatabase {
     const row = this.database.prepare("SELECT coverage FROM package_index_registry WHERE registry = ?").get(registry);
     const coverage = row?.coverage;
     return coverage === "full" ? "full" : coverage === "partial" ? "partial" : undefined;
+  }
+
+  suggestPackageNames(registry: PackageRegistry, packageName: string, limit = 3): string[] {
+    this.initialize();
+    const terms = suggestionSearchTerms(packageName).slice(0, 4);
+    if (terms.length === 0) {
+      return [];
+    }
+
+    const where = terms.map(() => "package_name LIKE ? ESCAPE '\\'").join(" OR ");
+    const rows = this.database
+      .prepare(
+        `SELECT package_name
+         FROM package_index_package
+         WHERE registry = ? AND (${where})
+         ORDER BY package_name
+         LIMIT 5000`
+      )
+      .all(registry, ...terms.map((term) => `%${escapeLike(term)}%`));
+
+    return suggestPackageNames(
+      packageName,
+      rows.map((row) => String(row.package_name ?? "")),
+      limit
+    );
   }
 
   importPackageNames(
@@ -253,6 +279,10 @@ export class SqlitePackageNameIndex implements PackageNameIndexLike {
     return this.store.coverage(registry);
   }
 
+  async suggest(registry: PackageRegistry, packageName: string, limit = 3): Promise<string[]> {
+    return this.store.suggestPackageNames(registry, packageName, limit);
+  }
+
   async importPackageNames(
     registry: PackageRegistry,
     packageNames: Iterable<string>,
@@ -292,6 +322,10 @@ function createDatabase(databasePath: string): DatabaseLike {
   } catch (error) {
     throw new SqliteUnavailableError(error);
   }
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 function loadSqlite(): SqliteModule {

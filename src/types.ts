@@ -11,6 +11,8 @@ export type FindingType =
   | "path_traversal"
   | "insecure_deserialization"
   | "command_injection"
+  | "open_redirect"
+  | "information_leakage"
   | "missing_security_measure"
   | "other";
 
@@ -71,12 +73,47 @@ export interface ScanOptions {
   l3Analyzer?: L3AnalyzerLike;
   customRules?: CustomRuleLike[];
   ignoreRules?: IgnoreRules;
+  ignoredFindingIds?: string[];
+  dedupWithExistingTools?: boolean;
+  performanceBudgets?: Partial<ScanPerformanceBudgets>;
   now?: number;
 }
 
 export interface ScanResult {
   findings: Finding[];
   elapsedMs: number;
+  performance: ScanPerformance;
+}
+
+export interface ScanTimings {
+  totalMs: number;
+  l1Ms: number;
+  l2Ms: number;
+  l3Ms: number;
+  customRulesMs: number;
+  postProcessingMs: number;
+}
+
+export interface ScanPerformanceBudgets {
+  l1MinMs: number;
+  l1MsPerLine: number;
+  l2Ms: number;
+  l3Ms: number;
+}
+
+export interface ScanBudgetCheck {
+  layer: DetectionLayer;
+  elapsedMs: number;
+  budgetMs: number;
+  exceeded: boolean;
+}
+
+export interface ScanPerformance {
+  file: string;
+  lineCount: number;
+  timings: ScanTimings;
+  budgets: ScanBudgetCheck[];
+  budgetExceeded: boolean;
 }
 
 export interface PackageReference {
@@ -130,6 +167,7 @@ export interface PackageIndexEntry {
 export interface PackageNameIndexLike {
   get(registry: PackageRegistry, packageName: string): Promise<boolean | undefined>;
   coverage(registry: PackageRegistry): Promise<"partial" | "full" | undefined>;
+  suggest?(registry: PackageRegistry, packageName: string, limit?: number): Promise<string[]>;
 }
 
 export interface IgnoreRules {
@@ -154,6 +192,7 @@ export interface VibeGuardConfig {
     l2: boolean;
     l3: boolean;
   };
+  package_verification: "off" | "seed" | "remote";
   llm_provider?: "deepseek" | "claude" | "openai" | "local";
   llm_api_key_stored?: boolean;
   llm_api_key?: null;
@@ -175,6 +214,7 @@ export const defaultConfig: VibeGuardConfig = {
     l2: true,
     l3: false
   },
+  package_verification: "seed",
   llm_provider: "deepseek",
   llm_api_key_stored: false,
   llm_api_key: null,

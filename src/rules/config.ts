@@ -113,7 +113,8 @@ const configRules: ConfigRule[] = [
     regex: /\byaml\.load\s*\(\s*[^,\n)]+?\s*\)/g,
     severity: "high",
     message: "yaml.load() is used without an explicit safe loader.",
-    suggestion: "Use yaml.safe_load() or pass SafeLoader explicitly."
+    suggestion: "Use yaml.safe_load() or pass SafeLoader explicitly.",
+    replacement: (evidence) => evidence.replace(/\byaml\.load\s*\(/, "yaml.safe_load(")
   }
 ];
 

@@ -13,6 +13,7 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { loadCustomRules } from "./customRules";
 import { defaultIgnoreRulesPath, loadIgnoreRules } from "./ignore";
+import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
@@ -23,15 +24,23 @@ interface LspSettings {
   packageVerification: "off" | "seed" | "remote";
   enableL2: boolean;
   enableL3: boolean;
+  dedupWithExistingTools: boolean;
   customRules?: string[];
+  ignoredFindings?: string[];
   ignoreRulesPath?: string;
+  llmProvider?: LlmProvider;
+  llmModel?: string;
+  llmBaseUrl?: string;
+  llmApiKeyEnv?: string;
 }
 
 const defaultSettings: LspSettings = {
   enabled: true,
   packageVerification: "seed",
   enableL2: true,
-  enableL3: false
+  enableL3: false,
+  llmProvider: "deepseek",
+  dedupWithExistingTools: true
 };
 
 const connection = createConnection(ProposedFeatures.all);
@@ -98,15 +107,61 @@ async function validateDocument(document: TextDocument): Promise<void> {
       packageVerification: settings.packageVerification,
       includeSast: settings.enableL2,
       includeL3: settings.enableL3,
+      l3Analyzer: createLspL3Analyzer(),
       packageVerifier: verifier,
-      customRules: await loadCustomRules(settings.customRules ?? []),
-      ignoreRules: await loadIgnoreRules(settings.ignoreRulesPath?.trim() || defaultIgnoreRulesPath())
+      customRules: await loadConfiguredCustomRules(),
+      ignoreRules: await loadIgnoreRules(settings.ignoreRulesPath?.trim() || defaultIgnoreRulesPath()),
+      ignoredFindingIds: settings.ignoredFindings,
+      dedupWithExistingTools: settings.dedupWithExistingTools
     }
   );
+  if (result.performance.budgetExceeded) {
+    const warning = result.performance.budgets.find((check) => check.exceeded);
+    if (warning) {
+      connection.console.warn(
+        `VibeGuard performance budget warning: ${warning.layer} ${filePathFromUri(document.uri)} ${formatMs(
+          warning.elapsedMs
+        )} > ${formatMs(warning.budgetMs)}`
+      );
+    }
+  }
 
   connection.sendDiagnostics({
     uri: document.uri,
     diagnostics: result.findings.filter((finding) => !finding.dismissed).map(toDiagnostic)
+  });
+}
+
+function formatMs(value: number): string {
+  if (value < 1000) {
+    return `${value.toFixed(value < 10 ? 1 : 0)}ms`;
+  }
+  return `${(value / 1000).toFixed(2)}s`;
+}
+
+async function loadConfiguredCustomRules() {
+  try {
+    return await loadCustomRules(settings.customRules ?? []);
+  } catch (error) {
+    connection.console.warn(`VibeGuard custom rules error: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+function createLspL3Analyzer(): LlmSemanticAnalyzer | undefined {
+  if (!settings.enableL3) {
+    return undefined;
+  }
+  const provider = settings.llmProvider ?? "deepseek";
+  const apiKey = getLlmApiKeyFromEnv(provider, settings.llmApiKeyEnv);
+  if (provider !== "local" && !apiKey) {
+    return undefined;
+  }
+  return new LlmSemanticAnalyzer({
+    provider,
+    apiKey,
+    model: settings.llmModel,
+    baseUrl: settings.llmBaseUrl
   });
 }
 

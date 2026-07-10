@@ -1,4 +1,5 @@
 import { stringify } from "yaml";
+import { aiPatternRules } from "./rules/aiPatterns";
 import type { DetectionLayer, FindingType, Severity } from "./types";
 
 export interface SemgrepExportRule {
@@ -16,6 +17,18 @@ export interface SemgrepExportRule {
 export interface SemgrepExportOptions {
   rulePrefix?: string;
 }
+
+const aiPatternSemgrepRules: SemgrepExportRule[] = aiPatternRules.map((rule) => ({
+  id: rule.id,
+  vibeguardRuleId: rule.id,
+  languages: rule.languages ?? ["generic"],
+  severity: rule.severity,
+  detectionLayer: "L1",
+  findingType: "ai_pattern_error",
+  message: rule.message,
+  suggestion: rule.suggestion,
+  patternRegex: rule.patternRegex
+}));
 
 export const semgrepExportRules: SemgrepExportRule[] = [
   {
@@ -41,6 +54,61 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,255}\\b"
   },
   {
+    id: "hardcoded_secret_slack_token",
+    vibeguardRuleId: "hardcoded_secret_slack_token",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "Slack token appears to be hardcoded.",
+    suggestion: "Move the token to an environment variable or secret manager and rotate the exposed value.",
+    patternRegex: "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b"
+  },
+  {
+    id: "hardcoded_secret_stripe_key",
+    vibeguardRuleId: "hardcoded_secret_stripe_key",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "Stripe API key appears to be hardcoded.",
+    suggestion: "Move the key to a secret manager and rotate the exposed value.",
+    patternRegex: "\\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\\b"
+  },
+  {
+    id: "hardcoded_secret_google_api_key",
+    vibeguardRuleId: "hardcoded_secret_google_api_key",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "Google API key appears to be hardcoded.",
+    suggestion: "Move the key to a secret manager and rotate the exposed value.",
+    patternRegex: "\\bAIza[0-9A-Za-z_-]{35}\\b"
+  },
+  {
+    id: "hardcoded_secret_npm_token",
+    vibeguardRuleId: "hardcoded_secret_npm_token",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "npm access token appears to be hardcoded.",
+    suggestion: "Move the token to a secret manager and rotate the exposed value.",
+    patternRegex: "\\bnpm_[A-Za-z0-9]{36}\\b"
+  },
+  {
+    id: "hardcoded_secret_anthropic_key",
+    vibeguardRuleId: "hardcoded_secret_anthropic_key",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "Anthropic API key appears to be hardcoded.",
+    suggestion: "Move the key to a secret manager and rotate the exposed value.",
+    patternRegex: "\\bsk-ant-[A-Za-z0-9_-]{32,}\\b"
+  },
+  {
     id: "hardcoded_secret_openai_key",
     vibeguardRuleId: "hardcoded_secret_openai_key",
     languages: ["generic"],
@@ -49,7 +117,29 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     findingType: "hardcoded_secret",
     message: "OpenAI API key appears to be hardcoded.",
     suggestion: "Move the secret to an environment variable or OS keychain and rotate the exposed value.",
-    patternRegex: "\\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\\b"
+    patternRegex: "\\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{32,}\\b"
+  },
+  {
+    id: "hardcoded_secret_jwt",
+    vibeguardRuleId: "hardcoded_secret_jwt",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "JWT token appears to be hardcoded.",
+    suggestion: "Move the token to a secure runtime source and rotate it if it has been committed.",
+    patternRegex: "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b"
+  },
+  {
+    id: "hardcoded_secret_private_key",
+    vibeguardRuleId: "hardcoded_secret_private_key",
+    languages: ["generic"],
+    severity: "critical",
+    detectionLayer: "L1",
+    findingType: "hardcoded_secret",
+    message: "Private key block appears to be hardcoded.",
+    suggestion: "Remove the private key from source control and rotate the exposed credential.",
+    patternRegex: "-----BEGIN (?:RSA |EC |OPENSSH |DSA |ED25519 )?PRIVATE KEY-----"
   },
   {
     id: "hardcoded_secret_database_url",
@@ -63,49 +153,18 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\b(?:postgres|postgresql|mysql|mongodb|redis)://[^:\\s/@]+:[^@\\s]+@[^)\\s'\"]+"
   },
   {
-    id: "ai_pattern_default_password",
-    vibeguardRuleId: "ai_pattern_default_password",
+    id: "hardcoded_secret_high_entropy_assignment",
+    vibeguardRuleId: "hardcoded_secret_high_entropy_assignment",
     languages: ["generic"],
     severity: "critical",
     detectionLayer: "L1",
-    findingType: "ai_pattern_error",
-    message: "Default password is hardcoded.",
-    suggestion: "Generate a unique secret per environment and force users to set their own password.",
-    patternRegex: "\\b(?:password|passwd|pwd)\\s*[:=]\\s*[\"'](?:admin|password|123456|12345678|changeme)[\"']"
+    findingType: "hardcoded_secret",
+    message: "Sensitive value is assigned a high-entropy-looking literal.",
+    suggestion: "Read this value from an environment variable or secret manager instead of committing it.",
+    patternRegex:
+      "(?:\\b(?:[A-Za-z_][A-Za-z0-9_]*(?:api[_-]?key|secret|password|passwd|pwd|token|private[_-]?key|jwt[_-]?secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|webhook[_-]?secret|signing[_-]?secret|credential|authorization)[A-Za-z0-9_]*|(?:api[_-]?key|secret|password|passwd|pwd|token|private[_-]?key|jwt[_-]?secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|webhook[_-]?secret|signing[_-]?secret|credential|authorization)[A-Za-z0-9_]*)\\b|[\"'](?:authorization|x[_-]?api[_-]?key|api[_-]?key|secret|secret[_-]?key|password|passwd|pwd|token|private[_-]?key|jwt[_-]?secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|webhook[_-]?secret|signing[_-]?secret|credential)[\"'])\\s*[:=]\\s*[\"'`](?:Bearer\\s+)?[A-Za-z0-9_+./=-]{20,}[\"'`]"
   },
-  {
-    id: "ai_pattern_hardcoded_jwt_secret",
-    vibeguardRuleId: "ai_pattern_hardcoded_jwt_secret",
-    languages: ["generic"],
-    severity: "critical",
-    detectionLayer: "L1",
-    findingType: "ai_pattern_error",
-    message: "JWT secret is hardcoded.",
-    suggestion: "Load JWT_SECRET from a secret manager or environment variable and rotate the committed value.",
-    patternRegex: "\\bJWT_SECRET\\b\\s*[:=]\\s*[\"'`](?!process\\.env|import\\.meta\\.env|os\\.getenv)[^\"'`]{8,}[\"'`]"
-  },
-  {
-    id: "ai_pattern_frontend_secret_name",
-    vibeguardRuleId: "ai_pattern_frontend_secret_name",
-    languages: ["generic"],
-    severity: "critical",
-    detectionLayer: "L1",
-    findingType: "ai_pattern_error",
-    message: "Secret-like value is exposed through a frontend environment variable.",
-    suggestion: "Move secrets to server-side configuration; frontend-prefixed variables are public.",
-    patternRegex: "\\b(?:VITE|NEXT_PUBLIC|REACT_APP)_[A-Z0-9_]*(?:SECRET|PRIVATE|TOKEN|API_KEY)[A-Z0-9_]*\\s*[:=]\\s*[\"'`][^\"'`]{8,}[\"'`]"
-  },
-  {
-    id: "ai_pattern_dangerously_set_inner_html",
-    vibeguardRuleId: "ai_pattern_dangerously_set_inner_html",
-    languages: ["javascript", "typescript"],
-    severity: "high",
-    detectionLayer: "L1",
-    findingType: "ai_pattern_error",
-    message: "dangerouslySetInnerHTML is used without an obvious sanitizer.",
-    suggestion: "Sanitize HTML with a trusted sanitizer before passing it to dangerouslySetInnerHTML.",
-    patternRegex: "dangerouslySetInnerHTML\\s*=\\s*\\{\\s*\\{\\s*__html\\s*:\\s*(?!DOMPurify|sanitizeHtml|sanitize)[^}]+}\\s*}"
-  },
+  ...aiPatternSemgrepRules,
   {
     id: "insecure_config_debug_true",
     vibeguardRuleId: "insecure_config_debug_true",
@@ -237,6 +296,28 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     message: "Command execution appears to include user-controlled input.",
     suggestion: "Use argument arrays, strict allowlists, and avoid shell=True or string commands.",
     patternRegex: "\\b(?:os\\.system|subprocess\\.(?:call|run|Popen)|child_process\\.exec)\\s*\\([^\\)\\n]*(?:request|req\\.|input|body|params|\\$\\{)"
+  },
+  {
+    id: "sast_open_redirect_user_input",
+    vibeguardRuleId: "sast_open_redirect_user_input",
+    languages: ["javascript", "typescript", "python"],
+    severity: "medium",
+    detectionLayer: "L2",
+    findingType: "open_redirect",
+    message: "Redirect target appears to come from user-controlled input.",
+    suggestion: "Redirect only to relative paths or allowlisted hosts after validating the destination.",
+    patternRegex: "\\b(?:res|response)\\.redirect\\s*\\(\\s*(?:req\\.(?:query|body|params)|request\\.(?:query|body|params))|\\bredirect\\s*\\(\\s*(?:request\\.(?:args|GET|POST)|req\\.(?:query|body|params))"
+  },
+  {
+    id: "sast_information_leakage_error_details",
+    vibeguardRuleId: "sast_information_leakage_error_details",
+    languages: ["javascript", "typescript", "python"],
+    severity: "low",
+    detectionLayer: "L2",
+    findingType: "information_leakage",
+    message: "Detailed error information is returned to the client.",
+    suggestion: "Return a generic error response and log stack traces or exception details server-side only.",
+    patternRegex: "\\b(?:res|response)\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\b(?:res|response)\\.status\\s*\\(\\s*500\\s*\\)\\s*\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\breturn\\s+(?:traceback\\.format_exc\\s*\\(\\s*\\)|str\\s*\\(\\s*(?:err(?:or)?|exception|e)\\s*\\))"
   }
 ];
 

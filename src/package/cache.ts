@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import type { PackageIndexEntry, PackageNameIndexLike, PackageRegistry, PackageResolution } from "../types";
+import { suggestPackageNames } from "./suggestions";
 
 export interface PackageCacheStore {
   get(registry: PackageRegistry, packageName: string): Promise<PackageResolution | undefined>;
@@ -91,6 +92,15 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
   async coverage(registry: PackageRegistry): Promise<"partial" | "full" | undefined> {
     await this.load();
     return this.registries.get(registry)?.coverage;
+  }
+
+  async suggest(registry: PackageRegistry, packageName: string, limit = 3): Promise<string[]> {
+    await this.load();
+    const data = this.registries.get(registry);
+    if (!data) {
+      return [];
+    }
+    return suggestPackageNames(packageName, data.packages, limit);
   }
 
   async importPackageNames(

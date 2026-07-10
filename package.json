@@ -31,6 +31,10 @@
     "onStartupFinished",
     "onCommand:vibeguard.scanCurrentFile",
     "onCommand:vibeguard.scanWorkspace",
+    "onCommand:vibeguard.syncPackageCache",
+    "onCommand:vibeguard.setLlmApiKey",
+    "onCommand:vibeguard.deleteLlmApiKey",
+    "onCommand:vibeguard.showLlmStatus",
     "onCommand:vibeguard.applyFix",
     "onView:vibeguardFindings"
   ],
@@ -55,6 +59,22 @@
       {
         "command": "vibeguard.openIgnoreRules",
         "title": "VibeGuard: Open Ignore Rules"
+      },
+      {
+        "command": "vibeguard.syncPackageCache",
+        "title": "VibeGuard: Sync Package Cache"
+      },
+      {
+        "command": "vibeguard.setLlmApiKey",
+        "title": "VibeGuard: Set LLM API Key"
+      },
+      {
+        "command": "vibeguard.deleteLlmApiKey",
+        "title": "VibeGuard: Delete LLM API Key"
+      },
+      {
+        "command": "vibeguard.showLlmStatus",
+        "title": "VibeGuard: Show LLM Status"
       },
       {
         "command": "vibeguard.ignoreFinding",
@@ -129,15 +149,115 @@
           "default": "seed",
           "description": "How VibeGuard verifies package names. Seed mode is instant and offline; remote mode also checks npm/PyPI registries."
         },
+        "vibeguard.configPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to config.json. Defaults to ~/.vibeguard/config.json."
+        },
+        "vibeguard.autoSyncPackageCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically sync the local package-name cache in the background when VSCode starts."
+        },
+        "vibeguard.packageCacheLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "npm",
+              "pypi",
+              "cargo",
+              "gomod",
+              "maven"
+            ]
+          },
+          "default": [
+            "npm",
+            "pypi"
+          ],
+          "description": "Package registries to keep in the local package-name cache. Explicit VSCode settings override config.json package_cache.languages."
+        },
+        "vibeguard.packageCacheUpdateInterval": {
+          "type": "string",
+          "enum": [
+            "daily",
+            "weekly"
+          ],
+          "default": "daily",
+          "description": "How often VSCode background sync refreshes package-name indexes."
+        },
+        "vibeguard.packageCacheLightweightMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use lightweight partial package-name indexes for faster cold starts."
+        },
         "vibeguard.enableL2": {
           "type": "boolean",
           "default": true,
           "description": "Enable lightweight asynchronous SAST rules for SQL injection, XSS, SSRF, path traversal, unsafe deserialization, and command injection."
         },
+        "vibeguard.l2DebounceMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "maximum": 30000,
+          "description": "Delay in milliseconds before VSCode runs L2 SAST analysis after edits. L1 diagnostics still run immediately."
+        },
         "vibeguard.enableL3": {
           "type": "boolean",
           "default": false,
-          "description": "Enable local semantic security checks for endpoints missing authentication, rate limiting, validation, or output encoding."
+          "description": "Enable L3 semantic security checks. When an LLM provider and credential are available, VibeGuard uses them; otherwise it falls back to local endpoint heuristics."
+        },
+        "vibeguard.l3DebounceMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 0,
+          "maximum": 30000,
+          "description": "Delay in milliseconds before VSCode runs L3 semantic analysis after edits. Saves and manual scans run L3 immediately."
+        },
+        "vibeguard.llmProvider": {
+          "type": "string",
+          "enum": [
+            "deepseek",
+            "claude",
+            "openai",
+            "local"
+          ],
+          "default": "deepseek",
+          "description": "LLM provider for VibeGuard L3 semantic analysis. API keys are stored with VSCode SecretStorage or read from environment variables."
+        },
+        "vibeguard.llmModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional model override for L3 semantic analysis."
+        },
+        "vibeguard.llmBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional provider base URL override for L3 semantic analysis, useful for compatible gateways or local Ollama hosts."
+        },
+        "vibeguard.dedupWithExistingTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Dismiss duplicate L2 findings when nearby SonarQube, Snyk, Semgrep, or CodeQL annotations already cover the same issue."
+        },
+        "vibeguard.storeFindings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Store scan runs and findings in a local SQLite database."
+        },
+        "vibeguard.findingsDbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to findings.db. Defaults to ~/.vibeguard/findings.db."
+        },
+        "vibeguard.ignoredFindings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Exact finding IDs to dismiss in addition to config.json ignored_findings."
         },
         "vibeguard.customRules": {
           "type": "array",

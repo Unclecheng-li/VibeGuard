@@ -70,6 +70,24 @@ export function applyIgnoreRules(findings: Finding[], rules: IgnoreRules | undef
   });
 }
 
+export function applyIgnoredFindingIds(findings: Finding[], findingIds: string[] | undefined): Finding[] {
+  const ids = new Set((findingIds ?? []).filter(Boolean));
+  if (ids.size === 0) {
+    return findings;
+  }
+
+  return findings.map((finding) => {
+    if (finding.dismissed || !ids.has(finding.id)) {
+      return finding;
+    }
+    return {
+      ...finding,
+      dismissed: true,
+      dismissed_reason: "Matched config.ignored_findings"
+    };
+  });
+}
+
 export function matchesIgnoreRule(finding: Finding, rule: IgnoreRuleEntry): boolean {
   if (!matchesRuleId(finding, rule)) {
     return false;

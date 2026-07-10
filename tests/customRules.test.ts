@@ -75,6 +75,48 @@ test("runs custom rules through the scanner pipeline", async () => {
   assert.equal(result.findings.some((finding) => finding.detection_rule === "custom.company_public_s3_acl"), true);
 });
 
+test("scanner only runs custom rules for enabled layers", async () => {
+  const rules = parseCustomRules(`
+rules:
+  - id: company_l2_exec
+    pattern: "dangerousExec"
+    severity: high
+    type: command_injection
+    layer: L2
+    message: "Custom L2 command execution rule."
+`).rules;
+
+  const l1Only = await scanSourceFile(
+    {
+      filePath: "task.ts",
+      languageId: "typescript",
+      text: `dangerousExec(userInput);`
+    },
+    {
+      packageVerification: "off",
+      detectionLayers: { l1: true, l2: false, l3: false },
+      customRules: rules,
+      now: 1
+    }
+  );
+  const l2Enabled = await scanSourceFile(
+    {
+      filePath: "task.ts",
+      languageId: "typescript",
+      text: `dangerousExec(userInput);`
+    },
+    {
+      packageVerification: "off",
+      detectionLayers: { l1: false, l2: true, l3: false },
+      customRules: rules,
+      now: 1
+    }
+  );
+
+  assert.equal(l1Only.findings.some((finding) => finding.detection_rule === "custom.company_l2_exec"), false);
+  assert.equal(l2Enabled.findings.some((finding) => finding.detection_rule === "custom.company_l2_exec"), true);
+});
+
 test("loads custom rule files from disk", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-custom-rules-"));
   const filePath = path.join(tempDir, "rules.yml");

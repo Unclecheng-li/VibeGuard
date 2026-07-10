@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 import fs from "fs/promises";
 import path from "path";
+import {
+  cloneDefaultConfig,
+  defaultConfigPath,
+  ensureConfigFile,
+  loadConfig,
+  resolveConfigCustomRulePaths,
+  updateIgnoredFinding
+} from "./config";
 import { loadCustomRules } from "./customRules";
+import { defaultFindingsDbPath, SqliteFindingStore, type StoredFinding } from "./findings/storage";
 import { filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
 import { defaultIgnoreRulesPath, expandHome, loadIgnoreRules } from "./ignore";
+import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { defaultIndexPath } from "./package/cache";
+import { syncConfiguredPackageIndexes, type ConfiguredPackageSyncResult } from "./package/configSync";
 import { readPackageNameFile } from "./package/importer";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage, type PackageStorageKind } from "./package/storage";
@@ -15,14 +26,15 @@ import {
   formatGithubAnnotations,
   formatHumanReport,
   formatJsonReport,
+  formatMarkdownReport,
   formatSarifReport
 } from "./reporters";
 import { scanSourceFile } from "./scanner";
 import { formatSemgrepRules } from "./semgrep";
-import type { Finding, PackageRegistry, Severity } from "./types";
+import type { Finding, PackageRegistry, ScanPerformance, Severity } from "./types";
 import { extensionOf, severityMeetsThreshold } from "./utils";
 
-type ReportFormat = "human" | "json" | "sarif";
+type ReportFormat = "human" | "json" | "sarif" | "markdown";
 
 interface CliOptions {
   paths: string[];
@@ -33,17 +45,27 @@ interface CliOptions {
   reportFormat: ReportFormat;
   outputPath?: string;
   sarifPath?: string;
+  markdownPath?: string;
   githubAnnotations: boolean;
   failOn: Severity | "none";
-  packageVerification: "off" | "seed" | "remote";
-  includeSast: boolean;
-  includeL3: boolean;
+  packageVerification?: "off" | "seed" | "remote";
+  includeSast?: boolean;
+  includeL3?: boolean;
   ignoreRulesPath?: string;
   customRulePaths: string[];
   packageIndexPath?: string;
   sqlitePath?: string;
   storage: PackageStorageKind;
   useIgnoreRules: boolean;
+  useConfig: boolean;
+  configPath?: string;
+  dedupWithExistingTools?: boolean;
+  storeFindings: boolean;
+  findingsDbPath?: string;
+  llmProvider?: LlmProvider;
+  llmModel?: string;
+  llmBaseUrl?: string;
+  llmApiKeyEnv?: string;
 }
 
 const supportedExtensions = new Set([
@@ -87,8 +109,36 @@ async function main(): Promise<void> {
     await runPackagesCommand(args.slice(1));
     return;
   }
+  if (args[0] === "config") {
+    await runConfigCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "findings") {
+    await runFindingsCommand(args.slice(1));
+    return;
+  }
 
+  const scanStartedAt = Date.now();
   const options = parseArgs(args);
+  const loadedConfig = options.useConfig
+    ? await loadConfig(options.configPath)
+    : {
+        config: cloneDefaultConfig(),
+        path: path.resolve(expandHome(options.configPath ?? defaultConfigPath())),
+        exists: false
+      };
+  if (options.useConfig && options.configPath && !loadedConfig.exists) {
+    throw new Error(`Config file not found: ${loadedConfig.path}`);
+  }
+  const config = loadedConfig.config;
+  const packageVerification = options.packageVerification ?? config.package_verification;
+  const includeSast = options.includeSast ?? config.detection_layers.l2;
+  const includeL3 = options.includeL3 ?? config.detection_layers.l3;
+  const llmProvider = options.llmProvider ?? config.llm_provider ?? "deepseek";
+  const l3Analyzer = includeL3
+    ? createCliL3Analyzer(llmProvider, options.llmModel, options.llmBaseUrl, options.llmApiKeyEnv)
+    : undefined;
+  const dedupWithExistingTools = options.dedupWithExistingTools ?? config.dedup_with_existing_tools;
   const storage = createPackageStorage({
     kind: options.storage,
     indexPath: options.packageIndexPath,
@@ -99,7 +149,8 @@ async function main(): Promise<void> {
     packageIndex: storage.packageIndex
   });
   const ignoreRules = options.useIgnoreRules ? await loadIgnoreRules(options.ignoreRulesPath) : undefined;
-  const customRules = await loadCustomRules(options.customRulePaths);
+  const configCustomRulePaths = options.useConfig ? resolveConfigCustomRulePaths(config, loadedConfig.path) : [];
+  const customRules = await loadCustomRules([...configCustomRulePaths, ...options.customRulePaths]);
   const collectedFiles = await collectFiles(options.paths);
   const gitCwd = await resolveGitCwd(options.paths);
   const filterResult = await filterScanFiles(collectedFiles, {
@@ -114,6 +165,7 @@ async function main(): Promise<void> {
   }
   const files = filterResult.files;
   const allFindings: Finding[] = [];
+  const performances: ScanPerformance[] = [];
 
   for (const filePath of files) {
     const text = await fs.readFile(filePath, "utf8");
@@ -123,18 +175,33 @@ async function main(): Promise<void> {
         text
       },
       {
-        packageVerification: options.packageVerification,
-        includeSast: options.includeSast,
-        includeL3: options.includeL3,
+        enabled: config.enabled,
+        detectionLayers: {
+          l1: config.detection_layers.l1,
+          l2: includeSast,
+          l3: includeL3
+        },
+        packageVerification,
         packageVerifier: verifier,
+        l3Analyzer,
         customRules,
-        ignoreRules
+        ignoreRules,
+        ignoredFindingIds: config.ignored_findings,
+        dedupWithExistingTools
       }
     );
     allFindings.push(...result.findings);
+    performances.push(result.performance);
   }
 
-  const report = buildScanReport(allFindings);
+  const report = buildScanReport(allFindings, performances);
+  if (options.storeFindings) {
+    try {
+      await storeScanFindings(options, files.length, allFindings, scanStartedAt);
+    } catch (error) {
+      process.stderr.write(`VibeGuard findings storage warning: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
   if (options.githubAnnotations) {
     const annotations = formatGithubAnnotations(report.findings, process.cwd());
     if (annotations) {
@@ -143,6 +210,9 @@ async function main(): Promise<void> {
   }
   if (options.sarifPath) {
     await writeTextFile(options.sarifPath, formatSarifReport(report, process.cwd()));
+  }
+  if (options.markdownPath) {
+    await writeTextFile(options.markdownPath, formatMarkdownReport(report, files.length, process.cwd()));
   }
   await emitPrimaryReport(options, report, files.length);
 
@@ -163,6 +233,10 @@ async function runPackagesCommand(args: string[]): Promise<void> {
   }
   if (subcommand === "sync") {
     await syncPackageIndex(args);
+    return;
+  }
+  if (subcommand === "sync-config") {
+    await syncConfiguredPackageIndexesCommand(args);
     return;
   }
   if (subcommand === "status") {
@@ -192,6 +266,107 @@ async function runRulesCommand(args: string[]): Promise<void> {
   throw new Error(`Unknown rules subcommand: ${subcommand}`);
 }
 
+async function runConfigCommand(args: string[]): Promise<void> {
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "-h" || subcommand === "--help") {
+    printConfigHelp();
+    return;
+  }
+
+  if (subcommand === "init") {
+    await initConfig(args);
+    return;
+  }
+
+  if (subcommand === "path") {
+    console.log(defaultConfigPath());
+    return;
+  }
+  if (subcommand === "ignore-finding") {
+    await updateConfigIgnoredFinding(args, "add");
+    return;
+  }
+  if (subcommand === "unignore-finding") {
+    await updateConfigIgnoredFinding(args, "remove");
+    return;
+  }
+
+  throw new Error(`Unknown config subcommand: ${subcommand}`);
+}
+
+async function updateConfigIgnoredFinding(args: string[], action: "add" | "remove"): Promise<void> {
+  let filePath = defaultConfigPath();
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--path") {
+      filePath = path.resolve(expandHome(args[++index] ?? defaultConfigPath()));
+    } else if (arg.startsWith("--path=")) {
+      filePath = path.resolve(expandHome(arg.slice("--path=".length)));
+    } else if (arg === "-h" || arg === "--help") {
+      printConfigHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  const findingId = positional[0];
+  if (!findingId) {
+    throw new Error(`Usage: vibeguard config ${action === "add" ? "ignore-finding" : "unignore-finding"} <finding-id> [--path path]`);
+  }
+  const result = await updateIgnoredFinding(findingId, action, filePath);
+  const verb = action === "add" ? "Ignored" : "Unignored";
+  console.log(`${verb} finding ${findingId} in ${result.path}`);
+}
+
+async function runFindingsCommand(args: string[]): Promise<void> {
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "-h" || subcommand === "--help") {
+    printFindingsHelp();
+    return;
+  }
+
+  if (subcommand === "status") {
+    await printFindingsStatus(args);
+    return;
+  }
+  if (subcommand === "list") {
+    await listStoredFindings(args);
+    return;
+  }
+  if (subcommand === "prune") {
+    await pruneStoredFindings(args);
+    return;
+  }
+
+  throw new Error(`Unknown findings subcommand: ${subcommand}`);
+}
+
+async function initConfig(args: string[]): Promise<void> {
+  let filePath = defaultConfigPath();
+  let force = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--path") {
+      filePath = path.resolve(expandHome(args[++index] ?? defaultConfigPath()));
+    } else if (arg.startsWith("--path=")) {
+      filePath = path.resolve(expandHome(arg.slice("--path=".length)));
+    } else if (arg === "--force") {
+      force = true;
+    } else if (arg === "-h" || arg === "--help") {
+      printConfigHelp();
+      return;
+    } else {
+      throw new Error(`Unknown config init option: ${arg}`);
+    }
+  }
+
+  const result = await ensureConfigFile(filePath, { force });
+  console.log(`${result.created ? "Created" : "Existing"} VibeGuard config: ${result.path}`);
+}
+
 function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     paths: [],
@@ -200,12 +375,11 @@ function parseArgs(args: string[]): CliOptions {
     reportFormat: "human",
     githubAnnotations: false,
     failOn: "critical",
-    packageVerification: "seed",
-    includeSast: true,
-    includeL3: false,
     customRulePaths: [],
     storage: "auto",
-    useIgnoreRules: true
+    useIgnoreRules: true,
+    useConfig: true,
+    storeFindings: true
   };
 
   const rest = [...args];
@@ -245,16 +419,38 @@ function parseArgs(args: string[]): CliOptions {
       options.sarifPath = path.resolve(expandHome(rest.shift() ?? "vibeguard.sarif"));
     } else if (arg.startsWith("--sarif=")) {
       options.sarifPath = path.resolve(expandHome(arg.slice("--sarif=".length)));
+    } else if (arg === "--markdown") {
+      options.markdownPath = path.resolve(expandHome(rest.shift() ?? "vibeguard-report.md"));
+    } else if (arg.startsWith("--markdown=")) {
+      options.markdownPath = path.resolve(expandHome(arg.slice("--markdown=".length)));
     } else if (arg === "--github-annotations") {
       options.githubAnnotations = true;
     } else if (arg === "--no-github-annotations") {
       options.githubAnnotations = false;
     } else if (arg === "--no-l2") {
       options.includeSast = false;
+    } else if (arg === "--l2") {
+      options.includeSast = true;
     } else if (arg === "--l3") {
       options.includeL3 = true;
     } else if (arg === "--no-l3") {
       options.includeL3 = false;
+    } else if (arg === "--llm-provider") {
+      options.llmProvider = parseLlmProvider(rest.shift() ?? "deepseek");
+    } else if (arg.startsWith("--llm-provider=")) {
+      options.llmProvider = parseLlmProvider(arg.slice("--llm-provider=".length));
+    } else if (arg === "--llm-model") {
+      options.llmModel = rest.shift();
+    } else if (arg.startsWith("--llm-model=")) {
+      options.llmModel = arg.slice("--llm-model=".length);
+    } else if (arg === "--llm-base-url") {
+      options.llmBaseUrl = rest.shift();
+    } else if (arg.startsWith("--llm-base-url=")) {
+      options.llmBaseUrl = arg.slice("--llm-base-url=".length);
+    } else if (arg === "--llm-api-key-env") {
+      options.llmApiKeyEnv = rest.shift();
+    } else if (arg.startsWith("--llm-api-key-env=")) {
+      options.llmApiKeyEnv = arg.slice("--llm-api-key-env=".length);
     } else if (arg === "--fail-on") {
       options.failOn = parseSeverity(rest.shift() ?? "critical");
     } else if (arg.startsWith("--fail-on=")) {
@@ -285,6 +481,22 @@ function parseArgs(args: string[]): CliOptions {
       options.customRulePaths.push(path.resolve(expandHome(arg.slice("--custom-rules=".length))));
     } else if (arg === "--no-ignore") {
       options.useIgnoreRules = false;
+    } else if (arg === "--config") {
+      options.configPath = path.resolve(expandHome(rest.shift() ?? defaultConfigPath()));
+    } else if (arg.startsWith("--config=")) {
+      options.configPath = path.resolve(expandHome(arg.slice("--config=".length)));
+    } else if (arg === "--no-config") {
+      options.useConfig = false;
+    } else if (arg === "--dedup-existing-tools") {
+      options.dedupWithExistingTools = true;
+    } else if (arg === "--no-dedup-existing-tools") {
+      options.dedupWithExistingTools = false;
+    } else if (arg === "--findings-db") {
+      options.findingsDbPath = path.resolve(expandHome(rest.shift() ?? defaultFindingsDbPath()));
+    } else if (arg.startsWith("--findings-db=")) {
+      options.findingsDbPath = path.resolve(expandHome(arg.slice("--findings-db=".length)));
+    } else if (arg === "--no-store-findings") {
+      options.storeFindings = false;
     } else if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
@@ -322,7 +534,7 @@ function parseStorageKind(value: string): PackageStorageKind {
 }
 
 function parseReportFormat(value: string): ReportFormat {
-  if (value === "human" || value === "json" || value === "sarif") {
+  if (value === "human" || value === "json" || value === "sarif" || value === "markdown") {
     return value;
   }
   throw new Error(`Invalid --format value: ${value}`);
@@ -351,12 +563,149 @@ async function emitPrimaryReport(options: CliOptions, report: ReturnType<typeof 
   console.log(output);
 }
 
+async function storeScanFindings(
+  options: CliOptions,
+  fileCount: number,
+  findings: Finding[],
+  startedAt: number
+): Promise<void> {
+  const store = new SqliteFindingStore(options.findingsDbPath ?? defaultFindingsDbPath());
+  try {
+    store.recordScanRun({
+      startedAt,
+      completedAt: Date.now(),
+      cwd: process.cwd(),
+      targetPaths: options.paths,
+      fileCount,
+      findings
+    });
+  } finally {
+    store.close();
+  }
+}
+
+async function printFindingsStatus(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const stats = store.stats();
+    if (options.json) {
+      console.log(JSON.stringify(stats, null, 2));
+      return;
+    }
+    console.log(`Findings DB: ${options.dbPath}`);
+    console.log(`Scans: ${stats.scanCount}`);
+    console.log(`Findings: ${stats.findingCount} (${stats.activeCount} active, ${stats.dismissedCount} dismissed)`);
+    console.log(`Latest scan: ${stats.latestScanAt ? new Date(stats.latestScanAt).toISOString() : "none"}`);
+  } finally {
+    store.close();
+  }
+}
+
+async function listStoredFindings(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const findings = store.listFindings({
+      limit: options.limit,
+      includeDismissed: options.includeDismissed
+    });
+    if (options.json) {
+      console.log(JSON.stringify(findings, null, 2));
+      return;
+    }
+    if (findings.length === 0) {
+      console.log("No stored findings.");
+      return;
+    }
+    for (const finding of findings) {
+      console.log(formatStoredFinding(finding));
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function pruneStoredFindings(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const days = options.days ?? 30;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const result = store.pruneBefore(cutoff);
+    if (options.json) {
+      console.log(JSON.stringify({ ...result, cutoff }, null, 2));
+      return;
+    }
+    console.log(`Deleted ${result.deletedScans} scan(s) and ${result.deletedFindings} finding(s) older than ${days} day(s).`);
+  } finally {
+    store.close();
+  }
+}
+
+function parseFindingsCommandOptions(args: string[]): {
+  dbPath: string;
+  json: boolean;
+  limit: number;
+  includeDismissed: boolean;
+  days?: number;
+} {
+  let dbPath = defaultFindingsDbPath();
+  let json = false;
+  let limit = 50;
+  let includeDismissed = false;
+  let days: number | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--db") {
+      dbPath = path.resolve(expandHome(args[++index] ?? defaultFindingsDbPath()));
+    } else if (arg.startsWith("--db=")) {
+      dbPath = path.resolve(expandHome(arg.slice("--db=".length)));
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "--limit") {
+      limit = parsePositiveInteger(args[++index], "--limit");
+    } else if (arg.startsWith("--limit=")) {
+      limit = parsePositiveInteger(arg.slice("--limit=".length), "--limit");
+    } else if (arg === "--all") {
+      includeDismissed = true;
+    } else if (arg === "--days") {
+      days = parseNonNegativeInteger(args[++index], "--days");
+    } else if (arg.startsWith("--days=")) {
+      days = parseNonNegativeInteger(arg.slice("--days=".length), "--days");
+    } else if (arg === "-h" || arg === "--help") {
+      printFindingsHelp();
+      process.exit(0);
+    } else {
+      throw new Error(`Unknown findings option: ${arg}`);
+    }
+  }
+
+  return { dbPath, json, limit, includeDismissed, days };
+}
+
+function formatStoredFinding(finding: StoredFinding): string {
+  const status = finding.dismissed ? "DISMISSED" : "ACTIVE";
+  const lines = [
+    `[${status}:${finding.severity.toUpperCase()}] ${finding.file}:${finding.line}:${finding.column} ${finding.message}`,
+    `  ${finding.detection_rule} (${finding.detection_layer}) from ${new Date(finding.scanCompletedAt).toISOString()}`
+  ];
+  if (finding.dismissed_reason) {
+    lines.push(`  Dismissed: ${finding.dismissed_reason}`);
+  }
+  return lines.join("\n");
+}
+
 function formatPrimaryReport(format: ReportFormat, report: ReturnType<typeof buildScanReport>, fileCount: number): string {
   if (format === "json") {
     return formatJsonReport(report);
   }
   if (format === "sarif") {
     return formatSarifReport(report, process.cwd());
+  }
+  if (format === "markdown") {
+    return formatMarkdownReport(report, fileCount, process.cwd());
   }
   return formatHumanReport(report, fileCount);
 }
@@ -496,7 +845,7 @@ async function syncPackageIndex(args: string[]): Promise<void> {
 
   const registry = parseSyncableRegistry(positional[0]);
   if (!registry) {
-    throw new Error("Usage: vibeguard packages sync <npm|pypi> [--limit n] [--full|--partial] [--url URL]");
+    throw new Error("Usage: vibeguard packages sync <npm|pypi|cargo|gomod|maven> [--limit n] [--full|--partial] [--url URL]");
   }
 
   const syncResult = await fetchPackageNames({
@@ -518,6 +867,7 @@ async function syncPackageIndex(args: string[]): Promise<void> {
     effectiveCoverage,
     truncated: syncResult.truncated,
     totalAvailable: syncResult.totalAvailable,
+    pagesFetched: syncResult.pagesFetched,
     sourceUrl: syncResult.sourceUrl,
     format: syncResult.format,
     storage: storage.kind,
@@ -532,10 +882,113 @@ async function syncPackageIndex(args: string[]): Promise<void> {
   console.log(
     `Synced ${payload.imported} ${registry} package name(s) from ${payload.format}; index now has ${payload.packageCount} package(s) with ${payload.coverage} coverage.`
   );
+  if (payload.pagesFetched && payload.pagesFetched > 1) {
+    console.log(`Fetched ${payload.pagesFetched} page(s) from the remote registry.`);
+  }
   if (requestedCoverage === "full" && effectiveCoverage !== "full") {
     console.log("Requested full coverage but the remote result was truncated, so VibeGuard stored this as partial coverage.");
   }
   console.log(`${storage.kind === "sqlite" ? "SQLite DB" : "Index"}: ${payload.path}`);
+}
+
+async function syncConfiguredPackageIndexesCommand(args: string[]): Promise<void> {
+  let configPath = defaultConfigPath();
+  let configPathExplicit = false;
+  let useConfig = true;
+  let indexPath = defaultIndexPath();
+  let sqlitePath = defaultSqlitePath();
+  let storageKind: PackageStorageKind = "auto";
+  let limit: number | undefined;
+  let json = false;
+  let force = false;
+  let failFast = false;
+  const sourceUrls: Partial<Record<PackageRegistry, string>> = {};
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--force") {
+      force = true;
+    } else if (arg === "--fail-fast") {
+      failFast = true;
+    } else if (arg === "--no-config") {
+      useConfig = false;
+    } else if (arg === "--config") {
+      configPath = path.resolve(expandHome(args[++index] ?? defaultConfigPath()));
+      configPathExplicit = true;
+    } else if (arg.startsWith("--config=")) {
+      configPath = path.resolve(expandHome(arg.slice("--config=".length)));
+      configPathExplicit = true;
+    } else if (arg === "--limit") {
+      limit = parsePositiveInteger(args[++index], "--limit");
+    } else if (arg.startsWith("--limit=")) {
+      limit = parsePositiveInteger(arg.slice("--limit=".length), "--limit");
+    } else if (arg === "--url") {
+      parseRegistrySourceUrl(args[++index], sourceUrls);
+    } else if (arg.startsWith("--url=")) {
+      parseRegistrySourceUrl(arg.slice("--url=".length), sourceUrls);
+    } else if (arg === "--index") {
+      indexPath = path.resolve(expandHome(args[++index] ?? defaultIndexPath()));
+    } else if (arg.startsWith("--index=")) {
+      indexPath = path.resolve(expandHome(arg.slice("--index=".length)));
+    } else if (arg === "--sqlite-db") {
+      sqlitePath = path.resolve(expandHome(args[++index] ?? defaultSqlitePath()));
+    } else if (arg.startsWith("--sqlite-db=")) {
+      sqlitePath = path.resolve(expandHome(arg.slice("--sqlite-db=".length)));
+    } else if (arg === "--storage") {
+      storageKind = parseStorageKind(args[++index] ?? "auto");
+    } else if (arg.startsWith("--storage=")) {
+      storageKind = parseStorageKind(arg.slice("--storage=".length));
+    } else {
+      throw new Error(`Unknown packages sync-config option: ${arg}`);
+    }
+  }
+
+  const loadedConfig = useConfig
+    ? await loadConfig(configPath)
+    : {
+        config: cloneDefaultConfig(),
+        path: path.resolve(expandHome(configPath)),
+        exists: false
+      };
+  if (useConfig && configPathExplicit && !loadedConfig.exists) {
+    throw new Error(`Config file not found: ${loadedConfig.path}`);
+  }
+
+  const storage = createPackageStorage({
+    kind: storageKind,
+    indexPath,
+    sqlitePath
+  });
+  const result = await syncConfiguredPackageIndexes({
+    config: loadedConfig.config,
+    storage,
+    limit,
+    force,
+    sourceUrls,
+    continueOnError: !failFast
+  });
+
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          ...result,
+          configPath: loadedConfig.path,
+          configExists: loadedConfig.exists
+        },
+        null,
+        2
+      )
+    );
+  } else {
+    printConfiguredPackageSyncReport(result, loadedConfig.path, loadedConfig.exists);
+  }
+
+  if (result.results.some((entry) => entry.status === "failed")) {
+    process.exitCode = 1;
+  }
 }
 
 async function printPackageIndexStatus(args: string[]): Promise<void> {
@@ -632,6 +1085,56 @@ async function checkPackageIndex(args: string[]): Promise<void> {
   console.log(`${registry}:${packageName} is ${status} in ${coverage ?? "no"} local index coverage.`);
 }
 
+function printConfiguredPackageSyncReport(
+  result: ConfiguredPackageSyncResult,
+  configPath: string,
+  configExists: boolean
+): void {
+  const mode = result.lightweightMode ? "lightweight" : "full";
+  console.log(
+    `Config-driven package sync (${mode}, ${result.updateInterval}) using ${result.storage} storage: ${result.path}`
+  );
+  console.log(`Config: ${configPath}${configExists ? "" : " (defaults; file not found)"}`);
+  if (result.results.length === 0) {
+    console.log("No registries configured in package_cache.languages.");
+    return;
+  }
+
+  for (const entry of result.results) {
+    if (entry.status === "skipped") {
+      console.log(
+        `${entry.registry}: fresh, skipped (${entry.packageCount ?? 0} package(s), ${entry.coverage ?? "unknown"} coverage, updated ${formatTimestamp(entry.updatedAt)})`
+      );
+    } else if (entry.status === "synced") {
+      console.log(
+        `${entry.registry}: synced ${entry.imported ?? 0} package name(s), ${entry.coverage ?? entry.effectiveCoverage ?? "partial"} coverage (${entry.reason})`
+      );
+      if (entry.pagesFetched && entry.pagesFetched > 1) {
+        console.log(`${entry.registry}: fetched ${entry.pagesFetched} page(s).`);
+      }
+      if (entry.requestedCoverage === "full" && entry.effectiveCoverage !== "full") {
+        console.log(`${entry.registry}: remote result was truncated, so VibeGuard stored partial coverage.`);
+      }
+    } else {
+      console.log(`${entry.registry}: sync failed (${entry.reason}): ${entry.error}`);
+    }
+  }
+}
+
+function parseRegistrySourceUrl(value: string | undefined, target: Partial<Record<PackageRegistry, string>>): void {
+  const separatorIndex = value?.indexOf("=") ?? -1;
+  const registry = parseSyncableRegistry(separatorIndex > 0 ? value?.slice(0, separatorIndex) : undefined);
+  const sourceUrl = separatorIndex > 0 ? value?.slice(separatorIndex + 1) : undefined;
+  if (!registry || !sourceUrl) {
+    throw new Error("Expected --url <npm|pypi|cargo|gomod|maven>=URL.");
+  }
+  target[registry] = sourceUrl;
+}
+
+function formatTimestamp(timestamp: number | undefined): string {
+  return timestamp ? new Date(timestamp).toISOString() : "unknown";
+}
+
 function parseRegistry(value: string | undefined): PackageRegistry | undefined {
   if (value && ["npm", "pypi", "cargo", "gomod", "maven"].includes(value)) {
     return value as PackageRegistry;
@@ -640,16 +1143,49 @@ function parseRegistry(value: string | undefined): PackageRegistry | undefined {
 }
 
 function parseSyncableRegistry(value: string | undefined): SyncableRegistry | undefined {
-  if (value === "npm" || value === "pypi") {
-    return value;
+  if (value && ["npm", "pypi", "cargo", "gomod", "maven"].includes(value)) {
+    return value as SyncableRegistry;
   }
   return undefined;
+}
+
+function parseLlmProvider(value: string): LlmProvider {
+  if (value === "deepseek" || value === "claude" || value === "openai" || value === "local") {
+    return value;
+  }
+  throw new Error("LLM provider must be one of deepseek, claude, openai, local.");
+}
+
+function createCliL3Analyzer(
+  provider: LlmProvider,
+  model?: string,
+  baseUrl?: string,
+  apiKeyEnv?: string
+): LlmSemanticAnalyzer | undefined {
+  const apiKey = getLlmApiKeyFromEnv(provider, apiKeyEnv);
+  if (provider !== "local" && !apiKey) {
+    return undefined;
+  }
+  return new LlmSemanticAnalyzer({
+    provider,
+    apiKey,
+    model,
+    baseUrl
+  });
 }
 
 function parsePositiveInteger(value: string | undefined, name: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeInteger(value: string | undefined, name: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer.`);
   }
   return parsed;
 }
@@ -707,28 +1243,42 @@ function printHelp(): void {
   console.log(`VibeGuard
 
 Usage:
-  vibeguard scan [paths...] [--json|--format human|json|sarif] [--output path]
-                 [--sarif path] [--github-annotations]
+  vibeguard scan [paths...] [--json|--format human|json|sarif|markdown] [--output path]
+                 [--sarif path] [--markdown path] [--github-annotations]
                  [--mode full-scan|ai-code-scan] [--ai-detection author|message|aggressive]
                  [--base-ref ref] [--head-ref ref]
                  [--fail-on critical|high|medium|low|info|none]
                  [--package-verification seed|remote|off] [--ignore-rules path]
-                 [--custom-rules path]
+                 [--custom-rules path] [--config path] [--no-config]
                  [--storage auto|json|sqlite] [--package-index path] [--sqlite-db path]
-                 [--no-ignore] [--no-l2] [--l3]
-  vibeguard packages <import|sync|status|check> ...
+                 [--no-ignore] [--dedup-existing-tools|--no-dedup-existing-tools]
+                 [--findings-db path] [--no-store-findings]
+                 [--no-l2] [--l2] [--l3] [--no-l3]
+                 [--llm-provider deepseek|claude|openai|local] [--llm-model name]
+                 [--llm-base-url url] [--llm-api-key-env ENV_VAR]
+  vibeguard config init [--path path] [--force]
+  vibeguard config path
+  vibeguard config ignore-finding <finding-id> [--path path]
+  vibeguard config unignore-finding <finding-id> [--path path]
+  vibeguard findings <status|list|prune> [--db path] [--json]
+  vibeguard packages <import|sync|sync-config|status|check> ...
   vibeguard rules export-semgrep [--output path] [--prefix id-prefix]
 
 Examples:
   vibeguard scan .
   vibeguard scan src --l3
+  DEEPSEEK_API_KEY=... vibeguard scan src --l3 --llm-provider deepseek
   vibeguard scan src --json --package-verification remote --fail-on high
   vibeguard scan . --sarif vibeguard.sarif --github-annotations
+  vibeguard scan . --markdown vibeguard-report.md
   vibeguard scan . --mode ai-code-scan --base-ref origin/main --head-ref HEAD
   vibeguard scan src --custom-rules ./vibeguard-rules.yml
+  vibeguard findings list --limit 20
+  vibeguard config init
   vibeguard rules export-semgrep --output vibeguard-semgrep.yml
   vibeguard packages import npm ./npm-packages.txt --partial
   vibeguard packages sync npm --limit 100000 --partial
+  vibeguard packages sync-config --config ~/.vibeguard/config.json
   vibeguard scan src --package-index ~/.vibeguard/package-index.json
 `);
 }
@@ -738,8 +1288,10 @@ function printPackagesHelp(): void {
 
 Usage:
   vibeguard packages import <registry> <file> [--full|--partial] [--index path] [--json]
-  vibeguard packages sync <npm|pypi> [--limit n] [--full|--partial] [--url URL]
+  vibeguard packages sync <npm|pypi|cargo|gomod|maven> [--limit n] [--full|--partial] [--url URL]
                           [--storage auto|json|sqlite] [--index path] [--sqlite-db path] [--json]
+  vibeguard packages sync-config [--config path] [--force] [--limit n] [--url registry=URL]
+                                 [--storage auto|json|sqlite] [--index path] [--sqlite-db path] [--json]
   vibeguard packages status [--storage auto|json|sqlite] [--index path] [--sqlite-db path] [--json]
   vibeguard packages check <registry> <package> [--storage auto|json|sqlite] [--index path] [--sqlite-db path] [--json]
 
@@ -752,6 +1304,12 @@ Supported import formats:
 Remote sync defaults:
   - npm: https://replicate.npmjs.com/_all_docs
   - pypi: https://pypi.org/simple/
+  - cargo: https://crates.io/api/v1/crates
+  - gomod: https://index.golang.org/index
+  - maven: https://search.maven.org/solrsearch/select?q=*:*&rows=100&wt=json
+
+Config-driven sync reads package_cache.languages, update_interval, and lightweight_mode from config.json.
+Cargo and Maven sync paginate when needed. Lightweight mode uses a 100000-name partial index target where supported; Cargo currently uses a 100-name page cap.
 `);
 }
 
@@ -764,6 +1322,35 @@ Usage:
 Examples:
   vibeguard rules export-semgrep
   vibeguard rules export-semgrep --output vibeguard-semgrep.yml
+`);
+}
+
+function printConfigHelp(): void {
+  console.log(`VibeGuard config
+
+Usage:
+  vibeguard config init [--path path] [--force]
+  vibeguard config path
+  vibeguard config ignore-finding <finding-id> [--path path]
+  vibeguard config unignore-finding <finding-id> [--path path]
+
+Scan defaults:
+  vibeguard scan . --config ~/.vibeguard/config.json
+  vibeguard scan . --no-config
+`);
+}
+
+function printFindingsHelp(): void {
+  console.log(`VibeGuard findings
+
+Usage:
+  vibeguard findings status [--db path] [--json]
+  vibeguard findings list [--db path] [--limit n] [--all] [--json]
+  vibeguard findings prune [--db path] [--days n] [--json]
+
+Scan storage:
+  vibeguard scan . --findings-db ~/.vibeguard/findings.db
+  vibeguard scan . --no-store-findings
 `);
 }
 
