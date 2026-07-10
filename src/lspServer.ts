@@ -177,7 +177,8 @@ function createLspL3Analyzer(): LlmSemanticAnalyzer | undefined {
     provider,
     apiKey,
     model: settings.llmModel,
-    baseUrl: settings.llmBaseUrl
+    // LSP settings may come from a workspace; keep a Pro credential on its configured service origin.
+    baseUrl: provider === "vibeguard" ? undefined : settings.llmBaseUrl
   });
 }
 

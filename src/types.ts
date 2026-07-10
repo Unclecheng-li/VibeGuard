@@ -193,7 +193,7 @@ export interface VibeGuardConfig {
     l3: boolean;
   };
   package_verification: "off" | "seed" | "remote";
-  llm_provider?: "deepseek" | "claude" | "openai" | "local";
+  llm_provider?: "deepseek" | "claude" | "openai" | "local" | "vibeguard";
   llm_api_key_stored?: boolean;
   llm_api_key?: null;
   dedup_with_existing_tools: boolean;

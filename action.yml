@@ -15,11 +15,11 @@ inputs:
     required: false
     default: "seed"
   mode:
-    description: "Scan mode: full-scan or ai-code-scan."
+    description: "Scan mode: full-scan or ai-code-scan. AI mode reports only findings overlapping changed, AI-attributed lines."
     required: false
     default: "full-scan"
   ai_detection:
-    description: "AI code detection strategy for ai-code-scan: author, message, or aggressive."
+    description: "AI code detection strategy: author uses git blame attribution, message uses blamed commit messages, aggressive also includes large additions."
     required: false
     default: "author"
   base_ref:
@@ -39,7 +39,7 @@ inputs:
     required: false
     default: "false"
   llm_provider:
-    description: "LLM provider for L3: deepseek, claude, openai, or local."
+    description: "LLM provider for L3: deepseek, claude, openai, local, or vibeguard (official Pro service)."
     required: false
     default: ""
   llm_model:
@@ -74,6 +74,14 @@ inputs:
     description: "Create or update a sticky VibeGuard pull request comment with the Markdown report."
     required: false
     default: "false"
+  pr_review_comments:
+    description: "Create de-duplicated inline GitHub Review comments for active findings on pull request diff lines."
+    required: false
+    default: "false"
+  pr_review_comment_limit:
+    description: "Maximum inline review comments to create per run, from 1 to 50."
+    required: false
+    default: "20"
   dashboard:
     description: "Write a standalone HTML findings dashboard after the scan. Requires store_findings true or an existing findings_db."
     required: false
@@ -90,6 +98,22 @@ inputs:
     description: "Number of top detection rules to show in the generated findings dashboard."
     required: false
     default: "10"
+  compliance:
+    description: "Write a Markdown SOC 2 / ISO 27001 security evidence report after the scan. Requires store_findings true or an existing findings_db."
+    required: false
+    default: "false"
+  compliance_path:
+    description: "Path for the generated compliance evidence report when compliance is true."
+    required: false
+    default: ""
+  compliance_framework:
+    description: "Compliance framework evidence to include: soc2, iso27001, or all."
+    required: false
+    default: "all"
+  compliance_days:
+    description: "Number of recent days to include in the compliance evidence report."
+    required: false
+    default: "90"
   ignore_rules:
     description: "Optional path to ignore-rules.yml."
     required: false
@@ -118,6 +142,22 @@ inputs:
     description: "Optional path to findings.db when store_findings is true."
     required: false
     default: ""
+  findings_project:
+    description: "Stable project identifier for stored or centrally uploaded findings. Defaults to GITHUB_REPOSITORY when available."
+    required: false
+    default: ""
+  findings_endpoint:
+    description: "Optional private dashboard POST /api/ingest endpoint for centralized CI findings."
+    required: false
+    default: ""
+  findings_token_env:
+    description: "Environment variable name containing the dedicated private-dashboard ingest token."
+    required: false
+    default: "VIBEGUARD_FINDINGS_INGEST_TOKEN"
+  findings_upload_required:
+    description: "Fail the scan when a configured private-dashboard findings upload fails."
+    required: false
+    default: "false"
   no_ignore:
     description: "Disable ignore-rules.yml processing."
     required: false
@@ -138,6 +178,9 @@ outputs:
   dashboard_path:
     description: "Path to the generated HTML findings dashboard when dashboard is true."
     value: ${{ steps.vibeguard.outputs.dashboard_path }}
+  compliance_path:
+    description: "Path to the generated Markdown compliance evidence report when compliance is true."
+    value: ${{ steps.vibeguard.outputs.compliance_path }}
 runs:
   using: "composite"
   steps:
@@ -229,12 +272,30 @@ runs:
         if [ -n "${{ inputs.findings_db }}" ]; then
           extra_args+=("--findings-db" "${{ inputs.findings_db }}")
         fi
+        findings_project="${{ inputs.findings_project }}"
+        if [ -z "$findings_project" ]; then
+          findings_project="${GITHUB_REPOSITORY:-${{ github.repository }}}"
+        fi
+        if [ -n "$findings_project" ]; then
+          extra_args+=("--findings-project" "$findings_project")
+        fi
+        if [ -n "${{ inputs.findings_endpoint }}" ]; then
+          extra_args+=("--findings-endpoint" "${{ inputs.findings_endpoint }}" "--findings-token-env" "${{ inputs.findings_token_env }}")
+          if [ "${{ inputs.findings_upload_required }}" = "true" ]; then
+            extra_args+=("--findings-upload-required")
+          fi
+        fi
         if [ -n "${{ inputs.package_index }}" ]; then
           extra_args+=("--package-index" "${{ inputs.package_index }}")
         fi
         extra_args+=("--storage" "${{ inputs.storage }}")
         if [ -n "${{ inputs.sqlite_db }}" ]; then
           extra_args+=("--sqlite-db" "${{ inputs.sqlite_db }}")
+        fi
+        review_findings=""
+        if [ "${{ inputs.pr_review_comments }}" = "true" ]; then
+          review_findings="${RUNNER_TEMP:-.}/vibeguard-pr-review-findings.json"
+          extra_args+=("--json" "--output" "$review_findings")
         fi
         set +e
         node "${{ github.action_path }}/dist/cli.js" scan "${{ inputs.path }}" \
@@ -260,6 +321,25 @@ runs:
             fi
           else
             echo "VibeGuard warning: dashboard requested but store_findings is false and no findings_db was provided." >&2
+          fi
+        fi
+
+        if [ "${{ inputs.compliance }}" = "true" ]; then
+          compliance_report="${{ inputs.compliance_path }}"
+          if [ -z "$compliance_report" ]; then
+            compliance_report="vibeguard-compliance-report.md"
+          fi
+          if [ "${{ inputs.store_findings }}" = "true" ] || [ -n "${{ inputs.findings_db }}" ]; then
+            compliance_args=("--output" "$compliance_report" "--days" "${{ inputs.compliance_days }}" "--framework" "${{ inputs.compliance_framework }}")
+            if [ -n "${{ inputs.findings_db }}" ]; then
+              compliance_args+=("--db" "${{ inputs.findings_db }}")
+            fi
+            node "${{ github.action_path }}/dist/cli.js" findings compliance "${compliance_args[@]}"
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "compliance_path=$compliance_report" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "VibeGuard warning: compliance report requested but store_findings is false and no findings_db was provided." >&2
           fi
         fi
 
@@ -304,6 +384,52 @@ runs:
             fi
           else
             echo "VibeGuard warning: PR comment requested outside a pull_request event or without a token." >&2
+          fi
+        fi
+
+        if [ "${{ inputs.pr_review_comments }}" = "true" ] && [ -n "$review_findings" ] && [ -f "$review_findings" ]; then
+          pr_number="${{ github.event.pull_request.number }}"
+          repo="${GITHUB_REPOSITORY:-${{ github.repository }}}"
+          token="${GITHUB_TOKEN:-${{ github.token }}}"
+          api_url="${GITHUB_API_URL:-https://api.github.com}"
+          review_commit="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$review_commit" ]; then
+            review_commit="$head_ref"
+          fi
+          if [ -n "$pr_number" ] && [ -n "$repo" ] && [ -n "$token" ] && [ -n "$review_commit" ]; then
+            changed_files="${RUNNER_TEMP:-.}/vibeguard-pr-files.json"
+            existing_review_comments="${RUNNER_TEMP:-.}/vibeguard-pr-review-comments.json"
+            review_payload="${RUNNER_TEMP:-.}/vibeguard-pr-review.json"
+            if curl -fsSL \
+              -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api_url/repos/$repo/pulls/$pr_number/files?per_page=100" \
+              -o "$changed_files" && \
+              curl -fsSL \
+                -H "Authorization: Bearer $token" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$api_url/repos/$repo/pulls/$pr_number/comments?per_page=100" \
+                -o "$existing_review_comments"; then
+              review_count=""
+              if review_count="$(node "${{ github.action_path }}/scripts/create-pr-review-payload.cjs" "$review_findings" "$changed_files" "$existing_review_comments" "$review_commit" "${{ inputs.pr_review_comment_limit }}" "$review_payload")" && [[ "$review_count" =~ ^[0-9]+$ ]]; then
+                if [ "$review_count" -gt 0 ]; then
+                  curl -fsSL -X POST \
+                    -H "Authorization: Bearer $token" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    "$api_url/repos/$repo/pulls/$pr_number/reviews" \
+                    --data-binary "@$review_payload" >/dev/null || echo "VibeGuard warning: failed to create inline PR review comments." >&2
+                fi
+              else
+                echo "VibeGuard warning: failed to prepare inline PR review comments." >&2
+              fi
+            else
+              echo "VibeGuard warning: failed to inspect PR files or existing review comments; skipping inline comments to avoid duplicates." >&2
+            fi
+          else
+            echo "VibeGuard warning: inline PR comments requested outside a pull_request event or without a writable token." >&2
           fi
         fi
 

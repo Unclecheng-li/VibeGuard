@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { filterScanFiles, isAiCommit, type GitRunner } from "../src/gitFilter";
+import {
+  filterFindingsToAiLineRanges,
+  filterScanFiles,
+  isAiCommit,
+  parseBlamePorcelain,
+  type GitRunner
+} from "../src/gitFilter";
+import type { Finding } from "../src/types";
+
+const aiHash = "a".repeat(40);
+const humanHash = "b".repeat(40);
 
 test("detects AI commits by author, message, and aggressive mode", () => {
   assert.equal(
@@ -39,16 +49,19 @@ test("detects AI commits by author, message, and aggressive mode", () => {
   );
 });
 
-test("filters ai-code-scan files by changed files and AI authors", async () => {
+test("uses git blame to retain only AI-authored changed lines and findings", async () => {
   const cwd = process.cwd();
-  const files = [path.join(cwd, "src", "ai.ts"), path.join(cwd, "src", "human.ts"), path.join(cwd, "src", "unchanged.ts")];
+  const aiFile = path.join(cwd, "src", "mixed.ts");
+  const humanFile = path.join(cwd, "src", "human.ts");
   const runner = fakeGitRunner({
-    "diff --name-only --diff-filter=ACMRTUXB base...head": "src/ai.ts\nsrc/human.ts\n",
-    "log --format=%an%x00%ae%x00%B%x1e base...head -- src/ai.ts": "github-actions[bot]\x00bot@example.com\x00generated code\x1e",
-    "log --format=%an%x00%ae%x00%B%x1e base...head -- src/human.ts": "Human\x00human@example.com\x00manual change\x1e"
+    "diff --name-only --diff-filter=ACMRTUXB base...head": "src/mixed.ts\nsrc/human.ts\n",
+    "diff --unified=0 base...head -- src/mixed.ts": "@@ -1,0 +1,2 @@\n+const ai = eval(input);\n+const human = safe(input);\n",
+    "blame --line-porcelain -L 1,2 head -- src/mixed.ts": `${blameLine(aiHash, 1, "github-actions[bot]", "bot@example.com")}${blameLine(humanHash, 2, "Human", "human@example.com")}`,
+    "diff --unified=0 base...head -- src/human.ts": "@@ -4,0 +4,1 @@\n+const human = safe(input);\n",
+    "blame --line-porcelain -L 4,4 head -- src/human.ts": blameLine(humanHash, 4, "Human", "human@example.com")
   });
 
-  const result = await filterScanFiles(files, {
+  const result = await filterScanFiles([aiFile, humanFile], {
     mode: "ai-code-scan",
     aiDetection: "author",
     baseRef: "base",
@@ -57,20 +70,25 @@ test("filters ai-code-scan files by changed files and AI authors", async () => {
     runner
   });
 
-  assert.deepEqual(result.files, [path.join(cwd, "src", "ai.ts")]);
-  assert.equal(result.scannedMode, "ai-code-scan");
-  assert.equal(result.warning, undefined);
+  assert.deepEqual(result.files, [aiFile]);
+  assert.deepEqual(result.aiLineRanges?.get(normalize(aiFile)), [{ startLine: 1, endLine: 1 }]);
+  assert.deepEqual(
+    filterFindingsToAiLineRanges([finding(1), finding(2), finding(3)], aiFile, result.aiLineRanges).map((item) => item.line),
+    [1]
+  );
 });
 
-test("filters ai-code-scan files by commit message", async () => {
+test("uses the blamed commit message for line-level AI message attribution", async () => {
   const cwd = process.cwd();
-  const files = [path.join(cwd, "src", "message.ts")];
+  const file = path.join(cwd, "src", "message.ts");
   const runner = fakeGitRunner({
     "diff --name-only --diff-filter=ACMRTUXB base...head": "src/message.ts\n",
-    "log --format=%an%x00%ae%x00%B%x1e base...head -- src/message.ts": "Human\x00human@example.com\x00Co-authored-by: Copilot <bot@example.com>\x1e"
+    "diff --unified=0 base...head -- src/message.ts": "@@ -8,0 +8,1 @@\n+const query = input;\n",
+    "blame --line-porcelain -L 8,8 head -- src/message.ts": blameLine(humanHash, 8, "Human", "human@example.com"),
+    [`show -s --format=%an%x00%ae%x00%B ${humanHash}`]: "Human\x00human@example.com\x00Co-authored-by: Copilot <bot@example.com>\n"
   });
 
-  const result = await filterScanFiles(files, {
+  const result = await filterScanFiles([file], {
     mode: "ai-code-scan",
     aiDetection: "message",
     baseRef: "base",
@@ -79,19 +97,19 @@ test("filters ai-code-scan files by commit message", async () => {
     runner
   });
 
-  assert.deepEqual(result.files, [path.join(cwd, "src", "message.ts")]);
+  assert.deepEqual(result.files, [file]);
+  assert.deepEqual(result.aiLineRanges?.get(normalize(file)), [{ startLine: 8, endLine: 8 }]);
 });
 
-test("uses aggressive diff-size fallback for large added files", async () => {
+test("uses aggressive diff-size fallback for large added files without blame", async () => {
   const cwd = process.cwd();
-  const files = [path.join(cwd, "src", "large.ts")];
+  const file = path.join(cwd, "src", "large.ts");
   const runner = fakeGitRunner({
     "diff --name-only --diff-filter=ACMRTUXB base...head": "src/large.ts\n",
-    "log --format=%an%x00%ae%x00%B%x1e base...head -- src/large.ts": "Human\x00human@example.com\x00manual change\x1e",
-    "diff --numstat base...head -- src/large.ts": "75\t0\tsrc/large.ts\n"
+    "diff --unified=0 base...head -- src/large.ts": "@@ -0,0 +1,75 @@\n"
   });
 
-  const result = await filterScanFiles(files, {
+  const result = await filterScanFiles([file], {
     mode: "ai-code-scan",
     aiDetection: "aggressive",
     baseRef: "base",
@@ -100,7 +118,8 @@ test("uses aggressive diff-size fallback for large added files", async () => {
     runner
   });
 
-  assert.deepEqual(result.files, [path.join(cwd, "src", "large.ts")]);
+  assert.deepEqual(result.files, [file]);
+  assert.deepEqual(result.aiLineRanges?.get(normalize(file)), [{ startLine: 1, endLine: 75 }]);
 });
 
 test("falls back to full scan when git history cannot be inspected", async () => {
@@ -126,6 +145,23 @@ test("falls back to full scan when git history cannot be inspected", async () =>
   assert.match(result.warning ?? "", /falling back to full scan/);
 });
 
+test("parses blame records with boundary commits", () => {
+  const records = parseBlamePorcelain(blameLine(`^${aiHash}`, 7, "Cursor Bot", "cursor@example.com"));
+  assert.deepEqual(records, [
+    {
+      hash: aiHash,
+      line: 7,
+      authorName: "Cursor Bot",
+      authorEmail: "cursor@example.com",
+      message: ""
+    }
+  ]);
+});
+
+function blameLine(hash: string, line: number, authorName: string, authorEmail: string): string {
+  return `${hash} ${line} ${line} 1\nauthor ${authorName}\nauthor-mail <${authorEmail}>\nauthor-time 0\nauthor-tz +0000\ncommitter ${authorName}\ncommitter-mail <${authorEmail}>\nsummary commit\nfilename file.ts\n\tline ${line}\n`;
+}
+
 function fakeGitRunner(responses: Record<string, string>): GitRunner {
   return {
     async run(args: string[]): Promise<string> {
@@ -136,5 +172,26 @@ function fakeGitRunner(responses: Record<string, string>): GitRunner {
       }
       return response;
     }
+  };
+}
+
+function normalize(filePath: string): string {
+  return path.resolve(filePath).replace(/\\/g, "/").toLowerCase();
+}
+
+function finding(line: number): Finding {
+  return {
+    id: `finding-${line}`,
+    type: "ai_pattern_error",
+    severity: "high",
+    message: "Unsafe AI-generated code.",
+    file: "mixed.ts",
+    line,
+    column: 1,
+    evidence: "code",
+    detection_layer: "L1",
+    detection_rule: "ai_pattern_eval",
+    timestamp: 1,
+    dismissed: false
   };
 }

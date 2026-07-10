@@ -33,6 +33,17 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
         highRiskRate: 1
       }
     ],
+    projectCounts: [
+      {
+        key: "acme/payments-api",
+        scanCount: 2,
+        findingCount: 4,
+        activeCount: 3,
+        dismissedCount: 1,
+        highRiskCount: 2,
+        highRiskRate: 2 / 3
+      }
+    ],
     topRules: [
       {
         key: "sast_sql_template_interpolation",
@@ -60,6 +71,8 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
   assert.match(html, /Top Detection Rules/);
   assert.match(html, /Dismissal Reasons/);
   assert.match(html, /Developer Risk/);
+  assert.match(html, /Project Risk/);
+  assert.match(html, /acme\/payments-api/);
   assert.match(html, /Ada Lovelace/);
   assert.match(html, /false_positive: migration fixture/);
   assert.match(html, /Risk posture/);
@@ -77,6 +90,7 @@ test("escapes dashboard text and embedded JSON safely", () => {
     typeCounts: [{ key: "other", count: 1, activeCount: 1, dismissedCount: 0 }],
     dismissedReasonCounts: [],
     authorCounts: [],
+    projectCounts: [],
     topRules: [
       {
         key: "</script><script>alert(1)</script>",

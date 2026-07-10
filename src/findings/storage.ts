@@ -23,6 +23,8 @@ export interface RecordScanRunInput {
   scanId?: string;
   startedAt: number;
   completedAt?: number;
+  /** Stable repository or application identifier for centralized team reporting. */
+  project?: string;
   cwd: string;
   targetPaths: string[];
   fileCount: number;
@@ -34,6 +36,7 @@ export interface StoredScanRun {
   scanId: string;
   startedAt: number;
   completedAt: number;
+  project?: string;
   cwd: string;
   targetPaths: string[];
   fileCount: number;
@@ -45,6 +48,7 @@ export interface StoredScanRun {
 export interface StoredFinding extends Finding {
   scanId: string;
   scanCompletedAt: number;
+  project?: string;
   authorName?: string;
   authorEmail?: string;
 }
@@ -57,6 +61,34 @@ export interface FindingAuthor {
 export interface FindingQuery {
   limit?: number;
   includeDismissed?: boolean;
+  project?: string;
+}
+
+export type AuditAuthentication = "oidc" | "token" | "ingest" | "anonymous";
+export type AuditOutcome = "success" | "denied";
+
+export interface AuditEventInput {
+  timestamp?: number;
+  subject?: string;
+  role?: "viewer" | "analyst" | "admin" | "none";
+  authentication: AuditAuthentication;
+  action: string;
+  outcome?: AuditOutcome;
+  details?: Record<string, string | number | boolean>;
+}
+
+export interface StoredAuditEvent extends Required<Pick<AuditEventInput, "authentication" | "action">> {
+  id: string;
+  timestamp: number;
+  subject?: string;
+  role?: AuditEventInput["role"];
+  outcome: AuditOutcome;
+  details: Record<string, string | number | boolean>;
+}
+
+export interface AuditEventQuery {
+  limit?: number;
+  since?: number;
 }
 
 export interface FindingStoreStats {
@@ -94,12 +126,24 @@ export interface FindingTrendPoint {
   dismissedCount: number;
 }
 
+export interface FindingProjectSummary {
+  key: string;
+  scanCount: number;
+  findingCount: number;
+  activeCount: number;
+  dismissedCount: number;
+  highRiskCount: number;
+  highRiskRate: number;
+}
+
 export interface FindingStoreSummary extends FindingStoreStats {
   since?: number;
+  project?: string;
   severityCounts: FindingSummaryBucket[];
   typeCounts: FindingSummaryBucket[];
   dismissedReasonCounts: FindingSummaryBucket[];
   authorCounts: FindingAuthorSummary[];
+  projectCounts: FindingProjectSummary[];
   topRules: FindingRuleSummary[];
   trend: FindingTrendPoint[];
 }
@@ -107,6 +151,7 @@ export interface FindingStoreSummary extends FindingStoreStats {
 export interface PruneResult {
   deletedScans: number;
   deletedFindings: number;
+  deletedAuditEvents: number;
 }
 
 export class SqliteFindingStore {
@@ -127,6 +172,7 @@ export class SqliteFindingStore {
       scanId,
       startedAt: input.startedAt,
       completedAt,
+      project: normalizeProject(input.project),
       cwd: input.cwd,
       targetPaths: [...input.targetPaths],
       fileCount: input.fileCount,
@@ -140,14 +186,15 @@ export class SqliteFindingStore {
       this.database
         .prepare(
           `INSERT INTO scan_run (
-             scan_id, started_at, completed_at, cwd, target_paths, file_count,
+             scan_id, started_at, completed_at, project, cwd, target_paths, file_count,
              finding_count, active_count, dismissed_count
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           storedRun.scanId,
           storedRun.startedAt,
           storedRun.completedAt,
+          storedRun.project ?? null,
           storedRun.cwd,
           JSON.stringify(storedRun.targetPaths),
           storedRun.fileCount,
@@ -200,36 +247,86 @@ export class SqliteFindingStore {
   listFindings(query: FindingQuery = {}): StoredFinding[] {
     this.initialize();
     const limit = Math.max(1, Math.min(query.limit ?? 50, 1000));
+    const project = normalizeProject(query.project) ?? null;
     const rows = this.database
       .prepare(
-        `SELECT f.*, s.completed_at AS scan_completed_at
+        `SELECT f.*, s.completed_at AS scan_completed_at, s.project AS project
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? = 1 OR f.dismissed = 0)
+           AND (? IS NULL OR s.project = ?)
          ORDER BY s.completed_at DESC, f.file_path ASC, f.line ASC, f.column ASC
          LIMIT ?`
       )
-      .all(query.includeDismissed ? 1 : 0, limit);
+      .all(query.includeDismissed ? 1 : 0, project, project, limit);
     return rows.map(rowToStoredFinding);
   }
 
-  listScanRuns(limit = 20): StoredScanRun[] {
+  listScanRuns(limit = 20, project?: string): StoredScanRun[] {
     this.initialize();
     const boundedLimit = Math.max(1, Math.min(limit, 1000));
     const rows = this.database
       .prepare(
-        `SELECT scan_id, started_at, completed_at, cwd, target_paths, file_count,
+        `SELECT scan_id, started_at, completed_at, project, cwd, target_paths, file_count,
                 finding_count, active_count, dismissed_count
          FROM scan_run
+         WHERE (? IS NULL OR project = ?)
          ORDER BY completed_at DESC
          LIMIT ?`
       )
-      .all(boundedLimit);
+      .all(normalizeProject(project) ?? null, normalizeProject(project) ?? null, boundedLimit);
     return rows.map(rowToStoredScanRun);
   }
 
-  stats(): FindingStoreStats {
+  recordAuditEvent(input: AuditEventInput): StoredAuditEvent {
     this.initialize();
+    const timestamp = input.timestamp ?? Date.now();
+    const event: StoredAuditEvent = {
+      id: auditEventId(timestamp),
+      timestamp,
+      subject: sanitizeAuditText(input.subject, 256),
+      role: input.role,
+      authentication: input.authentication,
+      action: sanitizeAuditText(input.action, 120) ?? "unknown",
+      outcome: input.outcome ?? "success",
+      details: sanitizeAuditDetails(input.details)
+    };
+    this.database
+      .prepare(
+        `INSERT INTO audit_event (event_id, occurred_at, subject, role, authentication, action, outcome, details_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        event.id,
+        event.timestamp,
+        event.subject ?? null,
+        event.role ?? null,
+        event.authentication,
+        event.action,
+        event.outcome,
+        JSON.stringify(event.details)
+      );
+    return event;
+  }
+
+  listAuditEvents(query: AuditEventQuery = {}): StoredAuditEvent[] {
+    this.initialize();
+    const limit = Math.max(1, Math.min(query.limit ?? 100, 1000));
+    const rows = this.database
+      .prepare(
+        `SELECT event_id, occurred_at, subject, role, authentication, action, outcome, details_json
+         FROM audit_event
+         WHERE (? IS NULL OR occurred_at >= ?)
+         ORDER BY occurred_at DESC, event_id DESC
+         LIMIT ?`
+      )
+      .all(query.since ?? null, query.since ?? null, limit);
+    return rows.map(rowToStoredAuditEvent);
+  }
+
+  stats(project?: string): FindingStoreStats {
+    this.initialize();
+    const selectedProject = normalizeProject(project) ?? null;
     const row = this.database
       .prepare(
         `SELECT COUNT(DISTINCT s.scan_id) AS scan_count,
@@ -238,9 +335,10 @@ export class SqliteFindingStore {
                 SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
                 MAX(s.completed_at) AS latest_scan_at
          FROM scan_run s
-         LEFT JOIN finding_result f ON f.scan_id = s.scan_id`
+         LEFT JOIN finding_result f ON f.scan_id = s.scan_id
+         WHERE (? IS NULL OR s.project = ?)`
       )
-      .get();
+      .get(selectedProject, selectedProject);
 
     return {
       scanCount: Number(row?.scan_count ?? 0),
@@ -251,9 +349,10 @@ export class SqliteFindingStore {
     };
   }
 
-  summary(options: { since?: number; topLimit?: number } = {}): FindingStoreSummary {
+  summary(options: { since?: number; topLimit?: number; project?: string } = {}): FindingStoreSummary {
     this.initialize();
     const since = options.since ?? null;
+    const project = normalizeProject(options.project) ?? null;
     const topLimit = Math.max(1, Math.min(options.topLimit ?? 10, 100));
     const statsRow = this.database
       .prepare(
@@ -264,9 +363,10 @@ export class SqliteFindingStore {
                 MAX(s.completed_at) AS latest_scan_at
          FROM scan_run s
          LEFT JOIN finding_result f ON f.scan_id = s.scan_id
-         WHERE (? IS NULL OR s.completed_at >= ?)`
+         WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)`
       )
-      .get(since, since);
+      .get(since, since, project, project);
 
     const severityRows = this.database
       .prepare(
@@ -277,10 +377,11 @@ export class SqliteFindingStore {
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY f.severity
          ORDER BY count DESC, f.severity ASC`
       )
-      .all(since, since);
+      .all(since, since, project, project);
 
     const typeRows = this.database
       .prepare(
@@ -291,10 +392,11 @@ export class SqliteFindingStore {
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY f.type
          ORDER BY count DESC, f.type ASC`
       )
-      .all(since, since);
+      .all(since, since, project, project);
 
     const topRuleRows = this.database
       .prepare(
@@ -307,11 +409,12 @@ export class SqliteFindingStore {
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY f.detection_rule, f.type, f.severity
          ORDER BY count DESC, active_count DESC, f.detection_rule ASC
          LIMIT ?`
       )
-      .all(since, since, topLimit);
+      .all(since, since, project, project, topLimit);
 
     const dismissedReasonRows = this.database
       .prepare(
@@ -322,10 +425,11 @@ export class SqliteFindingStore {
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE f.dismissed = 1 AND (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY key
          ORDER BY count DESC, key ASC`
       )
-      .all(since, since);
+      .all(since, since, project, project);
 
     const authorRows = this.database
       .prepare(
@@ -339,11 +443,30 @@ export class SqliteFindingStore {
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY key
          ORDER BY high_risk_count DESC, active_count DESC, count DESC, key ASC
          LIMIT ?`
       )
-      .all(since, since, topLimit);
+      .all(since, since, project, project, topLimit);
+
+    const projectRows = this.database
+      .prepare(
+        `SELECT COALESCE(NULLIF(TRIM(s.project), ''), 'Unassigned') AS key,
+                COUNT(DISTINCT s.scan_id) AS scan_count,
+                COUNT(f.finding_id) AS finding_count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
+                SUM(CASE WHEN f.dismissed = 0 AND f.severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS high_risk_count
+         FROM scan_run s
+         LEFT JOIN finding_result f ON f.scan_id = s.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
+         GROUP BY key
+         ORDER BY high_risk_count DESC, active_count DESC, finding_count DESC, key ASC
+         LIMIT ?`
+      )
+      .all(since, since, project, project, topLimit);
 
     const trendRows = this.database
       .prepare(
@@ -355,10 +478,11 @@ export class SqliteFindingStore {
          FROM scan_run s
          LEFT JOIN finding_result f ON f.scan_id = s.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
          GROUP BY date
          ORDER BY date ASC`
       )
-      .all(since, since);
+      .all(since, since, project, project);
 
     return {
       scanCount: Number(statsRow?.scan_count ?? 0),
@@ -368,10 +492,12 @@ export class SqliteFindingStore {
       latestScanAt:
         statsRow?.latest_scan_at === null || statsRow?.latest_scan_at === undefined ? undefined : Number(statsRow.latest_scan_at),
       since: options.since,
+      project: project ?? undefined,
       severityCounts: severityRows.map(rowToSummaryBucket),
       typeCounts: typeRows.map(rowToSummaryBucket),
       dismissedReasonCounts: dismissedReasonRows.map(rowToSummaryBucket),
       authorCounts: authorRows.map(rowToAuthorSummary),
+      projectCounts: projectRows.map(rowToProjectSummary),
       topRules: topRuleRows.map(rowToRuleSummary),
       trend: trendRows.map(rowToTrendPoint)
     };
@@ -389,13 +515,18 @@ export class SqliteFindingStore {
     const deletedScansRow = this.database
       .prepare("SELECT COUNT(*) AS count FROM scan_run WHERE completed_at < ?")
       .get(timestamp);
+    const deletedAuditEventsRow = this.database
+      .prepare("SELECT COUNT(*) AS count FROM audit_event WHERE occurred_at < ?")
+      .get(timestamp);
     this.database
       .prepare("DELETE FROM finding_result WHERE scan_id IN (SELECT scan_id FROM scan_run WHERE completed_at < ?)")
       .run(timestamp);
     this.database.prepare("DELETE FROM scan_run WHERE completed_at < ?").run(timestamp);
+    this.database.prepare("DELETE FROM audit_event WHERE occurred_at < ?").run(timestamp);
     return {
       deletedScans: Number(deletedScansRow?.count ?? 0),
-      deletedFindings: Number(deletedFindingsRow?.count ?? 0)
+      deletedFindings: Number(deletedFindingsRow?.count ?? 0),
+      deletedAuditEvents: Number(deletedAuditEventsRow?.count ?? 0)
     };
   }
 
@@ -414,6 +545,7 @@ export class SqliteFindingStore {
         scan_id TEXT PRIMARY KEY,
         started_at INTEGER NOT NULL,
         completed_at INTEGER NOT NULL,
+        project TEXT,
         cwd TEXT NOT NULL,
         target_paths TEXT NOT NULL,
         file_count INTEGER NOT NULL,
@@ -447,10 +579,23 @@ export class SqliteFindingStore {
       CREATE INDEX IF NOT EXISTS idx_finding_result_scan ON finding_result(scan_id);
       CREATE INDEX IF NOT EXISTS idx_finding_result_active ON finding_result(dismissed, severity);
       CREATE INDEX IF NOT EXISTS idx_scan_run_completed_at ON scan_run(completed_at);
+      CREATE TABLE IF NOT EXISTS audit_event (
+        event_id TEXT PRIMARY KEY,
+        occurred_at INTEGER NOT NULL,
+        subject TEXT,
+        role TEXT,
+        authentication TEXT NOT NULL,
+        action TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        details_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_event_occurred_at ON audit_event(occurred_at DESC);
     `);
     ensureColumn(this.database, "finding_result", "author_name", "author_name TEXT");
     ensureColumn(this.database, "finding_result", "author_email", "author_email TEXT");
+    ensureColumn(this.database, "scan_run", "project", "project TEXT");
     this.database.exec("CREATE INDEX IF NOT EXISTS idx_finding_result_author ON finding_result(author_email, author_name);");
+    this.database.exec("CREATE INDEX IF NOT EXISTS idx_scan_run_project_completed_at ON scan_run(project, completed_at);");
   }
 }
 
@@ -472,6 +617,7 @@ function rowToStoredScanRun(row: Record<string, unknown>): StoredScanRun {
     scanId: row.scan_id as string,
     startedAt: Number(row.started_at),
     completedAt: Number(row.completed_at),
+    project: typeof row.project === "string" ? row.project : undefined,
     cwd: row.cwd as string,
     targetPaths: parseJsonStringArray(row.target_paths) ?? [],
     fileCount: Number(row.file_count),
@@ -481,10 +627,22 @@ function rowToStoredScanRun(row: Record<string, unknown>): StoredScanRun {
   };
 }
 
+function normalizeProject(value: string | undefined): string | undefined {
+  const project = value?.trim();
+  if (!project) {
+    return undefined;
+  }
+  if (project.length > 256) {
+    throw new Error("Project identifiers must be at most 256 characters.");
+  }
+  return project;
+}
+
 function rowToStoredFinding(row: Record<string, unknown>): StoredFinding {
   return {
     scanId: row.scan_id as string,
     scanCompletedAt: Number(row.scan_completed_at),
+    project: typeof row.project === "string" ? row.project : undefined,
     id: row.finding_id as string,
     type: row.type as FindingType,
     severity: row.severity as Severity,
@@ -536,6 +694,20 @@ function rowToAuthorSummary(row: Record<string, unknown>): FindingAuthorSummary 
   };
 }
 
+function rowToProjectSummary(row: Record<string, unknown>): FindingProjectSummary {
+  const activeCount = Number(row.active_count ?? 0);
+  const highRiskCount = Number(row.high_risk_count ?? 0);
+  return {
+    key: String(row.key ?? "Unassigned"),
+    scanCount: Number(row.scan_count ?? 0),
+    findingCount: Number(row.finding_count ?? 0),
+    activeCount,
+    dismissedCount: Number(row.dismissed_count ?? 0),
+    highRiskCount,
+    highRiskRate: activeCount === 0 ? 0 : highRiskCount / activeCount
+  };
+}
+
 function rowToTrendPoint(row: Record<string, unknown>): FindingTrendPoint {
   return {
     date: String(row.date ?? ""),
@@ -543,6 +715,22 @@ function rowToTrendPoint(row: Record<string, unknown>): FindingTrendPoint {
     findingCount: Number(row.finding_count ?? 0),
     activeCount: Number(row.active_count ?? 0),
     dismissedCount: Number(row.dismissed_count ?? 0)
+  };
+}
+
+function rowToStoredAuditEvent(row: Record<string, unknown>): StoredAuditEvent {
+  return {
+    id: String(row.event_id),
+    timestamp: Number(row.occurred_at),
+    subject: typeof row.subject === "string" ? row.subject : undefined,
+    role: row.role === "viewer" || row.role === "analyst" || row.role === "admin" || row.role === "none" ? row.role : undefined,
+    authentication:
+      row.authentication === "token" || row.authentication === "ingest" || row.authentication === "anonymous"
+        ? row.authentication
+        : "oidc",
+    action: String(row.action),
+    outcome: row.outcome === "denied" ? "denied" : "success",
+    details: parseAuditDetails(row.details_json)
   };
 }
 
@@ -572,6 +760,56 @@ function loadSqlite(): SqliteModule {
 
 function scanRunId(timestamp: number): string {
   return `scan_${timestamp}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function auditEventId(timestamp: number): string {
+  return `audit_${timestamp}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sanitizeAuditDetails(input: AuditEventInput["details"]): Record<string, string | number | boolean> {
+  if (!input) {
+    return {};
+  }
+  const details: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(input)) {
+    const normalizedKey = key.trim().toLowerCase();
+    if (!normalizedKey || normalizedKey.length > 80 || /token|secret|cookie|authorization|password|code|key|credential/.test(normalizedKey)) {
+      continue;
+    }
+    if (typeof value === "string") {
+      const normalizedValue = sanitizeAuditText(value, 256);
+      if (normalizedValue) {
+        details[normalizedKey] = normalizedValue;
+      }
+    } else if (typeof value === "number" && Number.isFinite(value)) {
+      details[normalizedKey] = value;
+    } else if (typeof value === "boolean") {
+      details[normalizedKey] = value;
+    }
+    if (Object.keys(details).length >= 16) {
+      break;
+    }
+  }
+  return details;
+}
+
+function parseAuditDetails(value: unknown): Record<string, string | number | boolean> {
+  if (typeof value !== "string") {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? sanitizeAuditDetails(parsed as Record<string, string | number | boolean>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function sanitizeAuditText(value: string | undefined, maxLength: number): string | undefined {
+  const normalized = value?.trim().replace(/[\r\n\u0000]/g, " ").slice(0, maxLength);
+  return normalized || undefined;
 }
 
 function parseJsonStringArray(value: unknown): string[] | undefined {

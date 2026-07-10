@@ -20,3 +20,10 @@ test("VSCode routes L3 fixes through a confirmation command", async () => {
   assert.match(source, /VibeGuard received this replacement from an LLM/);
   assert.match(source, /command: "vibeguard\.applyFix"/);
 });
+
+test("VSCode keeps Pro credentials on the configured service origin", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /showSubscriptionStatus/);
+  assert.match(source, /provider === "vibeguard" \? undefined : configuredOptionalString\("llmBaseUrl"\)/);
+});

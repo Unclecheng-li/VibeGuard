@@ -20,6 +20,7 @@ test("parses partial config and preserves defaults", () => {
         l3: true
       },
       package_verification: "off",
+      llm_provider: "vibeguard",
       dedup_with_existing_tools: false,
       custom_rules: ["./rules/company.yml"],
       package_cache: {
@@ -35,6 +36,7 @@ test("parses partial config and preserves defaults", () => {
   assert.equal(config.detection_layers.l2, true);
   assert.equal(config.detection_layers.l3, true);
   assert.equal(config.package_verification, "off");
+  assert.equal(config.llm_provider, "vibeguard");
   assert.equal(config.dedup_with_existing_tools, false);
   assert.deepEqual(config.custom_rules, ["./rules/company.yml"]);
   assert.deepEqual(config.package_cache.languages, ["npm", "maven"]);

@@ -33,10 +33,11 @@ import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3
 import { mergeFindingsForExecutedLayers, type ExecutedLayers } from "./layers";
 import { createPackageStorage, type PackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
+import { getProSubscriptionStatus } from "./subscription";
 import type { Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConfig } from "./types";
 
 const packageRegistries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
-const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local"];
+const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local", "vibeguard"];
 const firstRunOnboardingKey = "vibeguard.firstRunOnboardingShown";
 
 const supportedLanguageIds = new Set([
@@ -123,6 +124,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("vibeguard.setLlmApiKey", () => setLlmApiKey()),
     vscode.commands.registerCommand("vibeguard.deleteLlmApiKey", () => deleteLlmApiKey()),
     vscode.commands.registerCommand("vibeguard.showLlmStatus", () => showLlmStatus()),
+    vscode.commands.registerCommand("vibeguard.showSubscriptionStatus", () => showSubscriptionStatus()),
     vscode.commands.registerCommand("vibeguard.openFinding", (finding: Finding) => openFinding(finding)),
     vscode.commands.registerCommand("vibeguard.ignoreFinding", (nodeOrFinding: TreeNode | Finding) =>
       ignoreFinding(resolveFindingArgument(nodeOrFinding), "line")
@@ -316,7 +318,7 @@ async function setLlmApiKey(): Promise<void> {
   }
 
   const apiKey = await vscode.window.showInputBox({
-    prompt: `Enter ${provider} API key for VibeGuard L3 analysis`,
+    prompt: provider === "vibeguard" ? "Enter VibeGuard Pro credential" : `Enter ${provider} API key for VibeGuard L3 analysis`,
     password: true,
     ignoreFocusOut: true,
     validateInput: (value) => (value.trim() ? undefined : "API key must not be empty.")
@@ -357,6 +359,40 @@ async function showLlmStatus(): Promise<void> {
   output.appendLine("");
   output.show();
   void vscode.window.showInformationMessage(`VibeGuard L3 provider: ${provider}; credential: ${source}.`);
+}
+
+async function showSubscriptionStatus(): Promise<void> {
+  const loadedConfig = await loadConfiguredVibeGuardConfigForWorkspace();
+  const provider = configuredLlmProvider(loadedConfig.config);
+  if (provider !== "vibeguard") {
+    void vscode.window.showInformationMessage("Select the VibeGuard LLM provider to view Pro subscription usage.");
+    return;
+  }
+  const apiKey = (await extensionContext.secrets.get(llmSecretKey(provider))) ?? getLlmApiKeyFromEnv(provider);
+  try {
+    const status = await getProSubscriptionStatus({ apiKey });
+    output.appendLine("Pro Subscription Status");
+    output.appendLine("=======================");
+    output.appendLine(`Plan: ${status.plan}`);
+    output.appendLine(`State: ${status.state}`);
+    output.appendLine(`Active: ${status.active ? "yes" : "no"}`);
+    output.appendLine(`Features: ${status.features.length > 0 ? status.features.join(", ") : "none"}`);
+    if (status.l3Requests) {
+      output.appendLine(`Official L3 requests: ${status.l3Requests.used}/${status.l3Requests.limit}`);
+      if (status.l3Requests.resetAt) {
+        output.appendLine(`Resets: ${status.l3Requests.resetAt}`);
+      }
+    }
+    if (status.reason === "missing_credential") {
+      output.appendLine("Credential: missing");
+    }
+    output.appendLine("");
+    output.show();
+  } catch (error) {
+    output.appendLine(`Pro subscription status error: ${error instanceof Error ? error.message : String(error)}`);
+    output.show();
+    void vscode.window.showErrorMessage("VibeGuard could not retrieve the Pro subscription status.");
+  }
 }
 
 async function maybeShowFirstRunOnboarding(): Promise<void> {
@@ -1117,7 +1153,8 @@ async function createConfiguredL3Analyzer(config: VibeGuardConfig): Promise<LlmS
     provider,
     apiKey,
     model: configuredOptionalString("llmModel"),
-    baseUrl: configuredOptionalString("llmBaseUrl")
+    // The Pro credential must never be redirected by untrusted workspace settings.
+    baseUrl: provider === "vibeguard" ? undefined : configuredOptionalString("llmBaseUrl")
   });
 }
 

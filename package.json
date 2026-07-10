@@ -36,6 +36,7 @@
     "onCommand:vibeguard.setLlmApiKey",
     "onCommand:vibeguard.deleteLlmApiKey",
     "onCommand:vibeguard.showLlmStatus",
+    "onCommand:vibeguard.showSubscriptionStatus",
     "onCommand:vibeguard.applyFix",
     "onCommand:vibeguard.applyAllSafeFixes",
     "onView:vibeguardFindings"
@@ -81,6 +82,10 @@
       {
         "command": "vibeguard.showLlmStatus",
         "title": "VibeGuard: Show LLM Status"
+      },
+      {
+        "command": "vibeguard.showSubscriptionStatus",
+        "title": "VibeGuard: Show Pro Subscription Status"
       },
       {
         "command": "vibeguard.ignoreFinding",
@@ -231,7 +236,8 @@
             "deepseek",
             "claude",
             "openai",
-            "local"
+            "local",
+            "vibeguard"
           ],
           "default": "deepseek",
           "description": "LLM provider for VibeGuard L3 semantic analysis. API keys are stored with VSCode SecretStorage or read from environment variables."

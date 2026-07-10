@@ -12,7 +12,7 @@ export interface LoadedVibeGuardConfig {
 
 const registries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
 const packageVerificationModes = ["off", "seed", "remote"] as const;
-const llmProviders = ["deepseek", "claude", "openai", "local"] as const;
+const llmProviders = ["deepseek", "claude", "openai", "local", "vibeguard"] as const;
 
 export function defaultConfigPath(): string {
   return path.join(os.homedir(), ".vibeguard", "config.json");

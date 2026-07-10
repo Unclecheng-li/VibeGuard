@@ -10,17 +10,21 @@ import {
   updateIgnoredFinding
 } from "./config";
 import { loadCustomRules } from "./customRules";
+import { createComplianceReport, formatComplianceMarkdown, type ComplianceFramework } from "./findings/compliance";
 import { formatFindingsDashboard } from "./findings/dashboard";
+import { uploadFindings } from "./findings/ingestClient";
+import type { DashboardAccessRole, DashboardRole, OidcDashboardAuthOptions } from "./findings/auth";
 import { startFindingsDashboardServer } from "./findings/server";
 import {
   defaultFindingsDbPath,
   SqliteFindingStore,
   type FindingAuthor,
+  type RecordScanRunInput,
   type FindingStoreSummary,
   type StoredFinding
 } from "./findings/storage";
 import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
-import { filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
+import { filterFindingsToAiLineRanges, filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
 import { appendIgnoreRule, defaultIgnoreRulesPath, expandHome, loadIgnoreRules, scopedIgnoreReason } from "./ignore";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { defaultIndexPath } from "./package/cache";
@@ -40,6 +44,7 @@ import {
 } from "./reporters";
 import { scanSourceFile } from "./scanner";
 import { formatSemgrepRules } from "./semgrep";
+import { getProApiKeyFromEnv, getProSubscriptionStatus } from "./subscription";
 import type { Finding, PackageRegistry, ScanPerformance, Severity } from "./types";
 import { extensionOf, severityMeetsThreshold } from "./utils";
 
@@ -71,6 +76,10 @@ interface CliOptions {
   dedupWithExistingTools?: boolean;
   storeFindings: boolean;
   findingsDbPath?: string;
+  findingsProject?: string;
+  findingsEndpoint?: string;
+  findingsTokenEnv?: string;
+  findingsUploadRequired: boolean;
   llmProvider?: LlmProvider;
   llmModel?: string;
   llmBaseUrl?: string;
@@ -124,6 +133,10 @@ async function main(): Promise<void> {
   }
   if (args[0] === "findings") {
     await runFindingsCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "subscription") {
+    await runSubscriptionCommand(args.slice(1));
     return;
   }
   if (args[0] === "ignore-rules") {
@@ -203,14 +216,18 @@ async function main(): Promise<void> {
         dedupWithExistingTools
       }
     );
-    allFindings.push(...result.findings);
+    allFindings.push(...filterFindingsToAiLineRanges(result.findings, filePath, filterResult.aiLineRanges));
     performances.push(result.performance);
   }
 
   const report = buildScanReport(allFindings, performances);
-  if (options.storeFindings) {
+  let scanInput: RecordScanRunInput | undefined;
+  if (options.storeFindings || options.findingsEndpoint) {
     try {
-      await storeScanFindings(options, files.length, allFindings, scanStartedAt, gitCwd);
+      scanInput = await createScanRunInput(options, files.length, allFindings, scanStartedAt, gitCwd);
+      if (options.storeFindings) {
+        await storeScanFindings(options, scanInput);
+      }
     } catch (error) {
       process.stderr.write(`VibeGuard findings storage warning: ${error instanceof Error ? error.message : String(error)}\n`);
     }
@@ -229,7 +246,25 @@ async function main(): Promise<void> {
   }
   await emitPrimaryReport(options, report, files.length);
 
-  const shouldFail = allFindings.some((finding) => !finding.dismissed && severityMeetsThreshold(finding.severity, options.failOn));
+  let uploadFailed = false;
+  if (options.findingsEndpoint) {
+    if (!scanInput) {
+      uploadFailed = true;
+      process.stderr.write("VibeGuard findings upload warning: scan metadata could not be prepared.\n");
+    } else {
+      try {
+        const result = await uploadScanFindings(options, scanInput);
+        process.stderr.write(`VibeGuard findings upload: stored scan ${result.scanId} (${result.activeCount} active finding(s)).\n`);
+      } catch (error) {
+        uploadFailed = true;
+        process.stderr.write(`VibeGuard findings upload warning: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+    }
+  }
+
+  const shouldFail =
+    allFindings.some((finding) => !finding.dismissed && severityMeetsThreshold(finding.severity, options.failOn)) ||
+    (uploadFailed && options.findingsUploadRequired);
   process.exitCode = shouldFail ? 1 : 0;
 }
 
@@ -333,6 +368,66 @@ async function updateConfigIgnoredFinding(args: string[], action: "add" | "remov
   console.log(`${verb} finding ${findingId} in ${result.path}`);
 }
 
+async function runSubscriptionCommand(args: string[]): Promise<void> {
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "-h" || subcommand === "--help") {
+    printSubscriptionHelp();
+    return;
+  }
+  if (subcommand === "status") {
+    await printSubscriptionStatus(args);
+    return;
+  }
+  throw new Error(`Unknown subscription subcommand: ${subcommand}`);
+}
+
+async function printSubscriptionStatus(args: string[]): Promise<void> {
+  let apiKeyEnvironment: string | undefined;
+  let baseUrl: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--api-key-env") {
+      apiKeyEnvironment = readEnvironmentVariableName(args[++index], "--api-key-env");
+    } else if (arg.startsWith("--api-key-env=")) {
+      apiKeyEnvironment = readEnvironmentVariableName(arg.slice("--api-key-env=".length), "--api-key-env");
+    } else if (arg === "--base-url") {
+      baseUrl = readRequiredOptionValue(args[++index], "--base-url");
+    } else if (arg.startsWith("--base-url=")) {
+      baseUrl = readRequiredOptionValue(arg.slice("--base-url=".length), "--base-url");
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "-h" || arg === "--help") {
+      printSubscriptionHelp();
+      return;
+    } else {
+      throw new Error(`Unknown subscription status option: ${arg}`);
+    }
+  }
+  const status = await getProSubscriptionStatus({
+    apiKey: getProApiKeyFromEnv(apiKeyEnvironment),
+    baseUrl
+  });
+  if (json) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  console.log(`VibeGuard subscription: ${status.plan} (${status.state})`);
+  if (status.reason === "missing_credential") {
+    console.log("No VIBEGUARD_PRO_API_KEY credential is configured.");
+    return;
+  }
+  console.log(`Account active: ${status.active ? "yes" : "no"}`);
+  console.log(`Features: ${status.features.length > 0 ? status.features.join(", ") : "none"}`);
+  if (status.l3Requests) {
+    console.log(
+      `Official L3 requests: ${status.l3Requests.used}/${status.l3Requests.limit}${
+        status.l3Requests.resetAt ? `; resets ${status.l3Requests.resetAt}` : ""
+      }`
+    );
+  }
+}
+
 async function runFindingsCommand(args: string[]): Promise<void> {
   const subcommand = args.shift();
   if (!subcommand || subcommand === "-h" || subcommand === "--help") {
@@ -354,6 +449,14 @@ async function runFindingsCommand(args: string[]): Promise<void> {
   }
   if (subcommand === "dashboard") {
     await writeFindingsDashboard(args);
+    return;
+  }
+  if (subcommand === "compliance") {
+    await writeComplianceReport(args);
+    return;
+  }
+  if (subcommand === "audit") {
+    await listAuditEvents(args);
     return;
   }
   if (subcommand === "serve") {
@@ -535,7 +638,8 @@ function parseArgs(args: string[]): CliOptions {
     storage: "auto",
     useIgnoreRules: true,
     useConfig: true,
-    storeFindings: true
+    storeFindings: true,
+    findingsUploadRequired: false
   };
 
   const rest = [...args];
@@ -651,6 +755,22 @@ function parseArgs(args: string[]): CliOptions {
       options.findingsDbPath = path.resolve(expandHome(rest.shift() ?? defaultFindingsDbPath()));
     } else if (arg.startsWith("--findings-db=")) {
       options.findingsDbPath = path.resolve(expandHome(arg.slice("--findings-db=".length)));
+    } else if (arg === "--findings-project") {
+      options.findingsProject = readProjectIdentifier(rest.shift(), "--findings-project");
+    } else if (arg.startsWith("--findings-project=")) {
+      options.findingsProject = readProjectIdentifier(arg.slice("--findings-project=".length), "--findings-project");
+    } else if (arg === "--findings-endpoint") {
+      options.findingsEndpoint = readRequiredOptionValue(rest.shift(), "--findings-endpoint");
+    } else if (arg.startsWith("--findings-endpoint=")) {
+      options.findingsEndpoint = readRequiredOptionValue(arg.slice("--findings-endpoint=".length), "--findings-endpoint");
+    } else if (arg === "--findings-token-env") {
+      options.findingsTokenEnv = readEnvironmentVariableName(rest.shift(), "--findings-token-env");
+    } else if (arg.startsWith("--findings-token-env=")) {
+      options.findingsTokenEnv = readEnvironmentVariableName(arg.slice("--findings-token-env=".length), "--findings-token-env");
+    } else if (arg === "--findings-upload-required") {
+      options.findingsUploadRequired = true;
+    } else if (arg === "--no-findings-upload-required") {
+      options.findingsUploadRequired = false;
     } else if (arg === "--no-store-findings") {
       options.storeFindings = false;
     } else if (arg === "-h" || arg === "--help") {
@@ -663,6 +783,9 @@ function parseArgs(args: string[]): CliOptions {
 
   if (options.paths.length === 0) {
     options.paths.push(process.cwd());
+  }
+  if (options.findingsUploadRequired && !options.findingsEndpoint) {
+    throw new Error("--findings-upload-required requires --findings-endpoint.");
   }
 
   return options;
@@ -721,26 +844,43 @@ async function emitPrimaryReport(options: CliOptions, report: ReturnType<typeof 
 
 async function storeScanFindings(
   options: CliOptions,
+  input: RecordScanRunInput
+): Promise<void> {
+  const store = new SqliteFindingStore(options.findingsDbPath ?? defaultFindingsDbPath());
+  try {
+    store.recordScanRun(input);
+  } finally {
+    store.close();
+  }
+}
+
+async function createScanRunInput(
+  options: CliOptions,
   fileCount: number,
   findings: Finding[],
   startedAt: number,
   gitCwd: string
-): Promise<void> {
-  const store = new SqliteFindingStore(options.findingsDbPath ?? defaultFindingsDbPath());
-  try {
-    const findingAuthors = await resolveFindingAuthors(findings, gitCwd);
-    store.recordScanRun({
-      startedAt,
-      completedAt: Date.now(),
-      cwd: process.cwd(),
-      targetPaths: options.paths,
-      fileCount,
-      findings,
-      findingAuthors
-    });
-  } finally {
-    store.close();
-  }
+): Promise<RecordScanRunInput> {
+  return {
+    startedAt,
+    completedAt: Date.now(),
+    project: options.findingsProject,
+    cwd: process.cwd(),
+    targetPaths: options.paths,
+    fileCount,
+    findings,
+    findingAuthors: await resolveFindingAuthors(findings, gitCwd)
+  };
+}
+
+async function uploadScanFindings(options: CliOptions, scan: RecordScanRunInput) {
+  const tokenEnvironment = options.findingsTokenEnv ?? "VIBEGUARD_FINDINGS_INGEST_TOKEN";
+  const token = readEnvironmentValue(tokenEnvironment, "--findings-token-env");
+  return uploadFindings({
+    endpoint: options.findingsEndpoint ?? "",
+    token,
+    scan
+  });
 }
 
 async function resolveFindingAuthors(findings: Finding[], gitCwd: string): Promise<Record<string, FindingAuthor>> {
@@ -763,12 +903,15 @@ async function printFindingsStatus(args: string[]): Promise<void> {
   const options = parseFindingsCommandOptions(args);
   const store = new SqliteFindingStore(options.dbPath);
   try {
-    const stats = store.stats();
+    const stats = store.stats(options.project);
     if (options.json) {
       console.log(JSON.stringify(stats, null, 2));
       return;
     }
     console.log(`Findings DB: ${options.dbPath}`);
+    if (options.project) {
+      console.log(`Project: ${options.project}`);
+    }
     console.log(`Scans: ${stats.scanCount}`);
     console.log(`Findings: ${stats.findingCount} (${stats.activeCount} active, ${stats.dismissedCount} dismissed)`);
     console.log(`Latest scan: ${stats.latestScanAt ? new Date(stats.latestScanAt).toISOString() : "none"}`);
@@ -782,7 +925,7 @@ async function printFindingsSummary(args: string[]): Promise<void> {
   const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
   const store = new SqliteFindingStore(options.dbPath);
   try {
-    const summary = store.summary({ since, topLimit: options.topLimit });
+    const summary = store.summary({ since, topLimit: options.topLimit, project: options.project });
     if (options.json) {
       console.log(JSON.stringify(summary, null, 2));
       return;
@@ -799,7 +942,7 @@ async function writeFindingsDashboard(args: string[]): Promise<void> {
   const outputPath = options.outputPath ?? path.resolve("vibeguard-dashboard.html");
   const store = new SqliteFindingStore(options.dbPath);
   try {
-    const summary = store.summary({ since, topLimit: options.topLimit });
+    const summary = store.summary({ since, topLimit: options.topLimit, project: options.project });
     const html = formatFindingsDashboard(summary, {
       dbPath: options.dbPath,
       generatedAt: Date.now()
@@ -815,6 +958,33 @@ async function writeFindingsDashboard(args: string[]): Promise<void> {
   }
 }
 
+async function writeComplianceReport(args: string[]): Promise<void> {
+  const options = parseComplianceCommandOptions(args);
+  const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const summary = store.summary({ since, topLimit: options.topLimit, project: options.project });
+    const report = createComplianceReport(summary, {
+      frameworks: options.frameworks,
+      auditEvents: options.project ? [] : store.listAuditEvents({ since, limit: 1000 })
+    });
+    if (options.json) {
+      if (options.outputPath) {
+        await writeTextFile(options.outputPath, `${JSON.stringify(report, null, 2)}\n`);
+        console.log(`Wrote VibeGuard compliance evidence JSON to ${options.outputPath}`);
+      } else {
+        console.log(JSON.stringify(report, null, 2));
+      }
+      return;
+    }
+    const outputPath = options.outputPath ?? path.resolve("vibeguard-compliance-report.md");
+    await writeTextFile(outputPath, formatComplianceMarkdown(report));
+    console.log(`Wrote VibeGuard compliance evidence report to ${outputPath}`);
+  } finally {
+    store.close();
+  }
+}
+
 async function serveFindingsDashboard(args: string[]): Promise<void> {
   let dbPath = defaultFindingsDbPath();
   let host = "127.0.0.1";
@@ -822,6 +992,18 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
   let days: number | undefined;
   let topLimit = 10;
   let token: string | undefined;
+  let ingestToken: string | undefined;
+  let ingestMaxFindings: number | undefined;
+  let project: string | undefined;
+  let oidcIssuerEnvironment: string | undefined;
+  let oidcClientIdEnvironment: string | undefined;
+  let oidcClientSecretEnvironment: string | undefined;
+  let oidcSessionSecretEnvironment: string | undefined;
+  let oidcRoleClaim: string | undefined;
+  let oidcDefaultRole: DashboardAccessRole | undefined;
+  let publicUrl: string | undefined;
+  let secureCookies: boolean | undefined;
+  const oidcRoleMappings: Record<string, DashboardRole> = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--db") {
@@ -848,6 +1030,54 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
       token = readDashboardToken(args[++index]);
     } else if (arg.startsWith("--token-env=")) {
       token = readDashboardToken(arg.slice("--token-env=".length));
+    } else if (arg === "--ingest-token-env") {
+      ingestToken = readIngestToken(args[++index]);
+    } else if (arg.startsWith("--ingest-token-env=")) {
+      ingestToken = readIngestToken(arg.slice("--ingest-token-env=".length));
+    } else if (arg === "--ingest-max-findings") {
+      ingestMaxFindings = parsePositiveInteger(args[++index], "--ingest-max-findings");
+    } else if (arg.startsWith("--ingest-max-findings=")) {
+      ingestMaxFindings = parsePositiveInteger(arg.slice("--ingest-max-findings=".length), "--ingest-max-findings");
+    } else if (arg === "--project") {
+      project = readProjectIdentifier(args[++index], "--project");
+    } else if (arg.startsWith("--project=")) {
+      project = readProjectIdentifier(arg.slice("--project=".length), "--project");
+    } else if (arg === "--oidc-issuer-env") {
+      oidcIssuerEnvironment = readEnvironmentVariableName(args[++index], "--oidc-issuer-env");
+    } else if (arg.startsWith("--oidc-issuer-env=")) {
+      oidcIssuerEnvironment = readEnvironmentVariableName(arg.slice("--oidc-issuer-env=".length), "--oidc-issuer-env");
+    } else if (arg === "--oidc-client-id-env") {
+      oidcClientIdEnvironment = readEnvironmentVariableName(args[++index], "--oidc-client-id-env");
+    } else if (arg.startsWith("--oidc-client-id-env=")) {
+      oidcClientIdEnvironment = readEnvironmentVariableName(arg.slice("--oidc-client-id-env=".length), "--oidc-client-id-env");
+    } else if (arg === "--oidc-client-secret-env") {
+      oidcClientSecretEnvironment = readEnvironmentVariableName(args[++index], "--oidc-client-secret-env");
+    } else if (arg.startsWith("--oidc-client-secret-env=")) {
+      oidcClientSecretEnvironment = readEnvironmentVariableName(arg.slice("--oidc-client-secret-env=".length), "--oidc-client-secret-env");
+    } else if (arg === "--oidc-session-secret-env") {
+      oidcSessionSecretEnvironment = readEnvironmentVariableName(args[++index], "--oidc-session-secret-env");
+    } else if (arg.startsWith("--oidc-session-secret-env=")) {
+      oidcSessionSecretEnvironment = readEnvironmentVariableName(arg.slice("--oidc-session-secret-env=".length), "--oidc-session-secret-env");
+    } else if (arg === "--oidc-role-claim") {
+      oidcRoleClaim = readRequiredOptionValue(args[++index], "--oidc-role-claim");
+    } else if (arg.startsWith("--oidc-role-claim=")) {
+      oidcRoleClaim = readRequiredOptionValue(arg.slice("--oidc-role-claim=".length), "--oidc-role-claim");
+    } else if (arg === "--oidc-role") {
+      addOidcRoleMapping(args[++index], oidcRoleMappings);
+    } else if (arg.startsWith("--oidc-role=")) {
+      addOidcRoleMapping(arg.slice("--oidc-role=".length), oidcRoleMappings);
+    } else if (arg === "--oidc-default-role") {
+      oidcDefaultRole = parseDashboardAccessRole(args[++index], "--oidc-default-role");
+    } else if (arg.startsWith("--oidc-default-role=")) {
+      oidcDefaultRole = parseDashboardAccessRole(arg.slice("--oidc-default-role=".length), "--oidc-default-role");
+    } else if (arg === "--public-url") {
+      publicUrl = readRequiredOptionValue(args[++index], "--public-url");
+    } else if (arg.startsWith("--public-url=")) {
+      publicUrl = readRequiredOptionValue(arg.slice("--public-url=".length), "--public-url");
+    } else if (arg === "--secure-cookies") {
+      secureCookies = true;
+    } else if (arg === "--no-secure-cookies") {
+      secureCookies = false;
     } else if (arg === "-h" || arg === "--help") {
       printFindingsHelp();
       return;
@@ -855,10 +1085,37 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
       throw new Error(`Unknown findings serve option: ${arg}`);
     }
   }
-  const dashboard = await startFindingsDashboardServer({ dbPath, host, port, days, topLimit, token });
+  const oidc = createOidcDashboardOptions({
+    issuerEnvironment: oidcIssuerEnvironment,
+    clientIdEnvironment: oidcClientIdEnvironment,
+    clientSecretEnvironment: oidcClientSecretEnvironment,
+    sessionSecretEnvironment: oidcSessionSecretEnvironment,
+    roleClaim: oidcRoleClaim,
+    roleMappings: oidcRoleMappings,
+    defaultRole: oidcDefaultRole,
+    publicUrl,
+    secureCookies
+  });
+  const dashboard = await startFindingsDashboardServer({
+    dbPath,
+    host,
+    port,
+    days,
+    topLimit,
+    token,
+    ingestToken,
+    ingestMaxFindings,
+    project,
+    oidc
+  });
   console.log(`VibeGuard team dashboard listening at ${dashboard.url}`);
-  if (!token) {
-    console.log("Warning: dashboard authentication is disabled. Use --token-env before exposing it beyond localhost.");
+  if (!token && !oidc) {
+    console.log("Warning: dashboard authentication is disabled. Use --token-env or OIDC before exposing it beyond localhost.");
+  } else if (oidc) {
+    console.log(`OIDC role claim: ${oidc.roleClaim ?? "roles"}; unmapped users receive ${oidc.defaultRole ?? "none"} access.`);
+  }
+  if (ingestToken) {
+    console.log("CI findings ingestion is enabled at POST /api/ingest with its separate bearer token.");
   }
   const close = async () => {
     await dashboard.close();
@@ -869,15 +1126,120 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
 }
 
 function readDashboardToken(environmentVariable: string | undefined): string {
-  const name = environmentVariable?.trim();
-  if (!name) {
-    throw new Error("--token-env requires an environment variable name.");
+  const name = readEnvironmentVariableName(environmentVariable, "--token-env");
+  const token = readEnvironmentValue(name, "--token-env");
+  return token;
+}
+
+function readIngestToken(environmentVariable: string | undefined): string {
+  const name = readEnvironmentVariableName(environmentVariable, "--ingest-token-env");
+  return readEnvironmentValue(name, "--ingest-token-env");
+}
+
+interface OidcDashboardOptionInputs {
+  issuerEnvironment?: string;
+  clientIdEnvironment?: string;
+  clientSecretEnvironment?: string;
+  sessionSecretEnvironment?: string;
+  roleClaim?: string;
+  roleMappings: Record<string, DashboardRole>;
+  defaultRole?: DashboardAccessRole;
+  publicUrl?: string;
+  secureCookies?: boolean;
+}
+
+function createOidcDashboardOptions(input: OidcDashboardOptionInputs): OidcDashboardAuthOptions | undefined {
+  const configured = [
+    input.issuerEnvironment,
+    input.clientIdEnvironment,
+    input.clientSecretEnvironment,
+    input.sessionSecretEnvironment,
+    input.roleClaim,
+    input.defaultRole,
+    input.publicUrl,
+    input.secureCookies,
+    ...Object.keys(input.roleMappings)
+  ].some((value) => value !== undefined);
+  if (!configured) {
+    return undefined;
   }
+  const issuerEnvironment = input.issuerEnvironment ?? missingOidcOption("--oidc-issuer-env");
+  const clientIdEnvironment = input.clientIdEnvironment ?? missingOidcOption("--oidc-client-id-env");
+  const sessionSecretEnvironment = input.sessionSecretEnvironment ?? missingOidcOption("--oidc-session-secret-env");
+  return {
+    issuer: readEnvironmentValue(issuerEnvironment, "--oidc-issuer-env"),
+    clientId: readEnvironmentValue(clientIdEnvironment, "--oidc-client-id-env"),
+    clientSecret: input.clientSecretEnvironment
+      ? readEnvironmentValue(input.clientSecretEnvironment, "--oidc-client-secret-env")
+      : undefined,
+    sessionSecret: readEnvironmentValue(sessionSecretEnvironment, "--oidc-session-secret-env"),
+    roleClaim: input.roleClaim,
+    roleMappings: Object.keys(input.roleMappings).length > 0 ? input.roleMappings : undefined,
+    defaultRole: input.defaultRole,
+    publicUrl: input.publicUrl,
+    secureCookies: input.secureCookies
+  };
+}
+
+function missingOidcOption(option: string): never {
+  throw new Error(`${option} is required whenever OIDC dashboard options are used.`);
+}
+
+function readEnvironmentVariableName(value: string | undefined, option: string): string {
+  const name = value?.trim();
+  if (!name) {
+    throw new Error(`${option} requires an environment variable name.`);
+  }
+  return name;
+}
+
+function readEnvironmentValue(name: string, option: string): string {
   const token = process.env[name]?.trim();
   if (!token) {
-    throw new Error(`Dashboard token environment variable ${name} is empty.`);
+    throw new Error(`${option} environment variable ${name} is empty.`);
   }
   return token;
+}
+
+function readRequiredOptionValue(value: string | undefined, option: string): string {
+  const result = value?.trim();
+  if (!result) {
+    throw new Error(`${option} requires a value.`);
+  }
+  return result;
+}
+
+function readProjectIdentifier(value: string | undefined, option: string): string {
+  const project = readRequiredOptionValue(value, option);
+  if (project.length > 256) {
+    throw new Error(`${option} must be at most 256 characters.`);
+  }
+  return project;
+}
+
+function addOidcRoleMapping(value: string | undefined, mappings: Record<string, DashboardRole>): void {
+  const assignment = readRequiredOptionValue(value, "--oidc-role");
+  const separator = assignment.lastIndexOf("=");
+  const sourceRole = assignment.slice(0, separator).trim();
+  const dashboardRole = assignment.slice(separator + 1).trim();
+  if (!sourceRole || separator <= 0) {
+    throw new Error("--oidc-role must be <claim-value>=<viewer|analyst|admin>.");
+  }
+  mappings[sourceRole] = parseDashboardRole(dashboardRole, "--oidc-role");
+}
+
+function parseDashboardRole(value: string | undefined, option: string): DashboardRole {
+  if (value === "viewer" || value === "analyst" || value === "admin") {
+    return value;
+  }
+  throw new Error(`${option} role must be viewer, analyst, or admin.`);
+}
+
+function parseDashboardAccessRole(value: string | undefined, option: string): DashboardAccessRole {
+  if (value === "none" || value === "viewer" || value === "analyst" || value === "admin") {
+    return value;
+  }
+  throw new Error(`${option} must be none, viewer, analyst, or admin.`);
 }
 
 function parseDashboardPort(value: string | undefined): number {
@@ -894,7 +1256,8 @@ async function listStoredFindings(args: string[]): Promise<void> {
   try {
     const findings = store.listFindings({
       limit: options.limit,
-      includeDismissed: options.includeDismissed
+      includeDismissed: options.includeDismissed,
+      project: options.project
     });
     if (options.json) {
       console.log(JSON.stringify(findings, null, 2));
@@ -912,6 +1275,30 @@ async function listStoredFindings(args: string[]): Promise<void> {
   }
 }
 
+async function listAuditEvents(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const events = store.listAuditEvents({ limit: options.limit });
+    if (options.json) {
+      console.log(JSON.stringify(events, null, 2));
+      return;
+    }
+    if (events.length === 0) {
+      console.log("No stored dashboard audit events.");
+      return;
+    }
+    for (const event of events) {
+      const subject = event.subject ? ` ${event.subject}` : "";
+      const role = event.role ? ` (${event.role})` : "";
+      const details = Object.keys(event.details).length > 0 ? ` ${JSON.stringify(event.details)}` : "";
+      console.log(`${new Date(event.timestamp).toISOString()} ${event.outcome} ${event.action}${subject}${role}${details}`);
+    }
+  } finally {
+    store.close();
+  }
+}
+
 async function pruneStoredFindings(args: string[]): Promise<void> {
   const options = parseFindingsCommandOptions(args);
   const days = options.days ?? 30;
@@ -923,7 +1310,9 @@ async function pruneStoredFindings(args: string[]): Promise<void> {
       console.log(JSON.stringify({ ...result, cutoff }, null, 2));
       return;
     }
-    console.log(`Deleted ${result.deletedScans} scan(s) and ${result.deletedFindings} finding(s) older than ${days} day(s).`);
+    console.log(
+      `Deleted ${result.deletedScans} scan(s), ${result.deletedFindings} finding(s), and ${result.deletedAuditEvents} audit event(s) older than ${days} day(s).`
+    );
   } finally {
     store.close();
   }
@@ -937,6 +1326,7 @@ function parseFindingsCommandOptions(args: string[]): {
   days?: number;
   topLimit: number;
   outputPath?: string;
+  project?: string;
 } {
   let dbPath = defaultFindingsDbPath();
   let json = false;
@@ -945,6 +1335,7 @@ function parseFindingsCommandOptions(args: string[]): {
   let days: number | undefined;
   let topLimit = 10;
   let outputPath: string | undefined;
+  let project: string | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -972,6 +1363,10 @@ function parseFindingsCommandOptions(args: string[]): {
       outputPath = path.resolve(expandHome(args[++index] ?? "vibeguard-dashboard.html"));
     } else if (arg.startsWith("--output=")) {
       outputPath = path.resolve(expandHome(arg.slice("--output=".length)));
+    } else if (arg === "--project") {
+      project = readProjectIdentifier(args[++index], "--project");
+    } else if (arg.startsWith("--project=")) {
+      project = readProjectIdentifier(arg.slice("--project=".length), "--project");
     } else if (arg === "-h" || arg === "--help") {
       printFindingsHelp();
       process.exit(0);
@@ -980,7 +1375,40 @@ function parseFindingsCommandOptions(args: string[]): {
     }
   }
 
-  return { dbPath, json, limit, includeDismissed, days, topLimit, outputPath };
+  return { dbPath, json, limit, includeDismissed, days, topLimit, outputPath, project };
+}
+
+function parseComplianceCommandOptions(args: string[]): ReturnType<typeof parseFindingsCommandOptions> & { frameworks: ComplianceFramework[] } {
+  const frameworks: ComplianceFramework[] = [];
+  const remaining: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--framework") {
+      addComplianceFramework(args[++index], frameworks);
+    } else if (arg.startsWith("--framework=")) {
+      addComplianceFramework(arg.slice("--framework=".length), frameworks);
+    } else {
+      remaining.push(arg);
+    }
+  }
+  return {
+    ...parseFindingsCommandOptions(remaining),
+    frameworks: frameworks.length > 0 ? frameworks : ["soc2", "iso27001"]
+  };
+}
+
+function addComplianceFramework(value: string | undefined, target: ComplianceFramework[]): void {
+  if (value === "all") {
+    target.splice(0, target.length, "soc2", "iso27001");
+    return;
+  }
+  if (value === "soc2" || value === "iso27001") {
+    if (!target.includes(value)) {
+      target.push(value);
+    }
+    return;
+  }
+  throw new Error("--framework must be soc2, iso27001, or all.");
 }
 
 function printHumanFindingsSummary(dbPath: string, summary: FindingStoreSummary): void {
@@ -1504,10 +1932,10 @@ function parseSyncableRegistry(value: string | undefined): SyncableRegistry | un
 }
 
 function parseLlmProvider(value: string): LlmProvider {
-  if (value === "deepseek" || value === "claude" || value === "openai" || value === "local") {
+  if (value === "deepseek" || value === "claude" || value === "openai" || value === "local" || value === "vibeguard") {
     return value;
   }
-  throw new Error("LLM provider must be one of deepseek, claude, openai, local.");
+  throw new Error("LLM provider must be one of deepseek, claude, openai, local, vibeguard.");
 }
 
 function createCliL3Analyzer(
@@ -1607,14 +2035,18 @@ Usage:
                  [--storage auto|json|sqlite] [--package-index path] [--sqlite-db path]
                  [--no-ignore] [--dedup-existing-tools|--no-dedup-existing-tools]
                  [--findings-db path] [--no-store-findings]
+                 [--findings-project project-id]
+                 [--findings-endpoint https://dashboard.example.com/api/ingest]
+                 [--findings-token-env ENV_VAR] [--findings-upload-required]
                  [--no-l2] [--l2] [--l3] [--no-l3]
-                 [--llm-provider deepseek|claude|openai|local] [--llm-model name]
+                 [--llm-provider deepseek|claude|openai|local|vibeguard] [--llm-model name]
                  [--llm-base-url url] [--llm-api-key-env ENV_VAR]
   vibeguard config init [--path path] [--force]
   vibeguard config path
   vibeguard config ignore-finding <finding-id> [--path path]
   vibeguard config unignore-finding <finding-id> [--path path]
-  vibeguard findings <status|list|summary|dashboard|serve|prune> [--db path] [--json]
+  vibeguard findings <status|list|summary|dashboard|compliance|audit|serve|prune> [--db path] [--json]
+  vibeguard subscription status [--api-key-env ENV_VAR] [--base-url URL] [--json]
   vibeguard ignore-rules <add-rule|add-package> ...
   vibeguard packages <import|sync|sync-config|status|check> ...
   vibeguard rules export-semgrep [--output path] [--prefix id-prefix]
@@ -1623,6 +2055,8 @@ Examples:
   vibeguard scan .
   vibeguard scan src --l3
   DEEPSEEK_API_KEY=... vibeguard scan src --l3 --llm-provider deepseek
+  VIBEGUARD_PRO_API_KEY=... vibeguard scan src --l3 --llm-provider vibeguard
+  VIBEGUARD_PRO_API_KEY=... vibeguard subscription status
   vibeguard scan src --json --package-verification remote --fail-on high
   vibeguard scan . --sarif vibeguard.sarif --github-annotations
   vibeguard scan . --markdown vibeguard-report.md
@@ -1631,7 +2065,12 @@ Examples:
   vibeguard findings list --limit 20
   vibeguard findings summary --days 30
   vibeguard findings dashboard --days 30 --output vibeguard-dashboard.html
+  vibeguard findings compliance --framework all --days 90 --output vibeguard-compliance-report.md
+  vibeguard findings audit --limit 100
   VIBEGUARD_DASHBOARD_TOKEN=... vibeguard findings serve --db ./findings.db --token-env VIBEGUARD_DASHBOARD_TOKEN
+  VIBEGUARD_FINDINGS_INGEST_TOKEN=... vibeguard findings serve --ingest-token-env VIBEGUARD_FINDINGS_INGEST_TOKEN
+  VIBEGUARD_FINDINGS_INGEST_TOKEN=... vibeguard scan . --no-store-findings --findings-project acme/payments-api --findings-endpoint https://guard.example.com/api/ingest --findings-upload-required
+  VIBEGUARD_OIDC_ISSUER=... VIBEGUARD_OIDC_CLIENT_ID=... VIBEGUARD_OIDC_SESSION_SECRET=... vibeguard findings serve --oidc-issuer-env VIBEGUARD_OIDC_ISSUER --oidc-client-id-env VIBEGUARD_OIDC_CLIENT_ID --oidc-session-secret-env VIBEGUARD_OIDC_SESSION_SECRET
   vibeguard ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
   vibeguard ignore-rules add-package npm @company/private-utils
   vibeguard config init
@@ -1704,16 +2143,36 @@ function printFindingsHelp(): void {
   console.log(`VibeGuard findings
 
 Usage:
-  vibeguard findings status [--db path] [--json]
-  vibeguard findings list [--db path] [--limit n] [--all] [--json]
-  vibeguard findings summary [--db path] [--days n] [--top n] [--json]
-  vibeguard findings dashboard [--db path] [--days n] [--top n] [--output path] [--json]
-  vibeguard findings serve [--db path] [--host 127.0.0.1] [--port 8787] [--days n] [--top n] [--token-env ENV_VAR]
+  vibeguard findings status [--db path] [--project id] [--json]
+  vibeguard findings list [--db path] [--project id] [--limit n] [--all] [--json]
+  vibeguard findings summary [--db path] [--project id] [--days n] [--top n] [--json]
+  vibeguard findings dashboard [--db path] [--project id] [--days n] [--top n] [--output path] [--json]
+  vibeguard findings compliance [--db path] [--project id] [--framework soc2|iso27001|all] [--days n] [--top n] [--output path] [--json]
+  vibeguard findings audit [--db path] [--limit n] [--json]
+  vibeguard findings serve [--db path] [--project id] [--host 127.0.0.1] [--port 8787] [--days n] [--top n]
+                           [--token-env ENV_VAR]
+                           [--ingest-token-env ENV_VAR] [--ingest-max-findings n]
+                           [--oidc-issuer-env ENV_VAR --oidc-client-id-env ENV_VAR --oidc-session-secret-env ENV_VAR]
+                           [--oidc-client-secret-env ENV_VAR] [--oidc-role-claim path]
+                           [--oidc-role claim-value=viewer|analyst|admin] [--oidc-default-role none|viewer|analyst|admin]
+                           [--public-url https://dashboard.example.com] [--secure-cookies|--no-secure-cookies]
   vibeguard findings prune [--db path] [--days n] [--json]
 
 Scan storage:
   vibeguard scan . --findings-db ~/.vibeguard/findings.db
   vibeguard scan . --no-store-findings
+  VIBEGUARD_FINDINGS_INGEST_TOKEN=... vibeguard scan . --findings-project acme/payments-api --findings-endpoint https://dashboard.example.com/api/ingest
+`);
+}
+
+function printSubscriptionHelp(): void {
+  console.log(`VibeGuard subscription
+
+Usage:
+  vibeguard subscription status [--api-key-env ENV_VAR] [--base-url URL] [--json]
+
+The Pro credential is read from VIBEGUARD_PRO_API_KEY by default. The hosted service
+enforces official L3 request allowances; BYOK and local LLM modes remain available.
 `);
 }
 

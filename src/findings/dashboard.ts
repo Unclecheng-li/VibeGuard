@@ -82,7 +82,7 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
       gap: 14px;
     }
     .kpis {
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       margin-bottom: 14px;
     }
     .sections {
@@ -210,6 +210,7 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
       ${renderKpi("Findings", summary.findingCount, "total")}
       ${renderKpi("Active", summary.activeCount, "open findings")}
       ${renderKpi("Dismissed", summary.dismissedCount, "audited findings")}
+      ${renderKpi("Projects", summary.projectCounts.length, summary.project ? "filtered project" : "reporting projects")}
     </section>
 
     <section class="grid sections">
@@ -225,6 +226,10 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
         <section class="panel" aria-labelledby="authors-heading">
           <h2 id="authors-heading">Developer Risk</h2>
           ${renderAuthorsTable(summary)}
+        </section>
+        <section class="panel" aria-labelledby="projects-heading">
+          <h2 id="projects-heading">Project Risk</h2>
+          ${renderProjectsTable(summary)}
         </section>
       </div>
       <div class="stack">
@@ -349,6 +354,28 @@ function renderAuthorsTable(summary: FindingStoreSummary): string {
   </table>`;
 }
 
+function renderProjectsTable(summary: FindingStoreSummary): string {
+  if (summary.projectCounts.length === 0) {
+    return `<div class="empty">No project attribution recorded yet.</div>`;
+  }
+  const rows = summary.projectCounts
+    .map(
+      (project) => `<tr>
+        <td class="rule">${escapeHtml(project.key)}</td>
+        <td class="num">${project.scanCount}</td>
+        <td class="num">${project.findingCount}</td>
+        <td class="num">${project.activeCount}</td>
+        <td class="num">${project.highRiskCount}</td>
+        <td class="num">${Math.round(project.highRiskRate * 100)}%</td>
+      </tr>`
+    )
+    .join("\n");
+  return `<table>
+    <thead><tr><th>Project</th><th class="num">Scans</th><th class="num">Findings</th><th class="num">Active</th><th class="num">Critical/High</th><th class="num">High-Risk Rate</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 function renderTrendChart(summary: FindingStoreSummary): string {
   if (summary.trend.length === 0) {
     return `<div class="empty">No trend data recorded yet. Run scans with findings storage enabled to populate this dashboard.</div>`;
@@ -427,10 +454,8 @@ function riskColor(summary: FindingStoreSummary): string {
 }
 
 function formatWindow(summary: FindingStoreSummary): string {
-  if (!summary.since) {
-    return "All stored scan history";
-  }
-  return `Since ${formatDateTime(summary.since)}`;
+  const window = summary.since ? `Since ${formatDateTime(summary.since)}` : "All stored scan history";
+  return summary.project ? `${window} - project ${summary.project}` : window;
 }
 
 function formatDateTime(timestamp: number): string {

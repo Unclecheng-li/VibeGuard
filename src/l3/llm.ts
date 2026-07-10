@@ -1,4 +1,5 @@
 import type { Finding, L3AnalyzerLike, Severity, SourceFile, VibeGuardConfig } from "../types";
+import { defaultProApiBaseUrl, getProApiKeyFromEnv } from "../subscription";
 import { createFinding, lineStarts, lineTextAt } from "../utils";
 import { LocalSemanticAnalyzer } from "./analyzer";
 
@@ -89,6 +90,9 @@ export function getLlmApiKeyFromEnv(provider: LlmProvider, explicitEnvVar?: stri
   if (provider === "local") {
     return undefined;
   }
+  if (provider === "vibeguard") {
+    return getProApiKeyFromEnv(explicitEnvVar);
+  }
   const names = explicitEnvVar ? [explicitEnvVar] : llmApiKeyEnvNames(provider);
   for (const name of names) {
     const value = process.env[name]?.trim();
@@ -107,6 +111,8 @@ export function llmApiKeyEnvNames(provider: LlmProvider): string[] {
       return ["ANTHROPIC_API_KEY", "VIBEGUARD_LLM_API_KEY"];
     case "openai":
       return ["OPENAI_API_KEY", "VIBEGUARD_LLM_API_KEY"];
+    case "vibeguard":
+      return ["VIBEGUARD_PRO_API_KEY"];
     case "local":
       return [];
   }
@@ -120,6 +126,8 @@ export function defaultLlmModel(provider: LlmProvider): string {
       return "claude-3-5-haiku-latest";
     case "openai":
       return "gpt-4.1-mini";
+    case "vibeguard":
+      return "vibeguard-security-pro";
     case "local":
       return "llama3.2";
   }
@@ -133,6 +141,8 @@ export function defaultLlmBaseUrl(provider: LlmProvider): string {
       return "https://api.anthropic.com/v1";
     case "openai":
       return "https://api.openai.com/v1";
+    case "vibeguard":
+      return defaultProApiBaseUrl();
     case "local":
       return "http://localhost:11434";
   }

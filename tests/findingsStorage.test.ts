@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -220,6 +221,111 @@ test("prunes stored scans and findings before a cutoff", async (context) => {
   assert.equal(result.deletedFindings, 1);
   assert.deepEqual(findings.map((item) => item.id), ["new_finding"]);
   assert.equal(stats.scanCount, 1);
+  store.close();
+});
+
+test("stores bounded dashboard audit events without authentication material", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-audit-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  store.recordAuditEvent({
+    timestamp: 10,
+    subject: "security@example.com",
+    role: "analyst",
+    authentication: "oidc",
+    action: "dashboard.compliance_viewed",
+    details: {
+      path: "/api/compliance",
+      authorization: "must-not-be-stored",
+      access_token: "must-not-be-stored",
+      api_key: "must-not-be-stored",
+      credential: "must-not-be-stored",
+      count: 2
+    }
+  });
+  store.recordAuditEvent({
+    timestamp: 20,
+    subject: "admin@example.com",
+    role: "admin",
+    authentication: "oidc",
+    action: "dashboard.audit_log_viewed"
+  });
+
+  const events = store.listAuditEvents();
+  assert.equal(events.length, 2);
+  assert.equal(events[0].action, "dashboard.audit_log_viewed");
+  assert.deepEqual(events[1].details, { path: "/api/compliance", count: 2 });
+  assert.equal(store.listAuditEvents({ since: 15 }).length, 1);
+  const prune = store.pruneBefore(15);
+  assert.equal(prune.deletedAuditEvents, 1);
+  assert.equal(store.listAuditEvents().length, 1);
+  store.close();
+});
+
+test("migrates legacy scan history and aggregates findings by project", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-projects-"));
+  const dbPath = path.join(tempDir, "findings.db");
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE scan_run (
+      scan_id TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL,
+      cwd TEXT NOT NULL,
+      target_paths TEXT NOT NULL,
+      file_count INTEGER NOT NULL,
+      finding_count INTEGER NOT NULL,
+      active_count INTEGER NOT NULL,
+      dismissed_count INTEGER NOT NULL
+    );
+  `);
+  legacy.close();
+
+  const store = new SqliteFindingStore(dbPath);
+  store.recordScanRun({
+    scanId: "alpha",
+    startedAt: 1,
+    completedAt: 2,
+    project: "acme/payments-api",
+    cwd: tempDir,
+    targetPaths: ["payments.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "payments" })]
+  });
+  store.recordScanRun({
+    scanId: "beta",
+    startedAt: 3,
+    completedAt: 4,
+    project: "acme/web-app",
+    cwd: tempDir,
+    targetPaths: ["web.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "web", severity: "medium" })]
+  });
+
+  const all = store.summary({ topLimit: 10 });
+  const payments = store.summary({ project: "acme/payments-api" });
+  assert.deepEqual(
+    all.projectCounts.map((project) => [project.key, project.scanCount, project.activeCount, project.highRiskCount]),
+    [
+      ["acme/payments-api", 1, 1, 1],
+      ["acme/web-app", 1, 1, 0]
+    ]
+  );
+  assert.equal(payments.project, "acme/payments-api");
+  assert.equal(payments.scanCount, 1);
+  assert.equal(payments.findingCount, 1);
+  assert.equal(store.stats("acme/web-app").scanCount, 1);
+  assert.equal(store.listFindings({ project: "acme/payments-api" })[0]?.project, "acme/payments-api");
+  assert.equal(store.listScanRuns(10, "acme/web-app")[0]?.project, "acme/web-app");
   store.close();
 });
 

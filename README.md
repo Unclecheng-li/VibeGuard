@@ -2,13 +2,13 @@
 
 VibeGuard is an IDE-first security scanner for AI-generated code. It focuses on the mistakes AI tools commonly introduce while you are coding: hallucinated package names, hardcoded secrets, unsafe framework configuration, and high-confidence insecure coding patterns.
 
-This repository implements the core `VibeGuard-PRD.md` roadmap through the L3 foundations:
+This repository implements the core `VibeGuard-PRD.md` roadmap through L3 and the initial Pro subscription client:
 
 - VSCode extension shell with real-time diagnostics and a findings sidebar
 - JetBrains plugin module that starts the same bundled LSP server for supported source files
 - L1 scanner for npm/PyPI/Cargo/Go/Maven hallucinated packages, hardcoded secrets, loose config, and expanded AI error patterns
 - Tree-sitter WASM-backed L2 SAST rules for JavaScript, TypeScript, and Python injection, XSS, unsafe deserialization, redirects, and information leakage, with regex fallback for other languages and incomplete edits
-- Optional L3 semantic checks with DeepSeek, Claude, OpenAI-compatible, or local Ollama providers, plus local heuristic fallback
+- Optional L3 semantic checks with DeepSeek, Claude, OpenAI-compatible, local Ollama, or VibeGuard Pro providers, plus local heuristic fallback
 - Local package verification cache with offline seed mode and optional remote npm/PyPI checks
 - Local SQLite scan history in `~/.vibeguard/findings.db`
 - CLI scanner for local and CI usage
@@ -53,16 +53,45 @@ docker run --rm -v "$PWD:/workspace" vibeguard:local scan /workspace --mode ai-c
 
 `findings serve` turns the stored findings history into a deployable team dashboard with developer risk, rule, severity,
 dismissal, and trend views. It listens on `127.0.0.1:8787` by default. Use `--host 0.0.0.0` only behind a private network
-or reverse proxy, and provide an environment-backed token before exposing it beyond localhost.
+or reverse proxy.
+
+For a small private deployment, an environment-backed service token remains available as an emergency administrator
+credential. Do not put that token in a CI log or source file, and do not leave it in a bookmarked or shared URL.
 
 ```bash
 VIBEGUARD_DASHBOARD_TOKEN=replace-with-a-long-random-value \
   node dist/cli.js findings serve --db ~/.vibeguard/findings.db --token-env VIBEGUARD_DASHBOARD_TOKEN
 ```
 
-The dashboard is available at `/`, machine-readable summary data is at `/api/summary`, and `/healthz` is unauthenticated
-for container orchestration. A browser can authenticate with a bearer token through a reverse proxy; opening `/?token=…`
-once establishes an HttpOnly session cookie for the dashboard origin.
+For enterprise deployments, use a standards-based OpenID Connect provider. VibeGuard uses authorization code flow with
+PKCE, validates signed ID tokens against the provider JWKS, and stores only a short-lived signed HttpOnly dashboard
+session. Register `<public-url>/auth/callback` as the provider callback URL.
+
+```bash
+export VIBEGUARD_OIDC_ISSUER=https://id.example.com
+export VIBEGUARD_OIDC_CLIENT_ID=vibeguard-dashboard
+export VIBEGUARD_OIDC_CLIENT_SECRET=replace-with-provider-secret
+export VIBEGUARD_OIDC_SESSION_SECRET=replace-with-at-least-32-random-characters
+
+node dist/cli.js findings serve --db ~/.vibeguard/findings.db --host 0.0.0.0 \
+  --public-url https://guard.example.com --secure-cookies \
+  --oidc-issuer-env VIBEGUARD_OIDC_ISSUER \
+  --oidc-client-id-env VIBEGUARD_OIDC_CLIENT_ID \
+  --oidc-client-secret-env VIBEGUARD_OIDC_CLIENT_SECRET \
+  --oidc-session-secret-env VIBEGUARD_OIDC_SESSION_SECRET \
+  --oidc-role-claim groups \
+  --oidc-role security-reviewers=analyst \
+  --oidc-role platform-admins=admin
+```
+
+OIDC supports a dotted role claim path, such as `realm_access.roles`. An unmapped identity receives `none` access by
+default; add `--oidc-default-role viewer` only when every signed-in identity should see dashboard summaries. `viewer`
+can use `/` and `/api/summary`, `analyst` can additionally use `/api/findings` and `/api/compliance`, and `admin` can include dismissed results
+with `/api/findings?all=true` and inspect `/api/audit`. `/api/session` exposes the current identity and effective role. `/healthz` intentionally
+remains unauthenticated for container orchestration.
+
+The service-token flow grants `admin` access. A browser can authenticate it through a reverse proxy, or a one-time
+`/?token=<service-token>` visit sets an HttpOnly token cookie for that dashboard origin. Prefer OIDC for normal users.
 
 For a Docker deployment, mount the directory that holds `findings.db` and publish the dashboard port:
 
@@ -72,6 +101,62 @@ docker run --rm -p 8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN \
   findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
 ```
 
+### Central CI Ingestion
+
+Private dashboards can receive scan history from CI without sharing the dashboard administrator token. Enable a separate
+ingest token on the dashboard, keep the dashboard behind TLS in production, and give only that ingest token to CI. The
+`POST /api/ingest` endpoint accepts only JSON scan payloads with bounded fields, a 5 MiB body limit, and up to 10,000
+findings per upload by default. It does not accept dashboard cookies or OIDC sessions, and successful uploads are recorded
+as `findings.ingested` audit events without credentials.
+
+Every upload may carry a stable project identifier. Use `--findings-project` from a generic CLI environment; the GitHub
+Action defaults it to `GITHUB_REPOSITORY` and exposes `findings_project` only for overrides. The team dashboard renders a
+project-risk table. Use `--project <id>` with CLI history commands or `findings serve` to pin a view, or add
+`?project=<id>` to authenticated dashboard summary, findings, compliance, or HTML requests when the server is not pinned.
+
+```bash
+export VIBEGUARD_DASHBOARD_TOKEN=replace-with-break-glass-token
+export VIBEGUARD_FINDINGS_INGEST_TOKEN=replace-with-dedicated-ci-token
+
+node dist/cli.js findings serve --db ~/.vibeguard/findings.db --host 0.0.0.0 \
+  --token-env VIBEGUARD_DASHBOARD_TOKEN \
+  --ingest-token-env VIBEGUARD_FINDINGS_INGEST_TOKEN
+```
+
+The CLI can then upload one completed scan. Upload failures remain warnings by default so an unavailable dashboard does
+not hide scanner results; add `--findings-upload-required` when the centralized record is a required CI gate.
+
+```bash
+VIBEGUARD_FINDINGS_INGEST_TOKEN=replace-with-dedicated-ci-token \
+  node dist/cli.js scan . --no-store-findings \
+  --findings-endpoint https://guard.example.com/api/ingest \
+  --findings-token-env VIBEGUARD_FINDINGS_INGEST_TOKEN \
+  --findings-project acme/payments-api \
+  --findings-upload-required
+```
+
+## Pro Subscription
+
+The `vibeguard` L3 provider uses the official hosted service and its server-enforced Pro, Team, or Enterprise allowance.
+It does not replace the free BYOK paths: DeepSeek, Claude, OpenAI-compatible endpoints, and local Ollama remain available
+without a VibeGuard subscription. Store the Pro credential in `VIBEGUARD_PRO_API_KEY` for CLI, LSP, CI, and Docker, or use
+`VibeGuard: Set LLM API Key` with provider `vibeguard` in VSCode so it is held in SecretStorage.
+
+```bash
+export VIBEGUARD_PRO_API_KEY=replace-with-pro-credential
+node dist/cli.js scan src --l3 --llm-provider vibeguard
+node dist/cli.js subscription status
+```
+
+The default service origin is `https://api.vibeguard.dev/v1`. Private service deployments can set
+`VIBEGUARD_PRO_API_BASE_URL`; it must use HTTPS except for localhost development. The VSCode extension and LSP deliberately
+ignore a workspace-level `llmBaseUrl` for the hosted provider, so a repository cannot redirect a stored Pro credential.
+
+The hosted contract is OpenAI-compatible for `POST /chat/completions` and exposes `GET /account/usage` for the status
+command. The usage response contains `plan`, `status`, optional `features`, and `usage.l3_requests` with `used`, `limit`,
+and optional `reset_at`. Billing, credit checks, and request limits remain server-side; the client never writes the Pro
+credential into `config.json`.
+
 ## CLI
 
 ```bash
@@ -79,6 +164,8 @@ npm run build
 node dist/cli.js scan path/to/project --package-verification seed --fail-on high
 node dist/cli.js scan src --json
 DEEPSEEK_API_KEY=... node dist/cli.js scan src --l3 --llm-provider deepseek
+VIBEGUARD_PRO_API_KEY=... node dist/cli.js scan src --l3 --llm-provider vibeguard
+VIBEGUARD_PRO_API_KEY=... node dist/cli.js subscription status
 node dist/cli.js scan src --l3 --llm-provider local --llm-model llama3.2
 node dist/cli.js scan . --sarif vibeguard.sarif --github-annotations
 node dist/cli.js scan . --markdown vibeguard-report.md
@@ -97,10 +184,12 @@ node dist/cli.js findings status
 node dist/cli.js findings list --limit 20
 node dist/cli.js findings summary --days 30
 node dist/cli.js findings dashboard --days 30 --output vibeguard-dashboard.html
+node dist/cli.js findings compliance --framework all --days 90 --output vibeguard-compliance-report.md
+node dist/cli.js findings audit --limit 100
 node dist/cli.js rules export-semgrep --output vibeguard-semgrep.yml
 ```
 
-`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM and expects structured JSON findings; without credentials, it falls back to conservative local heuristics for missing authentication, rate limiting, input validation, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `VIBEGUARD_LLM_API_KEY`; the CLI intentionally has no plaintext API-key flag.
+`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM and expects structured JSON findings; without credentials, it falls back to conservative local heuristics for missing authentication, rate limiting, input validation, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VIBEGUARD_LLM_API_KEY`, or `VIBEGUARD_PRO_API_KEY`; the CLI intentionally has no plaintext API-key flag.
 
 Provider controls:
 
@@ -109,6 +198,7 @@ node dist/cli.js scan src --l3 --llm-provider deepseek --llm-model deepseek-v4-f
 node dist/cli.js scan src --l3 --llm-provider claude --llm-api-key-env ANTHROPIC_API_KEY
 node dist/cli.js scan src --l3 --llm-provider openai --llm-base-url https://api.openai.com/v1
 node dist/cli.js scan src --l3 --llm-provider local --llm-base-url http://localhost:11434
+VIBEGUARD_PRO_API_KEY=... node dist/cli.js scan src --l3 --llm-provider vibeguard
 ```
 
 The L1 secret scanner combines provider-specific signatures for keys and tokens, sensitive assignment context such as `apiKey`, `clientSecret`, `Authorization`, and `webhookSecret`, Shannon-entropy scoring for random-looking literals, and false-positive filters for placeholders, hashes, fixtures, UUIDs, and normal encoded data. High-confidence JavaScript/TypeScript and Python secret assignments include quick fixes that replace committed literals with environment-variable reads. The AI pattern library covers common generated-code mistakes such as placeholder credentials, unsafe JWT handling, wildcard CORS with credentials, disabled TLS verification, weak password hashing, plaintext password comparison, insecure random token generation, placeholder framework secrets, and public object-storage ACLs. L2 covers high-confidence SQL injection, XSS, SSRF, path traversal, unsafe deserialization, command injection, open redirect, and error-detail leakage patterns. High-confidence `innerHTML` and unsafe `yaml.load()` findings include mechanical quick fixes.
@@ -179,6 +269,19 @@ node dist/cli.js scan . --no-store-findings
 
 `findings summary` aggregates stored history by severity, type, top detection rules, dismissal reason, git author, and daily trend, providing a stable JSON shape for CI summaries or a future team dashboard. CLI and VSCode scans record the latest git author for files with findings when git history is available, so the summary and dashboard can surface developer risk hotspots. `findings dashboard` writes a standalone HTML dashboard with the same trend, author, and dismissal-reason data, suitable for CI artifacts, team reports, false-positive review, or offline review. VSCode users can run `VibeGuard: Export Findings Dashboard` to generate and open the same dashboard from the command palette.
 
+`findings compliance` writes a source-free Markdown evidence report for `soc2`, `iso27001`, or both. It maps scan
+history to selected control objectives, open mapped findings, trend cadence, top rules, and dismissal reasons. The report
+also includes aggregate dashboard action and access-denial counts without subjects or request metadata. It is technical
+evidence for an audit workflow; it is explicitly not a certification, attestation, or proof of compliance.
+Use `--json` to emit the same evidence shape for a GRC system, and `/api/compliance` from the protected team dashboard
+for an analyst-role JSON view.
+
+The private dashboard records successful OIDC sign-ins/sign-outs, sensitive findings and compliance views, audit-log
+views, and authenticated authorization denials in the same SQLite database. Audit metadata is bounded and filters keys
+such as tokens, cookies, authorization headers, passwords, and provider codes. `findings audit` is the local operator
+view; `/api/audit` requires the dashboard `admin` role. `findings prune` applies the selected retention cutoff to both
+scan history and audit events.
+
 GitHub Action scans default to `store_findings: false` so CI jobs do not write local history unless explicitly requested.
 
 ## Package Index
@@ -222,11 +325,15 @@ Storage modes:
 ```yaml
 name: VibeGuard Security Scan
 on: [pull_request]
+permissions:
+  contents: read
+  pull-requests: write
 jobs:
   scan:
     runs-on: ubuntu-latest
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      VIBEGUARD_FINDINGS_INGEST_TOKEN: ${{ secrets.VIBEGUARD_FINDINGS_INGEST_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - id: vibeguard
@@ -246,11 +353,21 @@ jobs:
           markdown: vibeguard-report.md
           step_summary: true
           pr_comment: false
+          pr_review_comments: true
+          pr_review_comment_limit: 20
           config: .vibeguard/config.json
           dedup_existing_tools: true
           store_findings: true
+          # findings_project: acme/security-platform
+          findings_endpoint: https://guard.example.com/api/ingest
+          findings_token_env: VIBEGUARD_FINDINGS_INGEST_TOKEN
+          findings_upload_required: true
           dashboard: true
           dashboard_path: vibeguard-dashboard.html
+          compliance: true
+          compliance_path: vibeguard-compliance-report.md
+          compliance_framework: all
+          compliance_days: 90
           ignore_rules: .vibeguard/ignore-rules.yml
           custom_rules: .vibeguard/custom-rules.yml
           package_index: .vibeguard/package-index.json
@@ -260,6 +377,11 @@ jobs:
         with:
           name: vibeguard-dashboard
           path: ${{ steps.vibeguard.outputs.dashboard_path }}
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.vibeguard.outputs.compliance_path != ''
+        with:
+          name: vibeguard-compliance-evidence
+          path: ${{ steps.vibeguard.outputs.compliance_path }}
 ```
 
 Package verification modes:
@@ -268,9 +390,9 @@ Package verification modes:
 - `remote`: seed + cached remote npm/PyPI verification with a 3 second timeout
 - `off`: disables package existence checks
 
-For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path. Set `store_findings: true` and `dashboard: true` to generate a standalone HTML findings dashboard, then upload `steps.vibeguard.outputs.dashboard_path` as a CI artifact.
+For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `pr_review_comments: true` to create a single `COMMENT` review containing up to `pr_review_comment_limit` active findings on changed diff lines. It defaults to `false`, requires `pull-requests: write`, skips existing VibeGuard comments at the same path/line/rule, and never includes a finding's code evidence. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path. Set `findings_endpoint` to the private dashboard's `/api/ingest` endpoint and provide its dedicated token only through the environment variable named by `findings_token_env`; `findings_upload_required` is opt-in. Set `store_findings: true` with `dashboard: true` or `compliance: true` to generate the corresponding HTML dashboard or source-free compliance evidence artifact.
 
-Set `mode: ai-code-scan` to scan only changed files whose commits look AI-authored. `ai_detection` supports `author`, `message`, and `aggressive`; when git history cannot be inspected, VibeGuard falls back to a full scan so CI does not silently miss findings.
+Set `mode: ai-code-scan` to analyze changed files but report only findings that overlap changed lines attributed to AI. VibeGuard parses zero-context diff hunks, uses `git blame` on the checked-out head for line attribution, and reads the blamed commit message only when `ai_detection: message` or `aggressive` needs it. `author` matches the blamed author, `message` matches the blamed commit body or trailers, and `aggressive` includes either signal plus additions of 50 or more lines. When git history or blame cannot be inspected, VibeGuard falls back to a full scan so CI does not silently miss findings.
 
 ## Semgrep Export
 
@@ -370,6 +492,7 @@ LLM commands:
 - `VibeGuard: Set LLM API Key`
 - `VibeGuard: Delete LLM API Key`
 - `VibeGuard: Show LLM Status`
+- `VibeGuard: Show Pro Subscription Status`
 
 Dashboard command:
 

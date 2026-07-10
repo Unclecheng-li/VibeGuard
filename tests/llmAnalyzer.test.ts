@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  defaultLlmBaseUrl,
+  defaultLlmModel,
   getLlmApiKeyFromEnv,
   LlmSemanticAnalyzer,
   llmApiKeyEnvNames,
@@ -153,6 +155,32 @@ test("requests OpenAI-compatible LLM providers and converts response content", a
   assert.equal(findings[0].detection_rule, "l3_llm_missing_rate_limiting");
 });
 
+test("uses the Pro provider's OpenAI-compatible hosted endpoint", async () => {
+  let requestedUrl = "";
+  let authorization = "";
+  const analyzer = new LlmSemanticAnalyzer({
+    provider: "vibeguard",
+    apiKey: "pro-credential",
+    baseUrl: "https://pro.example.test/v1",
+    fallbackAnalyzer: false,
+    fetchImpl: async (url, init) => {
+      requestedUrl = String(url);
+      authorization = String((init?.headers as Record<string, string>).authorization);
+      return response(
+        JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ findings: [] }) } }]
+        })
+      );
+    }
+  });
+
+  const findings = await analyzer.analyze({ filePath: "app.ts", text: "const ok = true;" }, 1);
+
+  assert.equal(requestedUrl, "https://pro.example.test/v1/chat/completions");
+  assert.equal(authorization, "Bearer pro-credential");
+  assert.deepEqual(findings, []);
+});
+
 test("falls back to local L3 analysis when remote provider has no API key", async () => {
   const analyzer = new LlmSemanticAnalyzer({
     provider: "openai"
@@ -177,16 +205,27 @@ app.post("/api/admin/users", (req, res) => {
 
 test("reads provider-specific LLM API keys from environment variables", () => {
   const previous = process.env.DEEPSEEK_API_KEY;
+  const previousPro = process.env.VIBEGUARD_PRO_API_KEY;
   process.env.DEEPSEEK_API_KEY = "deepseek-key";
+  process.env.VIBEGUARD_PRO_API_KEY = "pro-key";
   try {
     assert.deepEqual(llmApiKeyEnvNames("openai"), ["OPENAI_API_KEY", "VIBEGUARD_LLM_API_KEY"]);
+    assert.deepEqual(llmApiKeyEnvNames("vibeguard"), ["VIBEGUARD_PRO_API_KEY"]);
     assert.equal(getLlmApiKeyFromEnv("deepseek"), "deepseek-key");
+    assert.equal(getLlmApiKeyFromEnv("vibeguard"), "pro-key");
     assert.equal(getLlmApiKeyFromEnv("local"), undefined);
+    assert.equal(defaultLlmModel("vibeguard"), "vibeguard-security-pro");
+    assert.match(defaultLlmBaseUrl("vibeguard"), /^https:\/\//);
   } finally {
     if (previous === undefined) {
       delete process.env.DEEPSEEK_API_KEY;
     } else {
       process.env.DEEPSEEK_API_KEY = previous;
+    }
+    if (previousPro === undefined) {
+      delete process.env.VIBEGUARD_PRO_API_KEY;
+    } else {
+      process.env.VIBEGUARD_PRO_API_KEY = previousPro;
     }
   }
 });

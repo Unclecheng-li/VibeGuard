@@ -46,3 +46,11 @@
 - L3 structured responses can now provide a range-validated, review-required replacement for an exact evidence snippet, surfaced through VSCode and LSP Quick Fixes without marking the generated edit as preferred.
 - Added `VibeGuard: Apply All Safe Fixes in Current File` to batch non-overlapping L1/L2 mechanical fixes while excluding generated L3 edits for individual review.
 - Added `vibeguard findings serve` for a token-protected, Docker-ready team dashboard backed by SQLite findings history and a machine-readable summary API.
+- Added standards-based OIDC sign-in for private team dashboards with PKCE, JWKS ID-token validation, signed HttpOnly sessions, role-claim mapping, and enforced viewer/analyst/admin API access controls.
+- Added the VibeGuard Pro LLM provider with environment/SecretStorage credentials, hosted allowance status queries, CLI subscription status, and secure service-origin handling for VSCode and LSP.
+- Added source-free SOC 2 and ISO/IEC 27001 security evidence reports from stored scan history, with CLI, CI artifact, and analyst-role dashboard API delivery.
+- Added persisted dashboard access audit events with redacted metadata, CLI inspection, administrator-only API access, and retention pruning.
+- Added opt-in, bounded, de-duplicated GitHub PR Review comments for active findings on changed diff lines.
+- Added a separately tokened, bounded private-dashboard findings ingest API, optional CLI and GitHub Action uploads, and ingest audit events for centralized CI trend reporting.
+- Added project attribution and filtering across centralized scans, SQLite trend summaries, dashboards, CLI history commands, dashboard APIs, and GitHub Action uploads.
+- Refined `ai-code-scan` to use zero-context diffs and git blame for line-level AI attribution, reporting only findings that overlap changed AI-attributed lines while retaining a conservative full-scan fallback.

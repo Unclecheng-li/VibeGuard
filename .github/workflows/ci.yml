@@ -42,11 +42,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build --tag vibeguard:ci .
+      - run: docker run --rm vibeguard:ci subscription status --json
       - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" vibeguard:ci scan /workspace --package-verification off --no-store-findings --fail-on none
       - run: mkdir -p "$RUNNER_TEMP/vibeguard-dashboard"
       - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci scan /workspace --package-verification off --findings-db /data/findings.db --fail-on none
+      - run: docker run --rm -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci findings compliance --db /data/findings.db --framework all --output /data/compliance.md
+      - run: test -s "$RUNNER_TEMP/vibeguard-dashboard/compliance.md"
       - run: docker run --detach --name vibeguard-dashboard -p 127.0.0.1:8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN=ci-token -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
       - run: >-
           curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1
           -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/summary
+      - run: >-
+          curl --fail --silent --show-error
+          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/compliance?framework=soc2
+      - run: >-
+          curl --fail --silent --show-error
+          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/audit
       - run: docker rm --force vibeguard-dashboard
