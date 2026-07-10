@@ -15,6 +15,12 @@
 - Existing-tool deduplication for L2 findings with nearby SonarQube, Snyk, Semgrep, or CodeQL annotations, configurable across CLI, VSCode, LSP, GitHub Action, and config.json.
 - L2 SAST coverage for open redirects and server error-detail information leakage, including Semgrep export metadata.
 - Local SQLite findings history in `~/.vibeguard/findings.db`, with CLI `findings status/list/prune`, VSCode persistence, and opt-out flags for local/CI scans.
+- CLI `findings summary` now aggregates stored history by severity, finding type, top detection rules, and daily trend for CI summaries and future team dashboards.
+- Findings summaries and dashboards now include dismissal-reason counts so teams can spot false-positive or internal-package patterns.
+- CLI findings storage now records latest git author attribution for files with findings and surfaces developer risk counts/rates in summaries and dashboards.
+- CLI `findings dashboard` can now export the same findings history as a standalone HTML dashboard for offline team trend review.
+- GitHub Action can now generate the standalone findings dashboard during CI with `dashboard: true`, exposing `dashboard_path` for artifact upload.
+- VSCode now exposes `VibeGuard: Export Findings Dashboard` to generate and open the local findings trend dashboard from the command palette.
 - Exact finding-id dismissal through config `ignored_findings`, VSCode `vibeguard.ignoredFindings`, LSP settings, and CLI `config ignore-finding` / `config unignore-finding`.
 - Mechanical quick fixes for high-confidence L2 `innerHTML` and unsafe `yaml.load()` findings, plus L1 YAML loader findings.
 - Package-name remote sync expanded beyond npm/PyPI to Cargo crates, Go module index, and Maven Central search for richer local indexes.
@@ -30,3 +36,6 @@
 - Scanner results now include L1/L2/L3 timing breakdowns and PRD performance-budget checks, surfaced in CLI JSON/human/Markdown reports, GitHub Action summaries, VSCode status tooltips, and LSP console warnings.
 - L1 hardcoded-secret assignments now include mechanical quick fixes for JavaScript/TypeScript `process.env` reads and Python `os.getenv` reads, including an `import os` insertion when needed.
 - VSCode edit-time scans now follow the PRD timing model more closely: L1 runs immediately, L2 is debounced with `vibeguard.l2DebounceMs` (500ms default), and L3 keeps its separate debounce while findings from layers that have not rerun are preserved until their refresh completes.
+- VSCode ignore actions now prompt for a reason (`False positive`, `Not an issue`, `Internal package`, or custom text) and persist that reason into `ignore-rules.yml` for dismissed finding audit trails.
+- CLI `ignore-rules add-rule` and `ignore-rules add-package` commands can now append scoped ignore-rules.yml entries with the same standard reason presets, making CI/team ignores manageable without hand-editing YAML.
+- The LSP server now advertises quickfix code actions and returns workspace edits for findings with safe mechanical fixes, extending package, secret, config, and SAST fixes beyond the VSCode extension shell.

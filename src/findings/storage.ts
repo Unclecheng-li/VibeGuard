@@ -27,6 +27,7 @@ export interface RecordScanRunInput {
   targetPaths: string[];
   fileCount: number;
   findings: Finding[];
+  findingAuthors?: Record<string, FindingAuthor>;
 }
 
 export interface StoredScanRun {
@@ -44,6 +45,13 @@ export interface StoredScanRun {
 export interface StoredFinding extends Finding {
   scanId: string;
   scanCompletedAt: number;
+  authorName?: string;
+  authorEmail?: string;
+}
+
+export interface FindingAuthor {
+  name?: string;
+  email?: string;
 }
 
 export interface FindingQuery {
@@ -57,6 +65,43 @@ export interface FindingStoreStats {
   activeCount: number;
   dismissedCount: number;
   latestScanAt?: number;
+}
+
+export interface FindingSummaryBucket {
+  key: string;
+  count: number;
+  activeCount: number;
+  dismissedCount: number;
+}
+
+export interface FindingRuleSummary extends FindingSummaryBucket {
+  type: FindingType;
+  severity: Severity;
+}
+
+export interface FindingAuthorSummary extends FindingSummaryBucket {
+  name?: string;
+  email?: string;
+  highRiskCount: number;
+  highRiskRate: number;
+}
+
+export interface FindingTrendPoint {
+  date: string;
+  scanCount: number;
+  findingCount: number;
+  activeCount: number;
+  dismissedCount: number;
+}
+
+export interface FindingStoreSummary extends FindingStoreStats {
+  since?: number;
+  severityCounts: FindingSummaryBucket[];
+  typeCounts: FindingSummaryBucket[];
+  dismissedReasonCounts: FindingSummaryBucket[];
+  authorCounts: FindingAuthorSummary[];
+  topRules: FindingRuleSummary[];
+  trend: FindingTrendPoint[];
 }
 
 export interface PruneResult {
@@ -115,10 +160,11 @@ export class SqliteFindingStore {
         `INSERT INTO finding_result (
            scan_id, finding_id, type, severity, message, file_path, line, column,
            end_line, end_column, evidence, suggestion, fix_json, detection_layer,
-           detection_rule, timestamp, dismissed, dismissed_reason
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           detection_rule, timestamp, dismissed, dismissed_reason, author_name, author_email
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const finding of input.findings) {
+        const author = input.findingAuthors?.[finding.id];
         insertFinding.run(
           storedRun.scanId,
           finding.id,
@@ -137,7 +183,9 @@ export class SqliteFindingStore {
           finding.detection_rule,
           finding.timestamp,
           finding.dismissed ? 1 : 0,
-          finding.dismissed_reason ?? null
+          finding.dismissed_reason ?? null,
+          author?.name ?? null,
+          author?.email ?? null
         );
       }
       this.database.exec("COMMIT");
@@ -200,6 +248,132 @@ export class SqliteFindingStore {
       activeCount: Number(row?.active_count ?? 0),
       dismissedCount: Number(row?.dismissed_count ?? 0),
       latestScanAt: row?.latest_scan_at === null || row?.latest_scan_at === undefined ? undefined : Number(row.latest_scan_at)
+    };
+  }
+
+  summary(options: { since?: number; topLimit?: number } = {}): FindingStoreSummary {
+    this.initialize();
+    const since = options.since ?? null;
+    const topLimit = Math.max(1, Math.min(options.topLimit ?? 10, 100));
+    const statsRow = this.database
+      .prepare(
+        `SELECT COUNT(DISTINCT s.scan_id) AS scan_count,
+                COUNT(f.finding_id) AS finding_count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
+                MAX(s.completed_at) AS latest_scan_at
+         FROM scan_run s
+         LEFT JOIN finding_result f ON f.scan_id = s.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)`
+      )
+      .get(since, since);
+
+    const severityRows = this.database
+      .prepare(
+        `SELECT f.severity AS key,
+                COUNT(*) AS count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+         GROUP BY f.severity
+         ORDER BY count DESC, f.severity ASC`
+      )
+      .all(since, since);
+
+    const typeRows = this.database
+      .prepare(
+        `SELECT f.type AS key,
+                COUNT(*) AS count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+         GROUP BY f.type
+         ORDER BY count DESC, f.type ASC`
+      )
+      .all(since, since);
+
+    const topRuleRows = this.database
+      .prepare(
+        `SELECT f.detection_rule AS key,
+                f.type AS type,
+                f.severity AS severity,
+                COUNT(*) AS count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+         GROUP BY f.detection_rule, f.type, f.severity
+         ORDER BY count DESC, active_count DESC, f.detection_rule ASC
+         LIMIT ?`
+      )
+      .all(since, since, topLimit);
+
+    const dismissedReasonRows = this.database
+      .prepare(
+        `SELECT COALESCE(NULLIF(TRIM(f.dismissed_reason), ''), 'unspecified') AS key,
+                COUNT(*) AS count,
+                0 AS active_count,
+                COUNT(*) AS dismissed_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE f.dismissed = 1 AND (? IS NULL OR s.completed_at >= ?)
+         GROUP BY key
+         ORDER BY count DESC, key ASC`
+      )
+      .all(since, since);
+
+    const authorRows = this.database
+      .prepare(
+        `SELECT COALESCE(NULLIF(LOWER(TRIM(f.author_email)), ''), NULLIF(TRIM(f.author_name), ''), 'unknown') AS key,
+                NULLIF(TRIM(f.author_name), '') AS name,
+                NULLIF(TRIM(f.author_email), '') AS email,
+                COUNT(*) AS count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
+                SUM(CASE WHEN f.dismissed = 0 AND f.severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS high_risk_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+         GROUP BY key
+         ORDER BY high_risk_count DESC, active_count DESC, count DESC, key ASC
+         LIMIT ?`
+      )
+      .all(since, since, topLimit);
+
+    const trendRows = this.database
+      .prepare(
+        `SELECT date(s.completed_at / 1000, 'unixepoch') AS date,
+                COUNT(DISTINCT s.scan_id) AS scan_count,
+                COUNT(f.finding_id) AS finding_count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count
+         FROM scan_run s
+         LEFT JOIN finding_result f ON f.scan_id = s.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+         GROUP BY date
+         ORDER BY date ASC`
+      )
+      .all(since, since);
+
+    return {
+      scanCount: Number(statsRow?.scan_count ?? 0),
+      findingCount: Number(statsRow?.finding_count ?? 0),
+      activeCount: Number(statsRow?.active_count ?? 0),
+      dismissedCount: Number(statsRow?.dismissed_count ?? 0),
+      latestScanAt:
+        statsRow?.latest_scan_at === null || statsRow?.latest_scan_at === undefined ? undefined : Number(statsRow.latest_scan_at),
+      since: options.since,
+      severityCounts: severityRows.map(rowToSummaryBucket),
+      typeCounts: typeRows.map(rowToSummaryBucket),
+      dismissedReasonCounts: dismissedReasonRows.map(rowToSummaryBucket),
+      authorCounts: authorRows.map(rowToAuthorSummary),
+      topRules: topRuleRows.map(rowToRuleSummary),
+      trend: trendRows.map(rowToTrendPoint)
     };
   }
 
@@ -266,12 +440,17 @@ export class SqliteFindingStore {
         timestamp INTEGER NOT NULL,
         dismissed INTEGER NOT NULL,
         dismissed_reason TEXT,
+        author_name TEXT,
+        author_email TEXT,
         PRIMARY KEY (scan_id, finding_id)
       );
       CREATE INDEX IF NOT EXISTS idx_finding_result_scan ON finding_result(scan_id);
       CREATE INDEX IF NOT EXISTS idx_finding_result_active ON finding_result(dismissed, severity);
       CREATE INDEX IF NOT EXISTS idx_scan_run_completed_at ON scan_run(completed_at);
     `);
+    ensureColumn(this.database, "finding_result", "author_name", "author_name TEXT");
+    ensureColumn(this.database, "finding_result", "author_email", "author_email TEXT");
+    this.database.exec("CREATE INDEX IF NOT EXISTS idx_finding_result_author ON finding_result(author_email, author_name);");
   }
 }
 
@@ -322,7 +501,48 @@ function rowToStoredFinding(row: Record<string, unknown>): StoredFinding {
     detection_rule: row.detection_rule as string,
     timestamp: Number(row.timestamp),
     dismissed: Boolean(row.dismissed),
-    dismissed_reason: typeof row.dismissed_reason === "string" ? row.dismissed_reason : undefined
+    dismissed_reason: typeof row.dismissed_reason === "string" ? row.dismissed_reason : undefined,
+    authorName: typeof row.author_name === "string" ? row.author_name : undefined,
+    authorEmail: typeof row.author_email === "string" ? row.author_email : undefined
+  };
+}
+
+function rowToSummaryBucket(row: Record<string, unknown>): FindingSummaryBucket {
+  return {
+    key: String(row.key ?? "unknown"),
+    count: Number(row.count ?? 0),
+    activeCount: Number(row.active_count ?? 0),
+    dismissedCount: Number(row.dismissed_count ?? 0)
+  };
+}
+
+function rowToRuleSummary(row: Record<string, unknown>): FindingRuleSummary {
+  return {
+    ...rowToSummaryBucket(row),
+    type: row.type as FindingType,
+    severity: row.severity as Severity
+  };
+}
+
+function rowToAuthorSummary(row: Record<string, unknown>): FindingAuthorSummary {
+  const bucket = rowToSummaryBucket(row);
+  const highRiskCount = Number(row.high_risk_count ?? 0);
+  return {
+    ...bucket,
+    name: typeof row.name === "string" ? row.name : undefined,
+    email: typeof row.email === "string" ? row.email : undefined,
+    highRiskCount,
+    highRiskRate: bucket.activeCount === 0 ? 0 : highRiskCount / bucket.activeCount
+  };
+}
+
+function rowToTrendPoint(row: Record<string, unknown>): FindingTrendPoint {
+  return {
+    date: String(row.date ?? ""),
+    scanCount: Number(row.scan_count ?? 0),
+    findingCount: Number(row.finding_count ?? 0),
+    activeCount: Number(row.active_count ?? 0),
+    dismissedCount: Number(row.dismissed_count ?? 0)
   };
 }
 
@@ -335,6 +555,14 @@ function createDatabase(databasePath: string): DatabaseLike {
   return new sqlite.DatabaseSync(databasePath, {
     timeout: 5000
   }) as DatabaseLike;
+}
+
+function ensureColumn(database: DatabaseLike, tableName: string, columnName: string, definition: string): void {
+  const rows = database.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (rows.some((row) => row.name === columnName)) {
+    return;
+  }
+  database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${definition}`);
 }
 
 function loadSqlite(): SqliteModule {

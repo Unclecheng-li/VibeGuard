@@ -9,6 +9,32 @@ export const emptyIgnoreRules: IgnoreRules = {
   ignore: []
 };
 
+export type IgnoreReasonPreset = "false_positive" | "not_issue" | "internal_package";
+
+export interface IgnoreReasonOption {
+  id: IgnoreReasonPreset;
+  label: string;
+  reason: string;
+}
+
+export const standardIgnoreReasons: IgnoreReasonOption[] = [
+  {
+    id: "false_positive",
+    label: "False positive",
+    reason: "False positive"
+  },
+  {
+    id: "not_issue",
+    label: "Not an issue",
+    reason: "Not an issue"
+  },
+  {
+    id: "internal_package",
+    label: "Internal package",
+    reason: "Internal package"
+  }
+];
+
 export function defaultIgnoreRulesPath(): string {
   return path.join(os.homedir(), ".vibeguard", "ignore-rules.yml");
 }
@@ -138,6 +164,34 @@ export async function appendIgnoreRule(rule: IgnoreRuleEntry, filePath: string =
   }
   await fs.appendFile(resolved, `${lines.join("\n")}\n`, "utf8");
   return resolved;
+}
+
+export function normalizeIgnoreReason(input: string | undefined, fallback?: string): string | undefined {
+  const value = input?.trim();
+  if (!value) {
+    return fallback;
+  }
+  const normalized = value.toLowerCase().replace(/[\s-]+/g, "_");
+  const matched = standardIgnoreReasons.find(
+    (option) => option.id === normalized || option.label.toLowerCase() === value.toLowerCase()
+  );
+  return matched?.reason ?? value;
+}
+
+export function scopedIgnoreReason(reason: string | undefined, scope: "line" | "file" | "global" | "package"): string | undefined {
+  const normalized = normalizeIgnoreReason(reason);
+  if (!normalized) {
+    return undefined;
+  }
+  const suffix =
+    scope === "line"
+      ? "line"
+      : scope === "file"
+        ? "file"
+        : scope === "global"
+          ? "global rule"
+          : "package";
+  return `${normalized} (${suffix} ignore)`;
 }
 
 function normalizeRule(value: unknown): IgnoreRuleEntry | undefined {

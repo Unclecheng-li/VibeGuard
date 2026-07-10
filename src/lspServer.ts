@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { fileURLToPath } from "url";
 import {
+  CodeActionKind,
   createConnection,
   DiagnosticSeverity,
   ProposedFeatures,
   TextDocumentSyncKind,
   TextDocuments,
+  type CodeAction,
+  type CodeActionParams,
   type Diagnostic,
   type InitializeParams,
   type InitializeResult
@@ -14,6 +17,7 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import { loadCustomRules } from "./customRules";
 import { defaultIgnoreRulesPath, loadIgnoreRules } from "./ignore";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
+import { createCodeActionsForFindings } from "./lspActions";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
@@ -51,10 +55,14 @@ const verifier = new PackageVerifier({
   packageIndex: storage.packageIndex
 });
 let settings = defaultSettings;
+const findingsByUri = new Map<string, Finding[]>();
 
 connection.onInitialize((_params: InitializeParams): InitializeResult => ({
   capabilities: {
-    textDocumentSync: TextDocumentSyncKind.Incremental
+    textDocumentSync: TextDocumentSyncKind.Incremental,
+    codeActionProvider: {
+      codeActionKinds: [CodeActionKind.QuickFix]
+    }
   },
   serverInfo: {
     name: "VibeGuard LSP",
@@ -82,14 +90,21 @@ documents.onDidChangeContent((event) => {
 });
 
 documents.onDidClose((event) => {
+  findingsByUri.delete(event.document.uri);
   connection.sendDiagnostics({
     uri: event.document.uri,
     diagnostics: []
   });
 });
 
+connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
+  const findings = findingsByUri.get(params.textDocument.uri) ?? [];
+  return createCodeActionsForFindings(params.textDocument.uri, findings, params.context.diagnostics);
+});
+
 async function validateDocument(document: TextDocument): Promise<void> {
   if (!settings.enabled) {
+    findingsByUri.set(document.uri, []);
     connection.sendDiagnostics({
       uri: document.uri,
       diagnostics: []
@@ -126,6 +141,7 @@ async function validateDocument(document: TextDocument): Promise<void> {
     }
   }
 
+  findingsByUri.set(document.uri, result.findings);
   connection.sendDiagnostics({
     uri: document.uri,
     diagnostics: result.findings.filter((finding) => !finding.dismissed).map(toDiagnostic)

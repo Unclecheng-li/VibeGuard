@@ -42,8 +42,12 @@ node dist/cli.js config init
 node dist/cli.js scan . --config ~/.vibeguard/config.json
 node dist/cli.js scan . --no-config
 node dist/cli.js config ignore-finding vg_12345678
+node dist/cli.js ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
+node dist/cli.js ignore-rules add-package npm @company/private-utils
 node dist/cli.js findings status
 node dist/cli.js findings list --limit 20
+node dist/cli.js findings summary --days 30
+node dist/cli.js findings dashboard --days 30 --output vibeguard-dashboard.html
 node dist/cli.js rules export-semgrep --output vibeguard-semgrep.yml
 ```
 
@@ -116,10 +120,15 @@ CLI and VSCode scans persist scan runs and findings to `~/.vibeguard/findings.db
 node dist/cli.js findings status
 node dist/cli.js findings list --limit 20
 node dist/cli.js findings list --all --json
+node dist/cli.js findings summary --days 30 --top 10
+node dist/cli.js findings summary --json
+node dist/cli.js findings dashboard --days 30 --top 10 --output vibeguard-dashboard.html
 node dist/cli.js findings prune --days 30
 node dist/cli.js scan . --findings-db ~/.vibeguard/findings.db
 node dist/cli.js scan . --no-store-findings
 ```
+
+`findings summary` aggregates stored history by severity, type, top detection rules, dismissal reason, git author, and daily trend, providing a stable JSON shape for CI summaries or a future team dashboard. CLI and VSCode scans record the latest git author for files with findings when git history is available, so the summary and dashboard can surface developer risk hotspots. `findings dashboard` writes a standalone HTML dashboard with the same trend, author, and dismissal-reason data, suitable for CI artifacts, team reports, false-positive review, or offline review. VSCode users can run `VibeGuard: Export Findings Dashboard` to generate and open the same dashboard from the command palette.
 
 GitHub Action scans default to `store_findings: false` so CI jobs do not write local history unless explicitly requested.
 
@@ -171,7 +180,8 @@ jobs:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
     steps:
       - uses: actions/checkout@v4
-      - uses: vibeguard/vibeguard@v1
+      - id: vibeguard
+        uses: vibeguard/vibeguard@v1
         with:
           path: .
           mode: full-scan
@@ -189,11 +199,18 @@ jobs:
           pr_comment: false
           config: .vibeguard/config.json
           dedup_existing_tools: true
-          store_findings: false
+          store_findings: true
+          dashboard: true
+          dashboard_path: vibeguard-dashboard.html
           ignore_rules: .vibeguard/ignore-rules.yml
           custom_rules: .vibeguard/custom-rules.yml
           package_index: .vibeguard/package-index.json
           storage: auto
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.vibeguard.outputs.dashboard_path != ''
+        with:
+          name: vibeguard-dashboard
+          path: ${{ steps.vibeguard.outputs.dashboard_path }}
 ```
 
 Package verification modes:
@@ -202,7 +219,7 @@ Package verification modes:
 - `remote`: seed + cached remote npm/PyPI verification with a 3 second timeout
 - `off`: disables package existence checks
 
-For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path.
+For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path. Set `store_findings: true` and `dashboard: true` to generate a standalone HTML findings dashboard, then upload `steps.vibeguard.outputs.dashboard_path` as a CI artifact.
 
 Set `mode: ai-code-scan` to scan only changed files whose commits look AI-authored. `ai_detection` supports `author`, `message`, and `aggressive`; when git history cannot be inspected, VibeGuard falls back to a full scan so CI does not silently miss findings.
 
@@ -220,6 +237,16 @@ The exported YAML keeps each VibeGuard rule id in `metadata.vibeguard.rule_id` s
 ## Ignore Rules
 
 VibeGuard reads `~/.vibeguard/ignore-rules.yml` by default. Ignored findings remain visible as dismissed items in editor views and JSON output, but they do not create diagnostics or fail the CLI threshold.
+
+VSCode ignore actions ask for a reason before writing a rule. Standard reasons include `False positive`, `Not an issue`, and `Internal package`, with a custom reason option for team-specific context. The selected reason is stored in `ignore-rules.yml` and shown as the dismissed reason in reports.
+
+CLI users can append the same YAML rules without hand-editing the file:
+
+```bash
+node dist/cli.js ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
+node dist/cli.js ignore-rules add-rule sql_injection --path "migrations/**" --reason "generated migration"
+node dist/cli.js ignore-rules add-package npm @company/private-utils
+```
 
 ```yaml
 ignore:
@@ -261,7 +288,7 @@ npm run build
 node dist/lspServer.js --stdio
 ```
 
-The LSP server publishes VibeGuard diagnostics with the same scanner used by the VSCode extension and CLI.
+The LSP server publishes VibeGuard diagnostics with the same scanner used by the VSCode extension and CLI. It also exposes LSP `quickfix` code actions for findings that have safe mechanical fixes, so non-VSCode LSP clients can apply the same package-name, secret-assignment, config, and SAST edits.
 
 ## VSCode Settings
 
@@ -295,9 +322,13 @@ LLM commands:
 - `VibeGuard: Delete LLM API Key`
 - `VibeGuard: Show LLM Status`
 
+Dashboard command:
+
+- `VibeGuard: Export Findings Dashboard`
+
 ## VSCode Quick Fixes
 
-VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, and high-confidence `innerHTML` to `textContent` cases. Findings also expose ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
+VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, and high-confidence `innerHTML` to `textContent` cases. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
 
 ## Scope Notes
 

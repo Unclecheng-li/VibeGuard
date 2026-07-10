@@ -32,6 +32,7 @@
     "onCommand:vibeguard.scanCurrentFile",
     "onCommand:vibeguard.scanWorkspace",
     "onCommand:vibeguard.syncPackageCache",
+    "onCommand:vibeguard.exportDashboard",
     "onCommand:vibeguard.setLlmApiKey",
     "onCommand:vibeguard.deleteLlmApiKey",
     "onCommand:vibeguard.showLlmStatus",
@@ -55,6 +56,10 @@
       {
         "command": "vibeguard.openReport",
         "title": "VibeGuard: Open Findings Report"
+      },
+      {
+        "command": "vibeguard.exportDashboard",
+        "title": "VibeGuard: Export Findings Dashboard"
       },
       {
         "command": "vibeguard.openIgnoreRules",

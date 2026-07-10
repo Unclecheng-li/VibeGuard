@@ -10,9 +10,17 @@ import {
   updateIgnoredFinding
 } from "./config";
 import { loadCustomRules } from "./customRules";
-import { defaultFindingsDbPath, SqliteFindingStore, type StoredFinding } from "./findings/storage";
+import { formatFindingsDashboard } from "./findings/dashboard";
+import {
+  defaultFindingsDbPath,
+  SqliteFindingStore,
+  type FindingAuthor,
+  type FindingStoreSummary,
+  type StoredFinding
+} from "./findings/storage";
+import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
 import { filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
-import { defaultIgnoreRulesPath, expandHome, loadIgnoreRules } from "./ignore";
+import { appendIgnoreRule, defaultIgnoreRulesPath, expandHome, loadIgnoreRules, scopedIgnoreReason } from "./ignore";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { defaultIndexPath } from "./package/cache";
 import { syncConfiguredPackageIndexes, type ConfiguredPackageSyncResult } from "./package/configSync";
@@ -117,6 +125,10 @@ async function main(): Promise<void> {
     await runFindingsCommand(args.slice(1));
     return;
   }
+  if (args[0] === "ignore-rules") {
+    await runIgnoreRulesCommand(args.slice(1));
+    return;
+  }
 
   const scanStartedAt = Date.now();
   const options = parseArgs(args);
@@ -197,7 +209,7 @@ async function main(): Promise<void> {
   const report = buildScanReport(allFindings, performances);
   if (options.storeFindings) {
     try {
-      await storeScanFindings(options, files.length, allFindings, scanStartedAt);
+      await storeScanFindings(options, files.length, allFindings, scanStartedAt, gitCwd);
     } catch (error) {
       process.stderr.write(`VibeGuard findings storage warning: ${error instanceof Error ? error.message : String(error)}\n`);
     }
@@ -335,12 +347,151 @@ async function runFindingsCommand(args: string[]): Promise<void> {
     await listStoredFindings(args);
     return;
   }
+  if (subcommand === "summary") {
+    await printFindingsSummary(args);
+    return;
+  }
+  if (subcommand === "dashboard") {
+    await writeFindingsDashboard(args);
+    return;
+  }
   if (subcommand === "prune") {
     await pruneStoredFindings(args);
     return;
   }
 
   throw new Error(`Unknown findings subcommand: ${subcommand}`);
+}
+
+async function runIgnoreRulesCommand(args: string[]): Promise<void> {
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "-h" || subcommand === "--help") {
+    printIgnoreRulesHelp();
+    return;
+  }
+
+  if (subcommand === "add-rule") {
+    await addIgnoreRuleCommand(args);
+    return;
+  }
+  if (subcommand === "add-package") {
+    await addIgnorePackageCommand(args);
+    return;
+  }
+
+  throw new Error(`Unknown ignore-rules subcommand: ${subcommand}`);
+}
+
+async function addIgnoreRuleCommand(args: string[]): Promise<void> {
+  let ignoreRulesPath = defaultIgnoreRulesPath();
+  let targetPath: string | undefined;
+  let scope: string | undefined;
+  let line: number | undefined;
+  let reason: string | undefined;
+  let json = false;
+  const positional: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--ignore-rules") {
+      ignoreRulesPath = path.resolve(expandHome(args[++index] ?? defaultIgnoreRulesPath()));
+    } else if (arg.startsWith("--ignore-rules=")) {
+      ignoreRulesPath = path.resolve(expandHome(arg.slice("--ignore-rules=".length)));
+    } else if (arg === "--path") {
+      targetPath = args[++index];
+    } else if (arg.startsWith("--path=")) {
+      targetPath = arg.slice("--path=".length);
+    } else if (arg === "--scope") {
+      scope = args[++index];
+    } else if (arg.startsWith("--scope=")) {
+      scope = arg.slice("--scope=".length);
+    } else if (arg === "--line") {
+      line = parsePositiveInteger(args[++index], "--line");
+    } else if (arg.startsWith("--line=")) {
+      line = parsePositiveInteger(arg.slice("--line=".length), "--line");
+    } else if (arg === "--reason") {
+      reason = args[++index];
+    } else if (arg.startsWith("--reason=")) {
+      reason = arg.slice("--reason=".length);
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "-h" || arg === "--help") {
+      printIgnoreRulesHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  const rule = positional[0];
+  if (!rule) {
+    throw new Error("Usage: vibeguard ignore-rules add-rule <rule-id-or-type> [--path glob] [--line n] [--reason text]");
+  }
+  if (line !== undefined && !targetPath && !scope) {
+    throw new Error("--line requires --path or --scope so the ignore does not apply to every file.");
+  }
+  const reasonScope = line !== undefined ? "line" : targetPath || scope ? "file" : "global";
+  const entry = {
+    rule,
+    path: targetPath,
+    scope,
+    line,
+    reason: scopedIgnoreReason(reason, reasonScope)
+  };
+  const filePath = await appendIgnoreRule(entry, ignoreRulesPath);
+
+  if (json) {
+    console.log(JSON.stringify({ path: filePath, rule: entry }, null, 2));
+    return;
+  }
+  console.log(`Added ignore rule for ${rule} to ${filePath}.`);
+}
+
+async function addIgnorePackageCommand(args: string[]): Promise<void> {
+  let ignoreRulesPath = defaultIgnoreRulesPath();
+  let reason: string | undefined = "internal_package";
+  let json = false;
+  const positional: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--ignore-rules") {
+      ignoreRulesPath = path.resolve(expandHome(args[++index] ?? defaultIgnoreRulesPath()));
+    } else if (arg.startsWith("--ignore-rules=")) {
+      ignoreRulesPath = path.resolve(expandHome(arg.slice("--ignore-rules=".length)));
+    } else if (arg === "--reason") {
+      reason = args[++index];
+    } else if (arg.startsWith("--reason=")) {
+      reason = arg.slice("--reason=".length);
+    } else if (arg === "--no-reason") {
+      reason = undefined;
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "-h" || arg === "--help") {
+      printIgnoreRulesHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  const registry = parseRegistry(positional[0]);
+  const packageName = positional[1];
+  if (!registry || !packageName) {
+    throw new Error("Usage: vibeguard ignore-rules add-package <npm|pypi|cargo|gomod|maven> <package> [--reason text]");
+  }
+  const entry = {
+    package: packageName,
+    registry,
+    reason: scopedIgnoreReason(reason, "package")
+  };
+  const filePath = await appendIgnoreRule(entry, ignoreRulesPath);
+
+  if (json) {
+    console.log(JSON.stringify({ path: filePath, rule: entry }, null, 2));
+    return;
+  }
+  console.log(`Added package ignore for ${registry}:${packageName} to ${filePath}.`);
 }
 
 async function initConfig(args: string[]): Promise<void> {
@@ -567,21 +718,40 @@ async function storeScanFindings(
   options: CliOptions,
   fileCount: number,
   findings: Finding[],
-  startedAt: number
+  startedAt: number,
+  gitCwd: string
 ): Promise<void> {
   const store = new SqliteFindingStore(options.findingsDbPath ?? defaultFindingsDbPath());
   try {
+    const findingAuthors = await resolveFindingAuthors(findings, gitCwd);
     store.recordScanRun({
       startedAt,
       completedAt: Date.now(),
       cwd: process.cwd(),
       targetPaths: options.paths,
       fileCount,
-      findings
+      findings,
+      findingAuthors
     });
   } finally {
     store.close();
   }
+}
+
+async function resolveFindingAuthors(findings: Finding[], gitCwd: string): Promise<Record<string, FindingAuthor>> {
+  const authorByFindingId: Record<string, FindingAuthor> = {};
+  if (findings.length === 0) {
+    return authorByFindingId;
+  }
+  const files = [...new Set(findings.map((finding) => finding.file))];
+  const fileAuthors = await gitAuthorsForFiles(files, gitCwd);
+  for (const finding of findings) {
+    const author = fileAuthors.get(normalizeAuthorFilePath(finding.file));
+    if (author) {
+      authorByFindingId[finding.id] = author;
+    }
+  }
+  return authorByFindingId;
 }
 
 async function printFindingsStatus(args: string[]): Promise<void> {
@@ -597,6 +767,44 @@ async function printFindingsStatus(args: string[]): Promise<void> {
     console.log(`Scans: ${stats.scanCount}`);
     console.log(`Findings: ${stats.findingCount} (${stats.activeCount} active, ${stats.dismissedCount} dismissed)`);
     console.log(`Latest scan: ${stats.latestScanAt ? new Date(stats.latestScanAt).toISOString() : "none"}`);
+  } finally {
+    store.close();
+  }
+}
+
+async function printFindingsSummary(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const summary = store.summary({ since, topLimit: options.topLimit });
+    if (options.json) {
+      console.log(JSON.stringify(summary, null, 2));
+      return;
+    }
+    printHumanFindingsSummary(options.dbPath, summary);
+  } finally {
+    store.close();
+  }
+}
+
+async function writeFindingsDashboard(args: string[]): Promise<void> {
+  const options = parseFindingsCommandOptions(args);
+  const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
+  const outputPath = options.outputPath ?? path.resolve("vibeguard-dashboard.html");
+  const store = new SqliteFindingStore(options.dbPath);
+  try {
+    const summary = store.summary({ since, topLimit: options.topLimit });
+    const html = formatFindingsDashboard(summary, {
+      dbPath: options.dbPath,
+      generatedAt: Date.now()
+    });
+    await writeTextFile(outputPath, html);
+    if (options.json) {
+      console.log(JSON.stringify({ outputPath, ...summary }, null, 2));
+      return;
+    }
+    console.log(`Wrote VibeGuard findings dashboard to ${outputPath}`);
   } finally {
     store.close();
   }
@@ -649,12 +857,16 @@ function parseFindingsCommandOptions(args: string[]): {
   limit: number;
   includeDismissed: boolean;
   days?: number;
+  topLimit: number;
+  outputPath?: string;
 } {
   let dbPath = defaultFindingsDbPath();
   let json = false;
   let limit = 50;
   let includeDismissed = false;
   let days: number | undefined;
+  let topLimit = 10;
+  let outputPath: string | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -674,6 +886,14 @@ function parseFindingsCommandOptions(args: string[]): {
       days = parseNonNegativeInteger(args[++index], "--days");
     } else if (arg.startsWith("--days=")) {
       days = parseNonNegativeInteger(arg.slice("--days=".length), "--days");
+    } else if (arg === "--top") {
+      topLimit = parsePositiveInteger(args[++index], "--top");
+    } else if (arg.startsWith("--top=")) {
+      topLimit = parsePositiveInteger(arg.slice("--top=".length), "--top");
+    } else if (arg === "--output") {
+      outputPath = path.resolve(expandHome(args[++index] ?? "vibeguard-dashboard.html"));
+    } else if (arg.startsWith("--output=")) {
+      outputPath = path.resolve(expandHome(arg.slice("--output=".length)));
     } else if (arg === "-h" || arg === "--help") {
       printFindingsHelp();
       process.exit(0);
@@ -682,7 +902,63 @@ function parseFindingsCommandOptions(args: string[]): {
     }
   }
 
-  return { dbPath, json, limit, includeDismissed, days };
+  return { dbPath, json, limit, includeDismissed, days, topLimit, outputPath };
+}
+
+function printHumanFindingsSummary(dbPath: string, summary: FindingStoreSummary): void {
+  console.log(`Findings DB: ${dbPath}`);
+  console.log(`Window: ${summary.since ? `since ${new Date(summary.since).toISOString()}` : "all time"}`);
+  console.log(`Scans: ${summary.scanCount}`);
+  console.log(`Findings: ${summary.findingCount} (${summary.activeCount} active, ${summary.dismissedCount} dismissed)`);
+  console.log(`Latest scan: ${summary.latestScanAt ? new Date(summary.latestScanAt).toISOString() : "none"}`);
+  console.log(`Severity: ${formatSummaryBuckets(summary.severityCounts)}`);
+  console.log(`Type: ${formatSummaryBuckets(summary.typeCounts)}`);
+  console.log(`Dismissal reasons: ${formatSummaryBuckets(summary.dismissedReasonCounts)}`);
+  console.log(`Authors: ${formatAuthorBuckets(summary.authorCounts)}`);
+
+  console.log("Top rules:");
+  if (summary.topRules.length === 0) {
+    console.log("  none");
+  } else {
+    for (const rule of summary.topRules) {
+      console.log(
+        `  ${rule.key}: ${rule.count} (${rule.activeCount} active, ${rule.dismissedCount} dismissed, ${rule.severity}/${rule.type})`
+      );
+    }
+  }
+
+  console.log("Daily trend:");
+  if (summary.trend.length === 0) {
+    console.log("  none");
+  } else {
+    for (const point of summary.trend) {
+      console.log(
+        `  ${point.date}: ${point.scanCount} scan(s), ${point.findingCount} finding(s), ${point.activeCount} active, ${point.dismissedCount} dismissed`
+      );
+    }
+  }
+}
+
+function formatSummaryBuckets(buckets: FindingStoreSummary["severityCounts"]): string {
+  if (buckets.length === 0) {
+    return "none";
+  }
+  return buckets
+    .map((bucket) => `${bucket.key} ${bucket.count} (${bucket.activeCount} active, ${bucket.dismissedCount} dismissed)`)
+    .join(", ");
+}
+
+function formatAuthorBuckets(authors: FindingStoreSummary["authorCounts"]): string {
+  if (authors.length === 0) {
+    return "none";
+  }
+  return authors
+    .map((author) => {
+      const label = author.name && author.email ? `${author.name} <${author.email}>` : author.name ?? author.email ?? author.key;
+      const rate = `${Math.round(author.highRiskRate * 100)}% high-risk`;
+      return `${label} ${author.count} (${author.activeCount} active, ${author.highRiskCount} high-risk, ${rate})`;
+    })
+    .join(", ");
 }
 
 function formatStoredFinding(finding: StoredFinding): string {
@@ -1260,7 +1536,8 @@ Usage:
   vibeguard config path
   vibeguard config ignore-finding <finding-id> [--path path]
   vibeguard config unignore-finding <finding-id> [--path path]
-  vibeguard findings <status|list|prune> [--db path] [--json]
+  vibeguard findings <status|list|summary|dashboard|prune> [--db path] [--json]
+  vibeguard ignore-rules <add-rule|add-package> ...
   vibeguard packages <import|sync|sync-config|status|check> ...
   vibeguard rules export-semgrep [--output path] [--prefix id-prefix]
 
@@ -1274,6 +1551,10 @@ Examples:
   vibeguard scan . --mode ai-code-scan --base-ref origin/main --head-ref HEAD
   vibeguard scan src --custom-rules ./vibeguard-rules.yml
   vibeguard findings list --limit 20
+  vibeguard findings summary --days 30
+  vibeguard findings dashboard --days 30 --output vibeguard-dashboard.html
+  vibeguard ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
+  vibeguard ignore-rules add-package npm @company/private-utils
   vibeguard config init
   vibeguard rules export-semgrep --output vibeguard-semgrep.yml
   vibeguard packages import npm ./npm-packages.txt --partial
@@ -1346,11 +1627,31 @@ function printFindingsHelp(): void {
 Usage:
   vibeguard findings status [--db path] [--json]
   vibeguard findings list [--db path] [--limit n] [--all] [--json]
+  vibeguard findings summary [--db path] [--days n] [--top n] [--json]
+  vibeguard findings dashboard [--db path] [--days n] [--top n] [--output path] [--json]
   vibeguard findings prune [--db path] [--days n] [--json]
 
 Scan storage:
   vibeguard scan . --findings-db ~/.vibeguard/findings.db
   vibeguard scan . --no-store-findings
+`);
+}
+
+function printIgnoreRulesHelp(): void {
+  console.log(`VibeGuard ignore rules
+
+Usage:
+  vibeguard ignore-rules add-rule <rule-id-or-type> [--path glob] [--scope file:glob] [--line n]
+                                   [--reason false_positive|not_issue|internal_package|text]
+                                   [--ignore-rules path] [--json]
+  vibeguard ignore-rules add-package <npm|pypi|cargo|gomod|maven> <package>
+                                      [--reason false_positive|not_issue|internal_package|text]
+                                      [--no-reason] [--ignore-rules path] [--json]
+
+Examples:
+  vibeguard ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue
+  vibeguard ignore-rules add-rule sql_injection --path "migrations/**" --reason "generated migration"
+  vibeguard ignore-rules add-package npm @company/private-utils
 `);
 }
 

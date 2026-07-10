@@ -1,3 +1,4 @@
+import fs from "fs/promises";
 import path from "path";
 import * as vscode from "vscode";
 import {
@@ -9,13 +10,17 @@ import {
   type LoadedVibeGuardConfig
 } from "./config";
 import { loadCustomRules } from "./customRules";
-import { defaultFindingsDbPath, SqliteFindingStore } from "./findings/storage";
+import { formatFindingsDashboard } from "./findings/dashboard";
+import { defaultFindingsDbPath, SqliteFindingStore, type FindingAuthor } from "./findings/storage";
+import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
 import {
   appendIgnoreRule,
   defaultIgnoreRulesPath,
   ensureIgnoreRulesFile,
   expandHome,
-  loadIgnoreRules
+  loadIgnoreRules,
+  scopedIgnoreReason,
+  standardIgnoreReasons
 } from "./ignore";
 import { PackageVerifier } from "./package/packageVerifier";
 import {
@@ -110,6 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("vibeguard.scanWorkspace", () => scanWorkspace()),
     vscode.commands.registerCommand("vibeguard.clearFindings", () => clearFindings()),
     vscode.commands.registerCommand("vibeguard.openReport", () => openReport()),
+    vscode.commands.registerCommand("vibeguard.exportDashboard", () => exportFindingsDashboard()),
     vscode.commands.registerCommand("vibeguard.openIgnoreRules", () => openIgnoreRules()),
     vscode.commands.registerCommand("vibeguard.syncPackageCache", () => syncPackageCache(true)),
     vscode.commands.registerCommand("vibeguard.setLlmApiKey", () => setLlmApiKey()),
@@ -224,6 +230,68 @@ async function openReport(): Promise<void> {
   }
   appendPerformanceReport(output, allCurrentPerformances());
   output.show();
+}
+
+async function exportFindingsDashboard(): Promise<void> {
+  const windowChoice = await vscode.window.showQuickPick(
+    [
+      { label: "Last 30 days", days: 30 },
+      { label: "Last 90 days", days: 90 },
+      { label: "All stored history", days: undefined }
+    ],
+    {
+      placeHolder: "Select the findings history window for the dashboard"
+    }
+  );
+  if (!windowChoice) {
+    return;
+  }
+
+  const defaultUri = vscode.Uri.file(path.join(workspaceRootPath(), "vibeguard-dashboard.html"));
+  const outputUri = await vscode.window.showSaveDialog({
+    defaultUri,
+    filters: {
+      HTML: ["html"]
+    },
+    saveLabel: "Export Dashboard"
+  });
+  if (!outputUri) {
+    return;
+  }
+
+  const dbPath = configuredFindingsDbPath();
+  if (!configuration().get<boolean>("storeFindings", true)) {
+    void vscode.window.showWarningMessage("VibeGuard findings storage is disabled. The exported dashboard may be empty.");
+  }
+
+  let store: SqliteFindingStore | undefined;
+  try {
+    store = new SqliteFindingStore(dbPath);
+    const since = windowChoice.days === undefined ? undefined : Date.now() - windowChoice.days * 24 * 60 * 60 * 1000;
+    const summary = store.summary({ since, topLimit: 10 });
+    const html = formatFindingsDashboard(summary, {
+      dbPath,
+      generatedAt: Date.now()
+    });
+    await fs.mkdir(path.dirname(outputUri.fsPath), { recursive: true });
+    await fs.writeFile(outputUri.fsPath, html, "utf8");
+  } catch (error) {
+    void vscode.window.showErrorMessage(`VibeGuard dashboard export failed: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  } finally {
+    store?.close();
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    `VibeGuard dashboard exported to ${outputUri.fsPath}`,
+    "Open",
+    "Reveal"
+  );
+  if (choice === "Open") {
+    await vscode.env.openExternal(outputUri);
+  } else if (choice === "Reveal") {
+    await vscode.commands.executeCommand("revealFileInOS", outputUri);
+  }
 }
 
 async function openIgnoreRules(): Promise<void> {
@@ -491,7 +559,7 @@ async function scanDocument(
   diagnostics.set(document.uri, mergedFindings.filter((finding) => !finding.dismissed).map(findingToDiagnostic));
   findingsProvider.refresh();
   updateStatus();
-  persistDocumentFindings(document, mergedFindings, scanStartedAt);
+  void persistDocumentFindings(document, mergedFindings, scanStartedAt);
   maybeShowCriticalPopup(document, mergedFindings);
 }
 
@@ -697,18 +765,17 @@ async function ignoreFinding(finding: Finding | undefined, scope: "line" | "file
   if (!finding) {
     return;
   }
+  const reason = await pickIgnoreReason(scope);
+  if (reason === null) {
+    return;
+  }
 
   await appendIgnoreRule(
     {
       rule: finding.detection_rule,
       path: scope === "global" ? undefined : finding.file,
       line: scope === "line" ? finding.line : undefined,
-      reason:
-        scope === "line"
-          ? "Ignored from VSCode finding"
-          : scope === "file"
-            ? "Ignored rule in this file from VSCode"
-            : "Ignored rule globally from VSCode"
+      reason
     },
     ignoreRulesPath()
   );
@@ -721,17 +788,65 @@ async function ignorePackage(finding: Finding | undefined): Promise<void> {
     void vscode.window.showInformationMessage("VibeGuard: this finding is not a package finding.");
     return;
   }
-  const registry = finding.detection_rule.replace(/^hallucinated_package_/, "") as "npm" | "pypi";
+  const reason = await pickIgnoreReason("package");
+  if (reason === null) {
+    return;
+  }
+  const registry = finding.detection_rule.replace(/^hallucinated_package_/, "") as PackageRegistry;
   await appendIgnoreRule(
     {
       package: finding.evidence,
       registry,
-      reason: "Ignored package from VSCode"
+      reason
     },
     ignoreRulesPath()
   );
   await refreshOpenDocuments();
   void vscode.window.showInformationMessage(`VibeGuard will ignore package "${finding.evidence}".`);
+}
+
+async function pickIgnoreReason(scope: "line" | "file" | "global" | "package"): Promise<string | undefined | null> {
+  const ordered =
+    scope === "package"
+      ? [
+          ...standardIgnoreReasons.filter((option) => option.id === "internal_package"),
+          ...standardIgnoreReasons.filter((option) => option.id !== "internal_package")
+        ]
+      : standardIgnoreReasons;
+  const picked = await vscode.window.showQuickPick(
+    [
+      ...ordered.map((option) => ({
+        label: option.label,
+        description: option.reason,
+        value: option.reason
+      })),
+      {
+        label: "Custom reason...",
+        description: "Write a short reason for this ignore rule",
+        value: "__custom__"
+      },
+      {
+        label: "No reason",
+        description: "Add the ignore rule without a reason",
+        value: undefined
+      }
+    ],
+    {
+      placeHolder: "Why should VibeGuard ignore this finding?"
+    }
+  );
+  if (!picked) {
+    return null;
+  }
+  if (picked.value === "__custom__") {
+    const custom = await vscode.window.showInputBox({
+      prompt: "Reason for ignoring this VibeGuard finding",
+      ignoreFocusOut: true,
+      validateInput: (value) => (value.trim() ? undefined : "Reason must not be empty.")
+    });
+    return custom ? scopedIgnoreReason(custom, scope) : null;
+  }
+  return scopedIgnoreReason(picked.value, scope);
 }
 
 async function refreshOpenDocuments(): Promise<void> {
@@ -804,17 +919,24 @@ function createFindingStore(): SqliteFindingStore | undefined {
   if (!configuration().get<boolean>("storeFindings", true)) {
     return undefined;
   }
-  const configured = configuration().get<string>("findingsDbPath", "").trim();
-  const dbPath = configured ? expandHome(configured) : defaultFindingsDbPath();
   try {
-    return new SqliteFindingStore(dbPath);
+    return new SqliteFindingStore(configuredFindingsDbPath());
   } catch (error) {
     output.appendLine(`Findings storage error: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
   }
 }
 
-function persistDocumentFindings(document: vscode.TextDocument, findings: Finding[], startedAt: number): void {
+function configuredFindingsDbPath(): string {
+  const configured = configuration().get<string>("findingsDbPath", "").trim();
+  return configured ? expandHome(configured) : defaultFindingsDbPath();
+}
+
+function workspaceRootPath(): string {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? extensionContext.globalStorageUri.fsPath;
+}
+
+async function persistDocumentFindings(document: vscode.TextDocument, findings: Finding[], startedAt: number): Promise<void> {
   if (!configuration().get<boolean>("storeFindings", true)) {
     return;
   }
@@ -827,17 +949,40 @@ function persistDocumentFindings(document: vscode.TextDocument, findings: Findin
   }
   try {
     const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const cwd = folder?.uri.fsPath ?? path.dirname(document.uri.fsPath);
+    const findingAuthors = await resolveDocumentFindingAuthors(document, findings, cwd);
     store.recordScanRun({
       startedAt,
       completedAt: Date.now(),
-      cwd: folder?.uri.fsPath ?? path.dirname(document.uri.fsPath),
+      cwd,
       targetPaths: [document.uri.fsPath],
       fileCount: 1,
-      findings
+      findings,
+      findingAuthors
     });
   } catch (error) {
     output.appendLine(`Findings storage error: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function resolveDocumentFindingAuthors(
+  document: vscode.TextDocument,
+  findings: Finding[],
+  cwd: string
+): Promise<Record<string, FindingAuthor>> {
+  const authorByFindingId: Record<string, FindingAuthor> = {};
+  if (findings.length === 0 || document.uri.scheme !== "file") {
+    return authorByFindingId;
+  }
+  const authors = await gitAuthorsForFiles([document.uri.fsPath], cwd);
+  const author = authors.get(normalizeAuthorFilePath(document.uri.fsPath));
+  if (!author) {
+    return authorByFindingId;
+  }
+  for (const finding of findings) {
+    authorByFindingId[finding.id] = author;
+  }
+  return authorByFindingId;
 }
 
 function resolveFindingArgument(nodeOrFinding: TreeNode | Finding | undefined): Finding | undefined {

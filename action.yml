@@ -74,6 +74,22 @@ inputs:
     description: "Create or update a sticky VibeGuard pull request comment with the Markdown report."
     required: false
     default: "false"
+  dashboard:
+    description: "Write a standalone HTML findings dashboard after the scan. Requires store_findings true or an existing findings_db."
+    required: false
+    default: "false"
+  dashboard_path:
+    description: "Path for the generated HTML findings dashboard when dashboard is true."
+    required: false
+    default: ""
+  dashboard_days:
+    description: "Number of recent days to include in the generated findings dashboard."
+    required: false
+    default: "30"
+  dashboard_top:
+    description: "Number of top detection rules to show in the generated findings dashboard."
+    required: false
+    default: "10"
   ignore_rules:
     description: "Optional path to ignore-rules.yml."
     required: false
@@ -118,6 +134,10 @@ inputs:
     description: "Optional path to packages.db when storage is sqlite."
     required: false
     default: ""
+outputs:
+  dashboard_path:
+    description: "Path to the generated HTML findings dashboard when dashboard is true."
+    value: ${{ steps.vibeguard.outputs.dashboard_path }}
 runs:
   using: "composite"
   steps:
@@ -130,6 +150,7 @@ runs:
       working-directory: ${{ github.action_path }}
       run: npm run build
     - name: Run VibeGuard scan
+      id: vibeguard
       shell: bash
       run: |
         set -euo pipefail
@@ -222,6 +243,25 @@ runs:
           "${extra_args[@]}"
         scan_status=$?
         set -e
+
+        if [ "${{ inputs.dashboard }}" = "true" ]; then
+          dashboard_report="${{ inputs.dashboard_path }}"
+          if [ -z "$dashboard_report" ]; then
+            dashboard_report="vibeguard-dashboard.html"
+          fi
+          if [ "${{ inputs.store_findings }}" = "true" ] || [ -n "${{ inputs.findings_db }}" ]; then
+            dashboard_args=("--output" "$dashboard_report" "--days" "${{ inputs.dashboard_days }}" "--top" "${{ inputs.dashboard_top }}")
+            if [ -n "${{ inputs.findings_db }}" ]; then
+              dashboard_args+=("--db" "${{ inputs.findings_db }}")
+            fi
+            node "${{ github.action_path }}/dist/cli.js" findings dashboard "${dashboard_args[@]}"
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "dashboard_path=$dashboard_report" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "VibeGuard warning: dashboard requested but store_findings is false and no findings_db was provided." >&2
+          fi
+        fi
 
         if [ "${{ inputs.step_summary }}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$markdown_report" ]; then
           cat "$markdown_report" >> "$GITHUB_STEP_SUMMARY"
