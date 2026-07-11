@@ -33,6 +33,14 @@ export interface ConfiguredPackageSyncOutcome {
   error?: string;
 }
 
+export interface ConfiguredPackageSyncProgress {
+  registry: PackageRegistry;
+  completed: number;
+  total: number;
+  phase: "starting" | "completed";
+  status?: ConfiguredPackageSyncOutcome["status"];
+}
+
 export interface ConfiguredPackageSyncOptions {
   config: VibeGuardConfig;
   storage: PackageStorage;
@@ -42,6 +50,7 @@ export interface ConfiguredPackageSyncOptions {
   limit?: number;
   sourceUrls?: Partial<Record<PackageRegistry, string>>;
   continueOnError?: boolean;
+  onProgress?: (progress: ConfiguredPackageSyncProgress) => void;
 }
 
 export interface ConfiguredPackageSyncResult {
@@ -62,14 +71,17 @@ export async function syncConfiguredPackageIndexes(
   const requestedCoverage = options.config.package_cache.lightweight_mode ? "partial" : "full";
   const results: ConfiguredPackageSyncOutcome[] = [];
   const continueOnError = options.continueOnError ?? true;
+  const registries = uniqueRegistries(options.config.package_cache.languages);
 
-  for (const registry of uniqueRegistries(options.config.package_cache.languages)) {
+  for (const [index, registry] of registries.entries()) {
+    options.onProgress?.({ registry, completed: index, total: registries.length, phase: "starting" });
     const existingEntry = stats.get(registry);
     const decision = shouldSyncPackageIndex(existingEntry, options.config, now, Boolean(options.force));
     const limit = configuredPackageSyncLimit(options.config, registry, options.limit);
+    let outcome: ConfiguredPackageSyncOutcome;
 
     if (!decision.due && existingEntry) {
-      results.push({
+      outcome = {
         registry,
         status: "skipped",
         reason: decision.reason,
@@ -78,53 +90,55 @@ export async function syncConfiguredPackageIndexes(
         packageCount: existingEntry.packageCount,
         updatedAt: existingEntry.updatedAt,
         limit
-      });
-      continue;
-    }
-
-    try {
-      const syncResult = await fetchPackageNames({
-        registry,
-        sourceUrl: options.sourceUrls?.[registry],
-        limit,
-        fetchImpl: options.fetchImpl
-      });
-      const effectiveCoverage = requestedCoverage === "full" && !syncResult.truncated ? "full" : "partial";
-      const entry = await options.storage.packageIndex.importPackageNames(
-        registry,
-        syncResult.names,
-        effectiveCoverage
-      );
-      results.push({
-        registry,
-        status: "synced",
-        reason: decision.reason,
-        requestedCoverage,
-        effectiveCoverage,
-        coverage: entry.coverage,
-        packageCount: entry.packageCount,
-        updatedAt: entry.updatedAt,
-        imported: syncResult.names.length,
-        pagesFetched: syncResult.pagesFetched,
-        truncated: syncResult.truncated,
-        totalAvailable: syncResult.totalAvailable,
-        sourceUrl: syncResult.sourceUrl,
-        format: syncResult.format,
-        limit
-      });
-    } catch (error) {
-      if (!continueOnError) {
-        throw error;
+      };
+    } else {
+      try {
+        const syncResult = await fetchPackageNames({
+          registry,
+          sourceUrl: options.sourceUrls?.[registry],
+          limit,
+          fetchImpl: options.fetchImpl
+        });
+        const effectiveCoverage = requestedCoverage === "full" && !syncResult.truncated ? "full" : "partial";
+        const entry = await options.storage.packageIndex.importPackageNames(
+          registry,
+          syncResult.names,
+          effectiveCoverage
+        );
+        outcome = {
+          registry,
+          status: "synced",
+          reason: decision.reason,
+          requestedCoverage,
+          effectiveCoverage,
+          coverage: entry.coverage,
+          packageCount: entry.packageCount,
+          updatedAt: entry.updatedAt,
+          imported: syncResult.names.length,
+          pagesFetched: syncResult.pagesFetched,
+          truncated: syncResult.truncated,
+          totalAvailable: syncResult.totalAvailable,
+          sourceUrl: syncResult.sourceUrl,
+          format: syncResult.format,
+          limit
+        };
+      } catch (error) {
+        if (!continueOnError) {
+          options.onProgress?.({ registry, completed: index + 1, total: registries.length, phase: "completed", status: "failed" });
+          throw error;
+        }
+        outcome = {
+          registry,
+          status: "failed",
+          reason: decision.reason,
+          requestedCoverage,
+          limit,
+          error: error instanceof Error ? error.message : String(error)
+        };
       }
-      results.push({
-        registry,
-        status: "failed",
-        reason: decision.reason,
-        requestedCoverage,
-        limit,
-        error: error instanceof Error ? error.message : String(error)
-      });
     }
+    results.push(outcome);
+    options.onProgress?.({ registry, completed: index + 1, total: registries.length, phase: "completed", status: outcome.status });
   }
 
   return {
@@ -186,7 +200,7 @@ export function selectConfiguredPackageSyncRegistries(
   const configured = uniqueRegistries(configuredRegistries);
   const detected = uniqueRegistries(detectedRegistries);
   const detectedConfigured = detected.filter((registry) => configured.includes(registry));
-  return detectedConfigured.length > 0 ? detectedConfigured : configured;
+  return [...detectedConfigured, ...configured.filter((registry) => !detectedConfigured.includes(registry))];
 }
 
 function uniqueRegistries(registries: PackageRegistry[]): PackageRegistry[] {

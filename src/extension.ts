@@ -23,10 +23,12 @@ import {
   scopedIgnoreReason,
   standardIgnoreReasons
 } from "./ignore";
+import { falsePositiveTelemetryEvent, isFalsePositiveDismissalReason, reportFalsePositiveTelemetry } from "./telemetry";
 import { PackageVerifier } from "./package/packageVerifier";
 import {
   selectConfiguredPackageSyncRegistries,
   syncConfiguredPackageIndexes,
+  type ConfiguredPackageSyncProgress,
   type ConfiguredPackageSyncResult
 } from "./package/configSync";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
@@ -39,6 +41,7 @@ import type { Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConf
 const packageRegistries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
 const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local", "vibeguard"];
 const firstRunOnboardingKey = "vibeguard.firstRunOnboardingShown";
+const realtimeRemoteVerificationDelayMs = 600;
 
 const supportedLanguageIds = new Set([
   "javascript",
@@ -53,7 +56,11 @@ const supportedLanguageIds = new Set([
   "xml",
   "groovy",
   "json",
-  "toml"
+  "toml",
+  "shellscript",
+  "powershell",
+  "yaml",
+  "dockerfile"
 ]);
 
 let diagnostics: vscode.DiagnosticCollection;
@@ -64,10 +71,12 @@ let packageVerifier: PackageVerifier;
 let packageStorage: PackageStorage;
 let findingStore: SqliteFindingStore | undefined;
 let packageSyncInFlight = false;
+let packageSyncProgress: ConfiguredPackageSyncProgress | undefined;
 let extensionContext: vscode.ExtensionContext;
 const l1Timers = new Map<string, NodeJS.Timeout>();
 const l2Timers = new Map<string, NodeJS.Timeout>();
 const l3Timers = new Map<string, NodeJS.Timeout>();
+const remotePackageTimers = new Map<string, NodeJS.Timeout>();
 const findingsByUri = new Map<string, Finding[]>();
 const performanceByUri = new Map<string, ScanPerformance>();
 const popupSeen = new Set<string>();
@@ -84,7 +93,11 @@ const codeActionSelector: vscode.DocumentSelector = [
   { scheme: "file", language: "xml" },
   { scheme: "file", language: "groovy" },
   { scheme: "file", language: "json" },
-  { scheme: "file", language: "toml" }
+  { scheme: "file", language: "toml" },
+  { scheme: "file", language: "shellscript" },
+  { scheme: "file", language: "powershell" },
+  { scheme: "file", language: "yaml" },
+  { scheme: "file", language: "dockerfile" }
 ];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -151,7 +164,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.workspace.onDidSaveTextDocument((document) => {
       if (configuration().get<boolean>("scanOnSave", true)) {
-        scheduleScan(document, 0, { includeL2: true, includeL3: true, cancelPendingL2: true, cancelPendingL3: true, replaceAll: true });
+        scheduleScan(document, 0, {
+          includeL2: true,
+          includeL3: true,
+          cancelPendingL2: true,
+          cancelPendingL3: true,
+          cancelPendingRemote: true,
+          replaceAll: true
+        });
       }
     }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -172,6 +192,7 @@ export function deactivate(): void {
   clearAllTimers(l1Timers);
   clearAllTimers(l2Timers);
   clearAllTimers(l3Timers);
+  clearAllTimers(remotePackageTimers);
   findingStore?.close();
 }
 
@@ -185,11 +206,12 @@ async function scanCurrentFile(): Promise<void> {
 }
 
 async function scanWorkspace(): Promise<void> {
-  const files = await vscode.workspace.findFiles(
-    "**/*.{js,jsx,ts,tsx,mjs,cjs,py,rs,go,java,kt,kts,json,toml,xml,gradle,txt}",
-    "**/{node_modules,.git,out,dist,build,coverage}/**",
-    500
-  );
+  const exclude = "**/{node_modules,.git,out,dist,build,coverage}/**";
+  const [extensionFiles, dockerfiles] = await Promise.all([
+    vscode.workspace.findFiles("**/*.{js,jsx,ts,tsx,mjs,cjs,py,rs,go,java,kt,kts,json,toml,xml,gradle,sh,bash,zsh,ps1,yml,yaml,txt}", exclude, 500),
+    vscode.workspace.findFiles("**/{Dockerfile,dockerfile}", exclude, 500)
+  ]);
+  const files = [...new Map([...extensionFiles, ...dockerfiles].map((uri) => [uri.toString(), uri])).values()];
 
   statusBar.text = "$(shield) VibeGuard scanning...";
   let scanned = 0;
@@ -206,6 +228,7 @@ function clearFindings(): void {
   clearAllTimers(l1Timers);
   clearAllTimers(l2Timers);
   clearAllTimers(l3Timers);
+  clearAllTimers(remotePackageTimers);
   findingsByUri.clear();
   performanceByUri.clear();
   diagnostics.clear();
@@ -431,6 +454,9 @@ interface ScheduleScanOptions {
   scheduleL3?: boolean;
   cancelPendingL2?: boolean;
   cancelPendingL3?: boolean;
+  cancelPendingRemote?: boolean;
+  deferRemotePackageVerification?: boolean;
+  scheduleRemotePackageVerification?: boolean;
   replaceAll?: boolean;
 }
 
@@ -439,7 +465,10 @@ function scheduleRealtimeScan(document: vscode.TextDocument, delayMs: number): v
     includeL2: false,
     includeL3: false,
     scheduleL2: true,
-    scheduleL3: true
+    scheduleL3: true,
+    cancelPendingRemote: true,
+    deferRemotePackageVerification: true,
+    scheduleRemotePackageVerification: true
   });
 }
 
@@ -458,6 +487,9 @@ function scheduleScan(
   if (options.cancelPendingL3 || options.includeL3) {
     clearTimer(l3Timers, key);
   }
+  if (options.cancelPendingRemote) {
+    clearTimer(remotePackageTimers, key);
+  }
   if (options.scheduleL2) {
     scheduleL2Scan(document);
   }
@@ -475,6 +507,8 @@ function scheduleScan(
       void scanDocument(document, {
         includeL2: options.includeL2,
         includeL3: options.includeL3,
+        deferRemotePackageVerification: options.deferRemotePackageVerification,
+        scheduleRemotePackageVerification: options.scheduleRemotePackageVerification,
         replaceAll: options.replaceAll
       });
     }, delayMs)
@@ -492,7 +526,12 @@ function scheduleL2Scan(document: vscode.TextDocument): void {
     key,
     setTimeout(() => {
       l2Timers.delete(key);
-      void scanDocument(document, { includeL2: true, includeL3: false });
+      void scanDocument(document, {
+        includeL2: true,
+        includeL3: false,
+        deferRemotePackageVerification: true,
+        scheduleRemotePackageVerification: true
+      });
     }, delayMs)
   );
 }
@@ -508,8 +547,26 @@ function scheduleL3Scan(document: vscode.TextDocument): void {
     key,
     setTimeout(() => {
       l3Timers.delete(key);
-      void scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+      void scanDocument(document, {
+        includeL2: true,
+        includeL3: true,
+        deferRemotePackageVerification: true,
+        scheduleRemotePackageVerification: true,
+        replaceAll: true
+      });
     }, delayMs)
+  );
+}
+
+function scheduleRemotePackageVerification(document: vscode.TextDocument): void {
+  const key = document.uri.toString();
+  clearTimer(remotePackageTimers, key);
+  remotePackageTimers.set(
+    key,
+    setTimeout(() => {
+      remotePackageTimers.delete(key);
+      void scanDocument(document, { includeL2: false, includeL3: false, packageVerification: "remote" });
+    }, realtimeRemoteVerificationDelayMs)
   );
 }
 
@@ -547,13 +604,20 @@ function configuredL3DebounceMs(): number {
   return normalizeL3DebounceMs(configuredSettingOr("l3DebounceMs", 2000));
 }
 
-async function scanDocument(
-  document: vscode.TextDocument,
-  options: { includeL2?: boolean; includeL3?: boolean; replaceAll?: boolean } = {}
-): Promise<void> {
+interface DocumentScanOptions {
+  includeL2?: boolean;
+  includeL3?: boolean;
+  packageVerification?: "off" | "seed" | "remote";
+  deferRemotePackageVerification?: boolean;
+  scheduleRemotePackageVerification?: boolean;
+  replaceAll?: boolean;
+}
+
+async function scanDocument(document: vscode.TextDocument, options: DocumentScanOptions = {}): Promise<void> {
   if (!isSupportedDocument(document)) {
     return;
   }
+  const documentVersion = document.version;
   const scanStartedAt = Date.now();
 
   const loadedConfig = await loadConfiguredVibeGuardConfig(document);
@@ -567,10 +631,14 @@ async function scanDocument(
     return;
   }
 
-  const packageVerification = configuredSettingOr<"off" | "seed" | "remote">(
+  const configuredPackageVerification = configuredSettingOr<"off" | "seed" | "remote">(
     "packageVerification",
     loadedConfig.config.package_verification
   );
+  const requestedPackageVerification = options.packageVerification ?? configuredPackageVerification;
+  const deferRemotePackageVerification =
+    options.deferRemotePackageVerification === true && requestedPackageVerification === "remote";
+  const packageVerification = deferRemotePackageVerification ? "seed" : requestedPackageVerification;
   const enableL2 = Boolean(options.includeL2 ?? true) && configuredSettingOr("enableL2", loadedConfig.config.detection_layers.l2);
   const enableL3 = Boolean(options.includeL3 ?? true) && configuredSettingOr("enableL3", loadedConfig.config.detection_layers.l3);
   const l3Analyzer = enableL3 ? await createConfiguredL3Analyzer(loadedConfig.config) : undefined;
@@ -611,6 +679,10 @@ async function scanDocument(
     }
   );
 
+  if (document.version !== documentVersion) {
+    return;
+  }
+
   const key = document.uri.toString();
   const existing = findingsByUri.get(key) ?? [];
   const mergedFindings = mergeFindingsForExecutedLayers(existing, result.findings, executedLayers, Boolean(options.replaceAll));
@@ -621,6 +693,9 @@ async function scanDocument(
   updateStatus();
   void persistDocumentFindings(document, mergedFindings, scanStartedAt);
   maybeShowCriticalPopup(document, mergedFindings);
+  if (deferRemotePackageVerification && options.scheduleRemotePackageVerification && executedLayers.l1) {
+    scheduleRemotePackageVerification(document);
+  }
 }
 
 function findingToDiagnostic(finding: Finding): vscode.Diagnostic {
@@ -728,6 +803,10 @@ async function applyAllSafeFixes(): Promise<void> {
 }
 
 function updateStatus(): void {
+  if (packageSyncInFlight) {
+    updatePackageSyncStatus();
+    return;
+  }
   const findings = allCurrentFindings().filter((finding) => !finding.dismissed);
   const performanceSummary = currentPerformanceSummary();
   const performanceMarker = performanceSummary.warningCount > 0 ? " $(watch)" : "";
@@ -743,6 +822,18 @@ function updateStatus(): void {
   statusBar.tooltip = `${findings.length} finding(s), ${critical} critical, ${high} high${
     performanceSummary.tooltip ? `\n${performanceSummary.tooltip}` : ""
   }`;
+}
+
+function updatePackageSyncStatus(): void {
+  const progress = packageSyncProgress;
+  const completed = progress?.completed ?? 0;
+  const total = progress?.total ?? 0;
+  const percent = total === 0 ? 0 : Math.round((completed / total) * 100);
+  const registry = progress?.registry ? ` (${progress.registry})` : "";
+  statusBar.text = `$(sync~spin) VibeGuard: package sync ${percent}%`;
+  statusBar.tooltip = total === 0
+    ? "VibeGuard package name cache is preparing to sync"
+    : `VibeGuard package name cache: ${completed}/${total} registries complete${registry}`;
 }
 
 function allCurrentFindings(): Finding[] {
@@ -883,6 +974,7 @@ async function ignoreFinding(finding: Finding | undefined, scope: "line" | "file
     },
     ignoreRulesPath()
   );
+  void reportIgnoredFalsePositive(finding, scope, reason);
   await refreshOpenDocuments();
   void vscode.window.showInformationMessage("VibeGuard ignore rule added.");
 }
@@ -905,8 +997,27 @@ async function ignorePackage(finding: Finding | undefined): Promise<void> {
     },
     ignoreRulesPath()
   );
+  void reportIgnoredFalsePositive(finding, "package", reason);
   await refreshOpenDocuments();
   void vscode.window.showInformationMessage(`VibeGuard will ignore package "${finding.evidence}".`);
+}
+
+async function reportIgnoredFalsePositive(
+  finding: Finding,
+  scope: "line" | "file" | "global" | "package",
+  reason: string | undefined
+): Promise<void> {
+  if (!isFalsePositiveDismissalReason(reason)) {
+    return;
+  }
+  const loadedConfig = await loadConfiguredVibeGuardConfigForWorkspace();
+  const delivery = await reportFalsePositiveTelemetry({
+    enabled: loadedConfig.config.telemetry,
+    event: falsePositiveTelemetryEvent(finding, "vscode", scope)
+  });
+  if (loadedConfig.config.telemetry && !delivery.sent) {
+    output.appendLine("Anonymous false-positive feedback was not delivered; the ignore rule was saved locally.");
+  }
 }
 
 async function pickIgnoreReason(scope: "line" | "file" | "global" | "package"): Promise<string | undefined | null> {
@@ -973,8 +1084,8 @@ async function syncPackageCache(manual: boolean): Promise<void> {
   }
 
   packageSyncInFlight = true;
-  statusBar.text = "$(sync~spin) VibeGuard: package sync";
-  statusBar.tooltip = "VibeGuard package name cache is syncing";
+  packageSyncProgress = undefined;
+  updatePackageSyncStatus();
   try {
     const loadedConfig = await loadConfiguredVibeGuardConfigForWorkspace();
     const configured = applyPackageCacheSettings(loadedConfig.config);
@@ -988,7 +1099,11 @@ async function syncPackageCache(manual: boolean): Promise<void> {
       config: syncConfig,
       storage: packageStorage,
       force: manual,
-      continueOnError: true
+      continueOnError: true,
+      onProgress: (progress) => {
+        packageSyncProgress = progress;
+        updatePackageSyncStatus();
+      }
     });
 
     logPackageSyncResult(result, loadedConfig.path, loadedConfig.exists, detectedRegistries);
@@ -1015,6 +1130,7 @@ async function syncPackageCache(manual: boolean): Promise<void> {
     }
   } finally {
     packageSyncInFlight = false;
+    packageSyncProgress = undefined;
     updateStatus();
   }
 }
@@ -1357,7 +1473,7 @@ function isSupportedDocument(document: vscode.TextDocument): boolean {
   if (supportedLanguageIds.has(document.languageId)) {
     return true;
   }
-  return /(?:package\.json|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle|build\.gradle\.kts)$/i.test(document.fileName);
+  return /(?:package\.json|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle|build\.gradle\.kts|dockerfile)$/i.test(document.fileName);
 }
 
 function configuration(): vscode.WorkspaceConfiguration {

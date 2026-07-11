@@ -1,7 +1,8 @@
 import type { Finding, L3AnalyzerLike, Severity, SourceFile, VibeGuardConfig } from "../types";
 import { defaultProApiBaseUrl, getProApiKeyFromEnv } from "../subscription";
+import { detectSecrets } from "../rules/secrets";
 import { createFinding, lineStarts, lineTextAt } from "../utils";
-import { LocalSemanticAnalyzer } from "./analyzer";
+import { buildSecurityReviewContext, LocalSemanticAnalyzer } from "./analyzer";
 
 export type LlmProvider = NonNullable<VibeGuardConfig["llm_provider"]>;
 
@@ -50,7 +51,10 @@ export class LlmSemanticAnalyzer implements L3AnalyzerLike {
     }
 
     try {
-      const raw = await requestLlmSecurityReview(this.options, buildLlmSecurityReviewPrompt(source));
+      const raw = await requestLlmSecurityReview(
+        this.options,
+        buildLlmSecurityReviewPrompt(source, this.options.provider !== "local")
+      );
       return parseLlmSecurityFindings(raw, source, timestamp);
     } catch {
       return this.fallback(source, timestamp);
@@ -148,24 +152,77 @@ export function defaultLlmBaseUrl(provider: LlmProvider): string {
   }
 }
 
-export function buildLlmSecurityReviewPrompt(source: SourceFile): string {
-  const code = clipSource(source.text, 16000);
+export function buildLlmSecurityReviewPrompt(source: SourceFile, redactSecrets = true): string {
+  const reviewedSource = redactSecrets ? redactSecretsForRemoteAnalysis(source.text) : source.text;
+  const code = clipSource(reviewedSource, 16000);
+  const context = buildSecurityReviewContext(source);
+  const hasRedactedSecrets = reviewedSource !== source.text;
   return [
     "Review this code for missing security controls. Focus on issues that require semantic understanding beyond simple regex matching.",
     "",
     `File: ${source.filePath}`,
     `Language: ${source.languageId ?? "unknown"}`,
+    `Framework: ${context.framework}`,
+    `Function candidates: ${context.functionNames.length > 0 ? context.functionNames.join(", ") : "Not confidently detected"}`,
+    `Route candidates: ${context.routes.length > 0 ? context.routes.join(", ") : "Not confidently detected"}`,
     "",
+    "Check for missing input validation, rate limiting, parameterized queries, error handling, authentication, and output encoding when the code context warrants it.",
     "Return JSON only. If there are no actionable findings, return {\"findings\":[]}.",
     "Each finding must include: ruleId, severity, message, evidence, suggestion, line, column.",
     "Use exact code snippets for evidence so the editor can place diagnostics.",
     "Optionally include replacement only when it can replace exactly that evidence snippet without edits elsewhere. Do not include Markdown fences or diffs.",
+    ...(hasRedactedSecrets ? ["Secret literal values are replaced with VIBEGUARD_REDACTED_SECRET. Do not infer, report, or replace those placeholders."] : []),
     "",
     "Code:",
     "```",
     code,
     "```"
   ].join("\n");
+}
+
+const privateKeyBlock = /-----BEGIN (?:RSA |EC |OPENSSH |DSA |ED25519 )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |ED25519 )?PRIVATE KEY-----/g;
+const remoteSecretPlaceholder = "VIBEGUARD_REDACTED_SECRET";
+
+function redactSecretsForRemoteAnalysis(text: string): string {
+  const starts = lineStarts(text);
+  const ranges = detectSecrets(text, "remote-llm-source", 0)
+    .map((finding) => ({
+      start: offsetAt(starts, finding.line, finding.column),
+      end: offsetAt(starts, finding.endLine ?? finding.line, finding.endColumn ?? finding.column + 1)
+    }))
+    .filter((range) => range.start >= 0 && range.end > range.start);
+  privateKeyBlock.lastIndex = 0;
+  for (const match of text.matchAll(privateKeyBlock)) {
+    const start = match.index ?? 0;
+    ranges.push({ start, end: start + match[0].length });
+  }
+  if (ranges.length === 0) {
+    return text;
+  }
+  const merged = ranges
+    .sort((left, right) => left.start - right.start || right.end - left.end)
+    .reduce<Array<{ start: number; end: number }>>((result, range) => {
+      const previous = result[result.length - 1];
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        result.push({ ...range });
+      }
+      return result;
+    }, []);
+  let result = "";
+  let cursor = 0;
+  for (const range of merged) {
+    result += text.slice(cursor, range.start);
+    result += `${remoteSecretPlaceholder}${(text.slice(range.start, range.end).match(/\r\n|\r|\n/g) ?? []).join("")}`;
+    cursor = range.end;
+  }
+  return `${result}${text.slice(cursor)}`;
+}
+
+function offsetAt(starts: readonly number[], line: number, column: number): number {
+  const lineStart = starts[Math.max(0, line - 1)];
+  return lineStart === undefined ? -1 : lineStart + Math.max(0, column - 1);
 }
 
 async function requestOpenAiCompatibleReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<string> {
@@ -276,7 +333,8 @@ async function fetchWithTimeout(
   try {
     return await fetchImpl(url, {
       ...init,
-      signal: controller.signal
+      signal: controller.signal,
+      redirect: "error"
     });
   } finally {
     clearTimeout(timer);
@@ -435,11 +493,31 @@ function evidenceFromLine(text: string, line: unknown, column: unknown): string 
 }
 
 function endpointUrl(baseUrl: string, path: string): string {
-  const trimmed = baseUrl.replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new Error("LLM base URL must be an absolute URL.");
+  }
+  if (!isSecureLlmUrl(url)) {
+    throw new Error("LLM base URL must use HTTPS outside localhost development.");
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("LLM base URL must not include credentials, query parameters, or fragments.");
+  }
+  const trimmed = url.toString().replace(/\/+$/, "");
   if (trimmed.endsWith(path)) {
     return trimmed;
   }
   return `${trimmed}${path}`;
+}
+
+function isSecureLlmUrl(url: URL): boolean {
+  return url.protocol === "https:" || (url.protocol === "http:" && isLoopbackHost(url.hostname));
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
 }
 
 function getNestedString(value: unknown, path: Array<string | number>): string | undefined {

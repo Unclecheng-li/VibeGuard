@@ -5,6 +5,7 @@ import type { FindingStoreSummary } from "../src/findings/storage";
 
 test("maps stored findings to cautious SOC 2 and ISO 27001 evidence", () => {
   const report = createComplianceReport(summary(), { generatedAt: Date.UTC(2026, 6, 1) });
+  const markdown = formatComplianceMarkdown(report);
   const soc2 = report.frameworks.find((framework) => framework.framework === "soc2");
   const iso = report.frameworks.find((framework) => framework.framework === "iso27001");
 
@@ -14,6 +15,21 @@ test("maps stored findings to cautious SOC 2 and ISO 27001 evidence", () => {
   assert.equal(iso?.controls.find((control) => control.id === "A.8.8")?.status, "attention");
   assert.match(report.disclaimer, /not a certification/i);
   assert.deepEqual(report.audit.dismissalReasons, [{ reason: "false_positive", count: 1 }]);
+  assert.match(markdown, /New active risks in latest scan \| 1/);
+  assert.deepEqual(report.audit.topRules, [
+    {
+      rule: "sast_sql_template_interpolation",
+      count: 2,
+      activeCount: 1,
+      falsePositiveCount: 1,
+      falsePositiveRate: 0.5
+    }
+  ]);
+  assert.match(markdown, /sast_sql_template_interpolation \| 2 \| 1 \| 1 \| 50%/);
+  assert.equal(
+    soc2?.controls.find((control) => control.id === "CC7.2")?.evidence.includes("Resolved active risks in latest scan: 2"),
+    true
+  );
 });
 
 test("identifies a project-scoped compliance report", () => {
@@ -88,6 +104,14 @@ function summary(): FindingStoreSummary {
     activeCount: 1,
     dismissedCount: 1,
     latestScanAt: Date.UTC(2026, 5, 30),
+    latestScanDelta: {
+      previousScanId: "scan-two",
+      currentScanId: "scan-three",
+      currentCompletedAt: Date.UTC(2026, 5, 30),
+      introducedCount: 1,
+      resolvedCount: 2,
+      persistentCount: 0
+    },
     since: Date.UTC(2026, 5, 1),
     severityCounts: [
       { key: "high", count: 1, activeCount: 1, dismissedCount: 0 },
@@ -105,11 +129,14 @@ function summary(): FindingStoreSummary {
         key: "sast_sql_template_interpolation",
         type: "sql_injection",
         severity: "high",
-        count: 1,
+        count: 2,
         activeCount: 1,
-        dismissedCount: 0
+        dismissedCount: 1,
+        falsePositiveCount: 1,
+        falsePositiveRate: 0.5
       }
     ],
+    falsePositiveRules: [],
     trend: [{ date: "2026-06-30", scanCount: 3, findingCount: 2, activeCount: 1, dismissedCount: 1 }]
   };
 }
@@ -126,6 +153,7 @@ function emptySummary(): FindingStoreSummary {
     authorCounts: [],
     projectCounts: [],
     topRules: [],
+    falsePositiveRules: [],
     trend: []
   };
 }

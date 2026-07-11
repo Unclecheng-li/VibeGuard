@@ -10,6 +10,14 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
     activeCount: 3,
     dismissedCount: 1,
     latestScanAt: Date.UTC(2026, 0, 2, 12),
+    latestScanDelta: {
+      previousScanId: "scan-one",
+      currentScanId: "scan-two",
+      currentCompletedAt: Date.UTC(2026, 0, 2, 12),
+      introducedCount: 2,
+      resolvedCount: 1,
+      persistentCount: 1
+    },
     since: Date.UTC(2026, 0, 1),
     severityCounts: [
       { key: "critical", count: 1, activeCount: 1, dismissedCount: 0 },
@@ -51,7 +59,21 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
         severity: "high",
         count: 3,
         activeCount: 2,
-        dismissedCount: 1
+        dismissedCount: 1,
+        falsePositiveCount: 1,
+        falsePositiveRate: 1 / 3
+      }
+    ],
+    falsePositiveRules: [
+      {
+        key: "sast_sql_template_interpolation",
+        type: "sql_injection",
+        severity: "high",
+        count: 3,
+        activeCount: 2,
+        dismissedCount: 1,
+        falsePositiveCount: 1,
+        falsePositiveRate: 1 / 3
       }
     ],
     trend: [
@@ -62,13 +84,18 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
 
   const html = formatFindingsDashboard(summary, {
     dbPath: "/tmp/findings.db",
-    generatedAt: Date.UTC(2026, 0, 3)
+    generatedAt: Date.UTC(2026, 0, 3),
+    adminUrl: "/projects"
   });
   const dataMatch = html.match(/<script type="application\/json" id="vibeguard-summary">([\s\S]*?)<\/script>/);
 
   assert.match(html, /VibeGuard Security Dashboard/);
   assert.match(html, /Daily Finding Trend/);
+  assert.match(html, /Latest Scan Change/);
+  assert.match(html, /Persistent/);
   assert.match(html, /Top Detection Rules/);
+  assert.match(html, /Rule Feedback/);
+  assert.match(html, /FP Rate/);
   assert.match(html, /Dismissal Reasons/);
   assert.match(html, /Developer Risk/);
   assert.match(html, /Project Risk/);
@@ -76,8 +103,24 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
   assert.match(html, /Ada Lovelace/);
   assert.match(html, /false_positive: migration fixture/);
   assert.match(html, /Risk posture/);
+  assert.match(html, /Project integrations/);
+  assert.match(html, /href="\/projects"/);
   assert.ok(dataMatch);
   assert.deepEqual(JSON.parse(dataMatch[1]), summary);
+
+  const hostedHtml = formatFindingsDashboard(
+    {
+      ...summary,
+      projectCounts: [
+        ...summary.projectCounts,
+        { key: "Unassigned", scanCount: 1, findingCount: 1, activeCount: 1, dismissedCount: 0, highRiskCount: 0, highRiskRate: 0 }
+      ]
+    },
+    { projectFilterBaseUrl: "/?project=", allProjectsUrl: "/" }
+  );
+  assert.match(hostedHtml, /href="\/\?project=acme%2Fpayments-api"/);
+  assert.match(hostedHtml, /href="\/">All projects/);
+  assert.equal(hostedHtml.includes("project=Unassigned"), false);
 });
 
 test("escapes dashboard text and embedded JSON safely", () => {
@@ -86,6 +129,14 @@ test("escapes dashboard text and embedded JSON safely", () => {
     findingCount: 1,
     activeCount: 1,
     dismissedCount: 0,
+    latestScanDelta: {
+      previousScanId: "</script><script>alert(1)</script>",
+      currentScanId: "scan-two",
+      currentCompletedAt: Date.UTC(2026, 0, 2),
+      introducedCount: 1,
+      resolvedCount: 0,
+      persistentCount: 0
+    },
     severityCounts: [{ key: "critical", count: 1, activeCount: 1, dismissedCount: 0 }],
     typeCounts: [{ key: "other", count: 1, activeCount: 1, dismissedCount: 0 }],
     dismissedReasonCounts: [],
@@ -98,9 +149,12 @@ test("escapes dashboard text and embedded JSON safely", () => {
         severity: "critical",
         count: 1,
         activeCount: 1,
-        dismissedCount: 0
+        dismissedCount: 0,
+        falsePositiveCount: 0,
+        falsePositiveRate: 0
       }
     ],
+    falsePositiveRules: [],
     trend: [{ date: "2026-01-01", scanCount: 1, findingCount: 1, activeCount: 1, dismissedCount: 0 }]
   };
 
@@ -111,4 +165,5 @@ test("escapes dashboard text and embedded JSON safely", () => {
   assert.match(html, /&lt;\/script&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.ok(dataMatch);
   assert.equal(JSON.parse(dataMatch[1]).topRules[0].key, "</script><script>alert(1)</script>");
+  assert.equal(JSON.parse(dataMatch[1]).latestScanDelta.previousScanId, "</script><script>alert(1)</script>");
 });

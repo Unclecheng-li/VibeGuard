@@ -1,4 +1,5 @@
 import { mkdirSync } from "fs";
+import { createHash, randomBytes } from "crypto";
 import { createRequire } from "module";
 import os from "os";
 import path from "path";
@@ -86,6 +87,28 @@ export interface StoredAuditEvent extends Required<Pick<AuditEventInput, "authen
   details: Record<string, string | number | boolean>;
 }
 
+export interface ManagedProjectIngestCredential {
+  project: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface IssuedProjectIngestCredential extends ManagedProjectIngestCredential {
+  token: string;
+  created: boolean;
+}
+
+/** Metadata used by the administrator-facing project rule registry. */
+export interface ManagedProjectCustomRules {
+  project: string;
+  ruleCount: number;
+  updatedAt: number;
+}
+
+export interface ProjectCustomRules extends ManagedProjectCustomRules {
+  yaml: string;
+}
+
 export interface AuditEventQuery {
   limit?: number;
   since?: number;
@@ -109,6 +132,8 @@ export interface FindingSummaryBucket {
 export interface FindingRuleSummary extends FindingSummaryBucket {
   type: FindingType;
   severity: Severity;
+  falsePositiveCount: number;
+  falsePositiveRate: number;
 }
 
 export interface FindingAuthorSummary extends FindingSummaryBucket {
@@ -124,6 +149,15 @@ export interface FindingTrendPoint {
   findingCount: number;
   activeCount: number;
   dismissedCount: number;
+}
+
+export interface FindingScanDelta {
+  previousScanId: string;
+  currentScanId: string;
+  currentCompletedAt: number;
+  introducedCount: number;
+  resolvedCount: number;
+  persistentCount: number;
 }
 
 export interface FindingProjectSummary {
@@ -145,7 +179,9 @@ export interface FindingStoreSummary extends FindingStoreStats {
   authorCounts: FindingAuthorSummary[];
   projectCounts: FindingProjectSummary[];
   topRules: FindingRuleSummary[];
+  falsePositiveRules: FindingRuleSummary[];
   trend: FindingTrendPoint[];
+  latestScanDelta?: FindingScanDelta;
 }
 
 export interface PruneResult {
@@ -324,6 +360,149 @@ export class SqliteFindingStore {
     return rows.map(rowToStoredAuditEvent);
   }
 
+  listProjectIngestCredentials(): ManagedProjectIngestCredential[] {
+    this.initialize();
+    return this.database
+      .prepare(
+        `SELECT project, created_at, updated_at
+         FROM project_ingest_credential
+         ORDER BY project ASC`
+      )
+      .all()
+      .map((row) => ({
+        project: String(row.project),
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at)
+      }));
+  }
+
+  /** Issues a one-time-returned token. Only its SHA-256 digest is persisted. */
+  issueProjectIngestCredential(project: string, rotate = false): IssuedProjectIngestCredential | undefined {
+    this.initialize();
+    const normalizedProject = requiredProject(project);
+    const existing = this.database
+      .prepare("SELECT created_at FROM project_ingest_credential WHERE project = ?")
+      .get(normalizedProject);
+    if (existing && !rotate) {
+      return undefined;
+    }
+
+    const now = Date.now();
+    const token = `vgpi_${randomBytes(32).toString("base64url")}`;
+    const tokenHash = ingestTokenHash(token);
+    if (existing) {
+      this.database
+        .prepare("UPDATE project_ingest_credential SET token_hash = ?, updated_at = ? WHERE project = ?")
+        .run(tokenHash, now, normalizedProject);
+    } else {
+      this.database
+        .prepare(
+          `INSERT INTO project_ingest_credential (project, token_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(normalizedProject, tokenHash, now, now);
+    }
+    return {
+      project: normalizedProject,
+      token,
+      created: !existing,
+      createdAt: existing ? Number(existing.created_at) : now,
+      updatedAt: now
+    };
+  }
+
+  projectForIngestToken(token: string): string | undefined {
+    this.initialize();
+    const trimmed = token.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const row = this.database
+      .prepare("SELECT project FROM project_ingest_credential WHERE token_hash = ?")
+      .get(ingestTokenHash(trimmed));
+    return typeof row?.project === "string" ? row.project : undefined;
+  }
+
+  revokeProjectIngestCredential(project: string): boolean {
+    this.initialize();
+    const normalizedProject = requiredProject(project);
+    const existing = this.database
+      .prepare("SELECT project FROM project_ingest_credential WHERE project = ?")
+      .get(normalizedProject);
+    if (!existing) {
+      return false;
+    }
+    this.database.prepare("DELETE FROM project_ingest_credential WHERE project = ?").run(normalizedProject);
+    return true;
+  }
+
+  listProjectCustomRules(): ManagedProjectCustomRules[] {
+    this.initialize();
+    return this.database
+      .prepare(
+        `SELECT project, rule_count, updated_at
+         FROM project_custom_rules
+         ORDER BY project ASC`
+      )
+      .all()
+      .map((row) => ({
+        project: String(row.project),
+        ruleCount: Number(row.rule_count),
+        updatedAt: Number(row.updated_at)
+      }));
+  }
+
+  getProjectCustomRules(project: string): ProjectCustomRules | undefined {
+    this.initialize();
+    const normalizedProject = requiredProject(project);
+    const row = this.database
+      .prepare(
+        `SELECT project, rules_yaml, rule_count, updated_at
+         FROM project_custom_rules
+         WHERE project = ?`
+      )
+      .get(normalizedProject);
+    if (!row) {
+      return undefined;
+    }
+    return {
+      project: String(row.project),
+      yaml: String(row.rules_yaml),
+      ruleCount: Number(row.rule_count),
+      updatedAt: Number(row.updated_at)
+    };
+  }
+
+  saveProjectCustomRules(project: string, yaml: string, ruleCount: number): ProjectCustomRules {
+    this.initialize();
+    const normalizedProject = requiredProject(project);
+    const now = Date.now();
+    this.database
+      .prepare(
+        `INSERT INTO project_custom_rules (project, rules_yaml, rule_count, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(project) DO UPDATE SET
+           rules_yaml = excluded.rules_yaml,
+           rule_count = excluded.rule_count,
+           updated_at = excluded.updated_at`
+      )
+      .run(normalizedProject, yaml, ruleCount, now);
+    return { project: normalizedProject, yaml, ruleCount, updatedAt: now };
+  }
+
+  deleteProjectCustomRules(project: string): boolean {
+    this.initialize();
+    const normalizedProject = requiredProject(project);
+    const existing = this.database
+      .prepare("SELECT project FROM project_custom_rules WHERE project = ?")
+      .get(normalizedProject);
+    if (!existing) {
+      return false;
+    }
+    this.database.prepare("DELETE FROM project_custom_rules WHERE project = ?").run(normalizedProject);
+    return true;
+  }
+
   stats(project?: string): FindingStoreStats {
     this.initialize();
     const selectedProject = normalizeProject(project) ?? null;
@@ -405,13 +584,58 @@ export class SqliteFindingStore {
                 f.severity AS severity,
                 COUNT(*) AS count,
                 SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
-                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
+                SUM(CASE WHEN f.dismissed = 1
+                              AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  IN ('false positive')
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive %'
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive(%'
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive:%'
+                         THEN 1 ELSE 0 END) AS false_positive_count
          FROM finding_result f
          JOIN scan_run s ON s.scan_id = f.scan_id
          WHERE (? IS NULL OR s.completed_at >= ?)
            AND (? IS NULL OR s.project = ?)
          GROUP BY f.detection_rule, f.type, f.severity
          ORDER BY count DESC, active_count DESC, f.detection_rule ASC
+         LIMIT ?`
+      )
+      .all(since, since, project, project, topLimit);
+
+    const falsePositiveRuleRows = this.database
+      .prepare(
+        `SELECT f.detection_rule AS key,
+                f.type AS type,
+                f.severity AS severity,
+                COUNT(*) AS count,
+                SUM(CASE WHEN f.dismissed = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN f.dismissed = 1 THEN 1 ELSE 0 END) AS dismissed_count,
+                SUM(CASE WHEN f.dismissed = 1
+                              AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  IN ('false positive')
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive %'
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive(%'
+                               OR f.dismissed = 1
+                                  AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(f.dismissed_reason, ''))), '_', ' '), '-', ' ')
+                                  LIKE 'false positive:%'
+                         THEN 1 ELSE 0 END) AS false_positive_count
+         FROM finding_result f
+         JOIN scan_run s ON s.scan_id = f.scan_id
+         WHERE (? IS NULL OR s.completed_at >= ?)
+           AND (? IS NULL OR s.project = ?)
+         GROUP BY f.detection_rule, f.type, f.severity
+         HAVING false_positive_count > 0
+         ORDER BY CAST(false_positive_count AS REAL) / COUNT(*) DESC, false_positive_count DESC, count DESC, f.detection_rule ASC
          LIMIT ?`
       )
       .all(since, since, project, project, topLimit);
@@ -483,6 +707,7 @@ export class SqliteFindingStore {
          ORDER BY date ASC`
       )
       .all(since, since, project, project);
+    const latestScanDelta = this.latestScanDelta(since, project);
 
     return {
       scanCount: Number(statsRow?.scan_count ?? 0),
@@ -499,7 +724,9 @@ export class SqliteFindingStore {
       authorCounts: authorRows.map(rowToAuthorSummary),
       projectCounts: projectRows.map(rowToProjectSummary),
       topRules: topRuleRows.map(rowToRuleSummary),
-      trend: trendRows.map(rowToTrendPoint)
+      falsePositiveRules: falsePositiveRuleRows.map(rowToRuleSummary),
+      trend: trendRows.map(rowToTrendPoint),
+      latestScanDelta
     };
   }
 
@@ -590,12 +817,81 @@ export class SqliteFindingStore {
         details_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_audit_event_occurred_at ON audit_event(occurred_at DESC);
+      CREATE TABLE IF NOT EXISTS project_ingest_credential (
+        project TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_project_ingest_credential_hash ON project_ingest_credential(token_hash);
+      CREATE TABLE IF NOT EXISTS project_custom_rules (
+        project TEXT PRIMARY KEY,
+        rules_yaml TEXT NOT NULL,
+        rule_count INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
     ensureColumn(this.database, "finding_result", "author_name", "author_name TEXT");
     ensureColumn(this.database, "finding_result", "author_email", "author_email TEXT");
     ensureColumn(this.database, "scan_run", "project", "project TEXT");
     this.database.exec("CREATE INDEX IF NOT EXISTS idx_finding_result_author ON finding_result(author_email, author_name);");
     this.database.exec("CREATE INDEX IF NOT EXISTS idx_scan_run_project_completed_at ON scan_run(project, completed_at);");
+  }
+
+  private latestScanDelta(since: number | null, project: string | null): FindingScanDelta | undefined {
+    const scans = this.database
+      .prepare(
+        `SELECT scan_id, completed_at
+         FROM scan_run
+         WHERE (? IS NULL OR completed_at >= ?)
+           AND (? IS NULL OR project = ?)
+         ORDER BY completed_at DESC, scan_id DESC
+         LIMIT 2`
+      )
+      .all(since, since, project, project);
+    if (scans.length < 2) {
+      return undefined;
+    }
+
+    const currentScan = scans[0];
+    const previousScan = scans[1];
+    const currentFindingIds = new Set(
+      this.database
+        .prepare("SELECT finding_id FROM finding_result WHERE scan_id = ? AND dismissed = 0")
+        .all(currentScan.scan_id)
+        .map((row) => String(row.finding_id))
+    );
+    const previousFindingIds = new Set(
+      this.database
+        .prepare("SELECT finding_id FROM finding_result WHERE scan_id = ? AND dismissed = 0")
+        .all(previousScan.scan_id)
+        .map((row) => String(row.finding_id))
+    );
+
+    let introducedCount = 0;
+    let persistentCount = 0;
+    for (const findingId of currentFindingIds) {
+      if (previousFindingIds.has(findingId)) {
+        persistentCount += 1;
+      } else {
+        introducedCount += 1;
+      }
+    }
+    let resolvedCount = 0;
+    for (const findingId of previousFindingIds) {
+      if (!currentFindingIds.has(findingId)) {
+        resolvedCount += 1;
+      }
+    }
+
+    return {
+      previousScanId: String(previousScan.scan_id),
+      currentScanId: String(currentScan.scan_id),
+      currentCompletedAt: Number(currentScan.completed_at),
+      introducedCount,
+      resolvedCount,
+      persistentCount
+    };
   }
 }
 
@@ -638,6 +934,18 @@ function normalizeProject(value: string | undefined): string | undefined {
   return project;
 }
 
+function requiredProject(value: string): string {
+  const project = normalizeProject(value);
+  if (!project) {
+    throw new Error("Project identifier must not be empty.");
+  }
+  return project;
+}
+
+function ingestTokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 function rowToStoredFinding(row: Record<string, unknown>): StoredFinding {
   return {
     scanId: row.scan_id as string,
@@ -675,10 +983,14 @@ function rowToSummaryBucket(row: Record<string, unknown>): FindingSummaryBucket 
 }
 
 function rowToRuleSummary(row: Record<string, unknown>): FindingRuleSummary {
+  const bucket = rowToSummaryBucket(row);
+  const falsePositiveCount = Number(row.false_positive_count ?? 0);
   return {
-    ...rowToSummaryBucket(row),
+    ...bucket,
     type: row.type as FindingType,
-    severity: row.severity as Severity
+    severity: row.severity as Severity,
+    falsePositiveCount,
+    falsePositiveRate: bucket.count === 0 ? 0 : falsePositiveCount / bucket.count
   };
 }
 

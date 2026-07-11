@@ -70,4 +70,8 @@ intellijPlatform {
       sinceBuild = "252"
     }
   }
+  publishing {
+    token = providers.environmentVariable("JETBRAINS_MARKETPLACE_TOKEN")
+    channels = providers.gradleProperty("jetbrainsChannel").map { listOf(it) }.orElse(listOf("default"))
+  }
 }

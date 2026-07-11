@@ -1,0 +1,93 @@
+name: Marketplace Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibeguard-marketplace-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const version = require("./package.json").version;
+          const gradle = fs.readFileSync("jetbrains/build.gradle.kts", "utf8");
+          const match = gradle.match(/^version\s*=\s*"([^"]+)"/m);
+          if (!match || match[1] !== version) {
+            throw new Error(`Version mismatch: package.json=${version}, JetBrains=${match?.[1] ?? "missing"}`);
+          }
+          const tag = process.env.GITHUB_REF_NAME;
+          if (process.env.GITHUB_EVENT_NAME === "push" && tag !== `v${version}`) {
+            throw new Error(`Release tag must be v${version}; received ${tag}`);
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          NODE
+
+  vscode:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm exec -- vsce package --out "vibeguard-${{ needs.verify-version.outputs.version }}.vsix"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibeguard-vscode-${{ needs.verify-version.outputs.version }}
+          path: vibeguard-${{ needs.verify-version.outputs.version }}.vsix
+      - name: Publish VSCode extension
+        if: github.event_name == 'push'
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npm exec -- vsce publish --packagePath "vibeguard-${{ needs.verify-version.outputs.version }}.vsix"
+
+  jetbrains:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - run: npm ci
+      - run: ./gradlew buildPlugin --no-daemon
+        working-directory: jetbrains
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibeguard-jetbrains-${{ needs.verify-version.outputs.version }}
+          path: jetbrains/build/distributions/*.zip
+      - name: Publish JetBrains plugin
+        if: github.event_name == 'push'
+        env:
+          JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+        run: ./gradlew publishPlugin --no-daemon
+        working-directory: jetbrains

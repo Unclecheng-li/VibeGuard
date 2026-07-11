@@ -5,7 +5,7 @@
 - Initial VibeGuard MVP extension package.
 - Real-time L1 findings for hallucinated npm, PyPI, Cargo, Go module, and Maven packages, hardcoded secrets, loose configuration, and common AI coding mistakes.
 - Lightweight L2 SAST diagnostics for common injection and unsafe deserialization patterns.
-- Optional local L3 semantic endpoint checks for missing authentication, rate limiting, validation, and output encoding.
+- Optional local L3 semantic endpoint checks for missing authentication, rate limiting, validation, parameterized queries, IO error handling, and output encoding.
 - Findings view, critical popups, quick fixes, ignore rules, CLI scanner, LSP server, GitHub Action, and package index sync/cache support.
 - CI reporting with JSON, SARIF, and GitHub workflow annotations for PR feedback.
 - Git-aware `ai-code-scan` mode for filtering PR scans to changed files touched by AI-looking authors, commit messages, or large generated diffs.
@@ -13,7 +13,7 @@
 - Custom YAML rules for team-specific VibeGuard findings across CLI, VSCode, LSP, and GitHub Action.
 - Shared `~/.vibeguard/config.json` support with CLI `config init`, `--config`, `--no-config`, VSCode `vibeguard.configPath`, and GitHub Action `config` inputs.
 - Existing-tool deduplication for L2 findings with nearby SonarQube, Snyk, Semgrep, or CodeQL annotations, configurable across CLI, VSCode, LSP, GitHub Action, and config.json.
-- L2 SAST coverage for open redirects and server error-detail information leakage, including Semgrep export metadata.
+- L2 SAST coverage for open redirects and server error-detail information leakage, including error responses that expose SQL, connection details, or other sensitive diagnostics, with Semgrep export metadata.
 - Local SQLite findings history in `~/.vibeguard/findings.db`, with CLI `findings status/list/prune`, VSCode persistence, and opt-out flags for local/CI scans.
 - CLI `findings summary` now aggregates stored history by severity, finding type, top detection rules, and daily trend for CI summaries and future team dashboards.
 - Findings summaries and dashboards now include dismissal-reason counts so teams can spot false-positive or internal-package patterns.
@@ -53,4 +53,22 @@
 - Added opt-in, bounded, de-duplicated GitHub PR Review comments for active findings on changed diff lines.
 - Added a separately tokened, bounded private-dashboard findings ingest API, optional CLI and GitHub Action uploads, and ingest audit events for centralized CI trend reporting.
 - Added project attribution and filtering across centralized scans, SQLite trend summaries, dashboards, CLI history commands, dashboard APIs, and GitHub Action uploads.
+- Private dashboard Project Risk rows now link directly to their authenticated project-filtered dashboard view, with a return-to-all-projects control.
 - Refined `ai-code-scan` to use zero-context diffs and git blame for line-level AI attribution, reporting only findings that overlap changed AI-attributed lines while retaining a conservative full-scan fallback.
+- Added a tag-gated Marketplace Release workflow that validates cross-editor versions, publishes VSCode and JetBrains packages only with repository secrets, and always emits reviewable release artifacts.
+- Added hardened Docker Compose manifests for persistent private dashboard deployment, optional OIDC override, and CI validation of the deployment configuration.
+- Added project-scoped custom-rule management to the private dashboard, with YAML validation, SQLite persistence, one-project CI credential enforcement, and optional GitHub Action rule downloads.
+- Added Gradle version-catalog (`*.versions.toml`) Maven dependency parsing for `module`, `group`/`name`, and direct-coordinate declarations.
+- Added PyPI `pip install` detection for Dockerfiles, shell and PowerShell scripts, and YAML CI commands across CLI and VSCode scans.
+- Added high-confidence Java L2 checks for direct request input reaching JDBC execution, process execution, or ObjectInputStream deserialization, with Semgrep export support.
+- VSCode edit-time scans now keep remote package-registry verification off the realtime L1 path by showing local seed/cache results immediately, scheduling remote verification 600ms after the latest automatic scan, and discarding stale document results.
+- OIDC private-dashboard startup now validates the callback public URL as a safe HTTPS origin before opening storage or listening, allowing HTTP only for loopback development.
+- One-time service-token dashboard sign-in now marks its browser cookie `Secure` when the configured public origin uses HTTPS.
+- One-time service-token dashboard sign-in now redirects to a URL with the token query parameter removed while preserving non-sensitive filters.
+- Expanded high-confidence L2 path-traversal coverage to Node.js `fs` and `fs.promises` write, append, stream, and deletion operations when their paths include user-controlled input.
+- Expanded high-confidence L2 SSRF coverage to Axios configuration targets, Node HTTP(S), HTTPX, Requests request methods, and common non-GET/POST outbound calls without treating request bodies as URL targets.
+- Expanded high-confidence L2 command-injection coverage to Node `execSync` and Python `subprocess.check_call` / `check_output` when commands include user-controlled input.
+- Remote L3 providers now receive high-confidence secret literals and complete private-key blocks only as redacted placeholders; local Ollama analysis remains local and unredacted.
+- Unavailable npm/PyPI verification results are no longer cached as package verdicts, so remote-mode scans automatically retry when registry connectivity returns.
+- Concurrent references to the same unknown npm/PyPI dependency now share a single remote verification request.
+- VSCode cold-start package sync now prioritizes detected workspace package managers before queuing every other configured registry.

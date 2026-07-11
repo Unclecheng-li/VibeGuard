@@ -9,4 +9,6 @@ test("VSCode findings persistence includes git author attribution", async () => 
   assert.match(source, /resolveDocumentFindingAuthors/);
   assert.match(source, /findingAuthors/);
   assert.match(source, /recordScanRun\(\{/);
+  assert.match(source, /reportIgnoredFalsePositive/);
+  assert.match(source, /falsePositiveTelemetryEvent/);
 });

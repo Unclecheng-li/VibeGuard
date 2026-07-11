@@ -8,6 +8,21 @@ import { startFindingsDashboardServer } from "../src/findings/server";
 import { isFindingsStorageAvailable, SqliteFindingStore } from "../src/findings/storage";
 import type { Finding } from "../src/types";
 
+test("rejects an unsafe OIDC public URL before opening dashboard storage", async () => {
+  await assert.rejects(
+    startFindingsDashboardServer({
+      dbPath: path.join(os.tmpdir(), "vibeguard-should-not-open.db"),
+      oidc: {
+        issuer: "https://id.example.test",
+        clientId: "vibeguard-dashboard",
+        sessionSecret: "dashboard-session-secret-with-at-least-32-bytes",
+        publicUrl: "http://dashboard.example.test"
+      }
+    }),
+    /OIDC dashboard public URL must use HTTPS outside localhost development\./
+  );
+});
+
 test("serves team dashboard HTML and token-protected summaries", async (context) => {
   if (!isFindingsStorageAvailable()) {
     context.skip("node:sqlite is not available in this runtime");
@@ -20,6 +35,7 @@ test("serves team dashboard HTML and token-protected summaries", async (context)
     scanId: "team_scan",
     startedAt: 1,
     completedAt: 2,
+    project: "acme/payments-api",
     cwd: directory,
     targetPaths: ["app.ts"],
     fileCount: 1,
@@ -35,11 +51,34 @@ test("serves team dashboard HTML and token-protected summaries", async (context)
     const malformedCookie = await fetch(dashboard.url, { headers: { cookie: "vibeguard_team_token=%" } });
     assert.equal(malformedCookie.status, 401);
 
+    const tokenLogin = await fetch(new URL("?token=team-secret&project=acme%2Fpayments-api", dashboard.url), { redirect: "manual" });
+    assert.equal(tokenLogin.status, 302);
+    assert.equal(tokenLogin.headers.get("location"), "/?project=acme%2Fpayments-api");
+    assert.match(tokenLogin.headers.get("set-cookie") ?? "", /HttpOnly; SameSite=Strict; Path=\/$/);
+    const tokenCookie = cookieFromHeaders(tokenLogin.headers, "vibeguard_team_token");
+    const tokenDashboard = await fetch(new URL(tokenLogin.headers.get("location") ?? "", dashboard.url), {
+      headers: { cookie: tokenCookie }
+    });
+    assert.equal(tokenDashboard.status, 200);
+
     const html = await fetch(dashboard.url, { headers: { authorization: "Bearer team-secret" } });
     assert.equal(html.status, 200);
     assert.equal(html.headers.get("x-frame-options"), "DENY");
     assert.match(html.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
-    assert.match(await html.text(), /Example Team/);
+    const dashboardHtml = await html.text();
+    assert.match(dashboardHtml, /Example Team/);
+    assert.match(dashboardHtml, /Project integrations/);
+    assert.match(dashboardHtml, /href="\/\?project=acme%2Fpayments-api"/);
+
+    const filteredDashboard = await fetch(new URL("?project=acme%2Fpayments-api", dashboard.url), {
+      headers: { authorization: "Bearer team-secret" }
+    });
+    assert.equal(filteredDashboard.status, 200);
+    assert.match(await filteredDashboard.text(), /href="\/">All projects/);
+
+    const projectPage = await fetch(new URL("projects", dashboard.url), { headers: { authorization: "Bearer team-secret" } });
+    assert.equal(projectPage.status, 200);
+    assert.match(await projectPage.text(), /Create Credential/);
 
     const summary = await fetch(new URL("api/summary", dashboard.url), { headers: { authorization: "Bearer team-secret" } });
     assert.equal(summary.status, 200);
@@ -57,6 +96,79 @@ test("serves team dashboard HTML and token-protected summaries", async (context)
 
     const health = await fetch(new URL("healthz", dashboard.url));
     assert.equal(health.status, 200);
+  } finally {
+    await dashboard.close();
+  }
+});
+
+test("administers project custom rules and limits downloads to the matching CI credential", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-project-rules-server-"));
+  const dbPath = path.join(directory, "findings.db");
+  const store = new SqliteFindingStore(dbPath);
+  const credential = store.issueProjectIngestCredential("acme/payments-api");
+  assert.ok(credential);
+  store.close();
+
+  const dashboard = await startFindingsDashboardServer({ dbPath, port: 0, token: "team-secret" });
+  const yaml = `rules:
+  - id: company_no_example
+    pattern: example-insecure-setting
+    severity: medium
+    type: insecure_config
+    layer: L1
+    message: Use the approved configuration.
+`;
+  try {
+    const saved = await fetch(new URL("api/project-rules", dashboard.url), {
+      method: "PUT",
+      headers: { authorization: "Bearer team-secret", "content-type": "application/json" },
+      body: JSON.stringify({ project: "acme/payments-api", yaml })
+    });
+    assert.equal(saved.status, 200);
+    const savedRules = await saved.json() as { project: string; yaml: string; ruleCount: number; updatedAt: number };
+    assert.equal(savedRules.project, "acme/payments-api");
+    assert.equal(savedRules.yaml, yaml);
+    assert.equal(savedRules.ruleCount, 1);
+    assert.ok(savedRules.updatedAt > 0);
+
+    const listed = await fetch(new URL("api/project-rules", dashboard.url), { headers: { authorization: "Bearer team-secret" } });
+    assert.equal(listed.status, 200);
+    const rules = await listed.json() as Array<{ project: string; ruleCount: number; updatedAt: number; yaml?: string }>;
+    assert.deepEqual(rules.map((rule) => ({ project: rule.project, ruleCount: rule.ruleCount })), [{ project: "acme/payments-api", ruleCount: 1 }]);
+    assert.equal("yaml" in rules[0], false);
+
+    const downloaded = await fetch(new URL("api/project-rules/download?project=acme%2Fpayments-api", dashboard.url), {
+      headers: { authorization: `Bearer ${credential.token}` }
+    });
+    assert.equal(downloaded.status, 200);
+    assert.match(downloaded.headers.get("content-type") ?? "", /^text\/yaml/);
+    assert.equal(await downloaded.text(), yaml);
+
+    const crossProject = await fetch(new URL("api/project-rules/download?project=acme%2Fother", dashboard.url), {
+      headers: { authorization: `Bearer ${credential.token}` }
+    });
+    assert.equal(crossProject.status, 403);
+
+    const invalid = await fetch(new URL("api/project-rules", dashboard.url), {
+      method: "PUT",
+      headers: { authorization: "Bearer team-secret", "content-type": "application/json" },
+      body: JSON.stringify({ project: "acme/payments-api", yaml: "rules: invalid" })
+    });
+    assert.equal(invalid.status, 400);
+
+    const deleted = await fetch(new URL("api/project-rules?project=acme%2Fpayments-api", dashboard.url), {
+      method: "DELETE",
+      headers: { authorization: "Bearer team-secret" }
+    });
+    assert.equal(deleted.status, 200);
+    const unavailable = await fetch(new URL("api/project-rules/download?project=acme%2Fpayments-api", dashboard.url), {
+      headers: { authorization: `Bearer ${credential.token}` }
+    });
+    assert.equal(unavailable.status, 404);
   } finally {
     await dashboard.close();
   }
@@ -94,6 +206,7 @@ test("uses OIDC PKCE sign-in and enforces dashboard roles", async (context) => {
       issuer,
       clientId: "vibeguard-dashboard",
       sessionSecret,
+      publicUrl: "https://guard.example.test",
       roleMappings: { "security-analysts": "analyst" },
       fetcher: async (input, init) => {
         const target = String(input);
@@ -130,6 +243,11 @@ test("uses OIDC PKCE sign-in and enforces dashboard roles", async (context) => {
   });
   let activeNonce = "";
   try {
+    const serviceTokenLogin = await fetch(new URL("?token=break-glass-token", dashboard.url), { redirect: "manual" });
+    assert.equal(serviceTokenLogin.status, 302);
+    assert.equal(serviceTokenLogin.headers.get("location"), "/");
+    assert.match(serviceTokenLogin.headers.get("set-cookie") ?? "", /HttpOnly; SameSite=Strict; Path=\/; Secure/);
+
     const projectRootLogin = await fetch(new URL("?project=acme%2Fpayments-api", dashboard.url), { redirect: "manual" });
     assert.equal(projectRootLogin.status, 302);
     const projectReturn = new URL(projectRootLogin.headers.get("location") ?? "", dashboard.url);
@@ -140,6 +258,7 @@ test("uses OIDC PKCE sign-in and enforces dashboard roles", async (context) => {
     assert.equal(login.status, 302);
     const loginLocation = new URL(login.headers.get("location") ?? "");
     assert.equal(loginLocation.origin, issuer);
+    assert.equal(loginLocation.searchParams.get("redirect_uri"), "https://guard.example.test/auth/callback");
     assert.equal(loginLocation.searchParams.get("code_challenge_method"), "S256");
     assert.ok(loginLocation.searchParams.get("code_challenge"));
 
@@ -174,6 +293,10 @@ test("uses OIDC PKCE sign-in and enforces dashboard roles", async (context) => {
     assert.equal(analystCompliance.status, 200);
     const analystAudit = await fetch(new URL("api/audit", dashboard.url), { headers: { cookie: sessionCookie } });
     assert.equal(analystAudit.status, 403);
+    const analystProjects = await fetch(new URL("api/projects", dashboard.url), { headers: { cookie: sessionCookie } });
+    assert.equal(analystProjects.status, 403);
+    const analystProjectPage = await fetch(new URL("projects", dashboard.url), { headers: { cookie: sessionCookie } });
+    assert.equal(analystProjectPage.status, 403);
 
     const viewerSession = signedDashboardSession({ sub: "viewer-1", role: "viewer", exp: Math.floor(Date.now() / 1000) + 60 }, sessionSecret);
     const denied = await fetch(new URL("api/findings", dashboard.url), { headers: { cookie: viewerSession } });

@@ -141,6 +141,14 @@ test("summarizes findings history for trend dashboards", async (context) => {
   assert.equal(summary.activeCount, 4);
   assert.equal(summary.dismissedCount, 2);
   assert.equal(summary.latestScanAt, dayTwo);
+  assert.deepEqual(summary.latestScanDelta, {
+    previousScanId: "day_one",
+    currentScanId: "day_two",
+    currentCompletedAt: dayTwo,
+    introducedCount: 2,
+    resolvedCount: 2,
+    persistentCount: 0
+  });
   assert.equal(highSeverity?.count, 3);
   assert.equal(highSeverity?.activeCount, 2);
   assert.equal(highSeverity?.dismissedCount, 1);
@@ -170,6 +178,12 @@ test("summarizes findings history for trend dashboards", async (context) => {
   assert.equal(summary.topRules.length, 2);
   assert.equal(summary.topRules[0].key, "sast_sql_template_interpolation");
   assert.equal(summary.topRules[0].count, 3);
+  assert.equal(summary.topRules[0].falsePositiveCount, 1);
+  assert.equal(summary.topRules[0].falsePositiveRate, 1 / 3);
+  assert.deepEqual(
+    summary.falsePositiveRules.map((rule) => [rule.key, rule.falsePositiveCount, rule.falsePositiveRate]),
+    [["sast_sql_template_interpolation", 1, 1 / 3]]
+  );
   assert.deepEqual(
     summary.trend.map((point) => [point.date, point.scanCount, point.findingCount, point.activeCount, point.dismissedCount]),
     [
@@ -182,6 +196,11 @@ test("summarizes findings history for trend dashboards", async (context) => {
   assert.equal(recentSummary.scanCount, 1);
   assert.equal(recentSummary.findingCount, 4);
   assert.equal(recentSummary.dismissedReasonCounts.length, 2);
+  assert.equal(recentSummary.latestScanDelta, undefined);
+  assert.deepEqual(
+    recentSummary.falsePositiveRules.map((rule) => [rule.key, rule.falsePositiveCount, rule.falsePositiveRate]),
+    [["sast_sql_template_interpolation", 1, 1 / 2]]
+  );
   assert.deepEqual(recentSummary.trend.map((point) => point.date), ["2026-01-02"]);
   store.close();
 });
@@ -266,6 +285,76 @@ test("stores bounded dashboard audit events without authentication material", as
   store.close();
 });
 
+test("issues, rotates, and revokes project-scoped ingest credentials without storing raw tokens", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-project-credentials-"));
+  const dbPath = path.join(tempDir, "findings.db");
+  const store = new SqliteFindingStore(dbPath);
+  const first = store.issueProjectIngestCredential("acme/payments-api");
+  assert.ok(first);
+  assert.equal(first.created, true);
+  assert.match(first.token, /^vgpi_/);
+  assert.equal(store.projectForIngestToken(first.token), "acme/payments-api");
+  assert.equal(store.issueProjectIngestCredential("acme/payments-api"), undefined);
+
+  const rotated = store.issueProjectIngestCredential("acme/payments-api", true);
+  assert.ok(rotated);
+  assert.equal(rotated.created, false);
+  assert.notEqual(rotated.token, first.token);
+  assert.equal(store.projectForIngestToken(first.token), undefined);
+  assert.equal(store.projectForIngestToken(rotated.token), "acme/payments-api");
+  assert.deepEqual(store.listProjectIngestCredentials().map((item) => item.project), ["acme/payments-api"]);
+  store.close();
+
+  const database = new DatabaseSync(dbPath);
+  const persisted = database.prepare("SELECT token_hash FROM project_ingest_credential").get();
+  database.close();
+  assert.equal(typeof persisted?.token_hash, "string");
+  assert.equal(String(persisted?.token_hash).length, 64);
+  assert.equal(String(persisted?.token_hash).includes(rotated.token), false);
+
+  const reopened = new SqliteFindingStore(dbPath);
+  assert.equal(reopened.revokeProjectIngestCredential("acme/payments-api"), true);
+  assert.equal(reopened.projectForIngestToken(rotated.token), undefined);
+  assert.equal(reopened.revokeProjectIngestCredential("acme/payments-api"), false);
+  reopened.close();
+});
+
+test("stores project custom rules with bounded metadata and supports deletion", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-project-rules-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const yaml = `rules:
+  - id: company_no_example
+    pattern: example-insecure-setting
+    severity: medium
+    type: insecure_config
+    layer: L1
+    message: Use the approved configuration.
+`;
+
+  const saved = store.saveProjectCustomRules("acme/payments-api", yaml, 1);
+  assert.equal(saved.project, "acme/payments-api");
+  assert.equal(saved.ruleCount, 1);
+  assert.equal(saved.yaml, yaml);
+  assert.deepEqual(store.listProjectCustomRules().map((entry) => ({ project: entry.project, ruleCount: entry.ruleCount })), [
+    { project: "acme/payments-api", ruleCount: 1 }
+  ]);
+  assert.deepEqual(store.getProjectCustomRules("acme/payments-api"), saved);
+  assert.equal(store.deleteProjectCustomRules("acme/payments-api"), true);
+  assert.equal(store.getProjectCustomRules("acme/payments-api"), undefined);
+  assert.equal(store.deleteProjectCustomRules("acme/payments-api"), false);
+  store.close();
+});
+
 test("migrates legacy scan history and aggregates findings by project", async (context) => {
   if (!isFindingsStorageAvailable()) {
     context.skip("node:sqlite is not available in this runtime");
@@ -310,19 +399,37 @@ test("migrates legacy scan history and aggregates findings by project", async (c
     fileCount: 1,
     findings: [finding({ id: "web", severity: "medium" })]
   });
+  store.recordScanRun({
+    scanId: "gamma",
+    startedAt: 5,
+    completedAt: 6,
+    project: "acme/payments-api",
+    cwd: tempDir,
+    targetPaths: ["payments.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "payments" }), finding({ id: "payments-new" })]
+  });
 
   const all = store.summary({ topLimit: 10 });
   const payments = store.summary({ project: "acme/payments-api" });
   assert.deepEqual(
     all.projectCounts.map((project) => [project.key, project.scanCount, project.activeCount, project.highRiskCount]),
     [
-      ["acme/payments-api", 1, 1, 1],
+      ["acme/payments-api", 2, 3, 3],
       ["acme/web-app", 1, 1, 0]
     ]
   );
   assert.equal(payments.project, "acme/payments-api");
-  assert.equal(payments.scanCount, 1);
-  assert.equal(payments.findingCount, 1);
+  assert.equal(payments.scanCount, 2);
+  assert.equal(payments.findingCount, 3);
+  assert.deepEqual(payments.latestScanDelta, {
+    previousScanId: "alpha",
+    currentScanId: "gamma",
+    currentCompletedAt: 6,
+    introducedCount: 1,
+    resolvedCount: 0,
+    persistentCount: 1
+  });
   assert.equal(store.stats("acme/web-app").scanCount, 1);
   assert.equal(store.listFindings({ project: "acme/payments-api" })[0]?.project, "acme/payments-api");
   assert.equal(store.listScanRuns(10, "acme/web-app")[0]?.project, "acme/web-app");

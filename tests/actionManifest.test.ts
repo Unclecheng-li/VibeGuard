@@ -26,6 +26,8 @@ test("GitHub Action exposes findings dashboard and compliance report inputs and 
   assert.equal(manifest.inputs.findings_endpoint.default, "");
   assert.equal(manifest.inputs.findings_project.default, "");
   assert.equal(manifest.inputs.findings_token_env.default, "VIBEGUARD_FINDINGS_INGEST_TOKEN");
+  assert.equal(manifest.inputs.findings_rules_endpoint.default, "");
+  assert.equal(manifest.inputs.findings_rules_required.default, "false");
   assert.equal(manifest.inputs.findings_upload_required.default, "false");
   assert.match(manifest.inputs.llm_provider.description ?? "", /vibeguard/);
   assert.equal(manifest.outputs.dashboard_path.value, "${{ steps.vibeguard.outputs.dashboard_path }}");
@@ -39,5 +41,12 @@ test("GitHub Action exposes findings dashboard and compliance report inputs and 
   assert.match(runStep.run ?? "", /pulls\/\$pr_number\/reviews/);
   assert.match(runStep.run ?? "", /--findings-endpoint/);
   assert.match(runStep.run ?? "", /--findings-project/);
+  assert.match(runStep.run ?? "", /findings_rules_endpoint/);
+  assert.match(runStep.run ?? "", /--custom-rules/);
+  assert.match(runStep.run ?? "", /findings_rules_required/);
+  assert.match(
+    runStep.run ?? "",
+    /rules_status"\s*=\s*"404"\s*\]\s*&&\s*\[\s*"\$\{\{\s*inputs\.findings_rules_required\s*\}\}"\s*!=\s*"true"/
+  );
   assert.match(runStep.run ?? "", /--findings-upload-required/);
 });

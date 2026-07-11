@@ -201,7 +201,7 @@ export const semgrepExportRules: SemgrepExportRule[] = [
   {
     id: "insecure_config_eval",
     vibeguardRuleId: "insecure_config_eval",
-    languages: ["javascript", "typescript", "python"],
+    languages: ["javascript", "typescript", "python", "java"],
     severity: "high",
     detectionLayer: "L1",
     findingType: "insecure_config",
@@ -243,6 +243,17 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\bexecute\\s*\\(\\s*f[\"'][^\"']*(?:SELECT|INSERT|UPDATE|DELETE)\\b[^\"']*\\{[^}]+}[^\"']*[\"']"
   },
   {
+    id: "sast_sql_user_input_execute",
+    vibeguardRuleId: "sast_sql_user_input_execute",
+    languages: ["javascript", "typescript", "python", "java"],
+    severity: "high",
+    detectionLayer: "L2",
+    findingType: "sql_injection",
+    message: "Database execution receives a user-controlled SQL value without bound parameters.",
+    suggestion: "Use placeholders and pass request values as separate parameters.",
+    patternRegex: "\\b(?:(?:db|database|pool|connection|conn|client|cursor|session)\\.(?:query|execute|executemany)|(?:statement|preparedStatement|callableStatement)\\.(?:execute|executeQuery|executeUpdate))\\s*\\([^\\)\\n]*(?:req\\.(?:query|body|params)|request\\.(?:args|form|json)|request\\s*\\.\\s*(?:getParameter|getHeader|getQueryString)\\s*\\()"
+  },
+  {
     id: "sast_xss_inner_html",
     vibeguardRuleId: "sast_xss_inner_html",
     languages: ["javascript", "typescript"],
@@ -254,6 +265,17 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\.(?:innerHTML|outerHTML)\\s*=\\s*(?!DOMPurify|sanitizeHtml|sanitize)[^;\\n]+"
   },
   {
+    id: "sast_xss_dangerously_set_inner_html",
+    vibeguardRuleId: "sast_xss_dangerously_set_inner_html",
+    languages: ["javascript", "typescript"],
+    severity: "high",
+    detectionLayer: "L2",
+    findingType: "xss",
+    message: "dangerouslySetInnerHTML receives user-controlled HTML.",
+    suggestion: "Sanitize untrusted HTML with a well-reviewed sanitizer before rendering it.",
+    patternRegex: "dangerouslySetInnerHTML\\s*=\\s*\\{\\s*\\{\\s*__html\\s*:\\s*(?!DOMPurify|sanitizeHtml|sanitize)[^}]*\\breq\\.(?:query|body|params)\\b[^}]*}\\s*}"
+  },
+  {
     id: "sast_ssrf_fetch_user_url",
     vibeguardRuleId: "sast_ssrf_fetch_user_url",
     languages: ["javascript", "typescript", "python"],
@@ -262,7 +284,7 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     findingType: "ssrf",
     message: "HTTP request appears to use a user-controlled URL.",
     suggestion: "Allowlist outbound hosts and validate URL schemes before making server-side requests.",
-    patternRegex: "\\b(?:fetch|axios\\.(?:get|post)|requests\\.(?:get|post)|http\\.get)\\s*\\(\\s*(?:req\\.(?:query|body|params)|request\\.(?:args|form|json))"
+    patternRegex: "\\b(?:fetch|axios\\.(?:get|post|put|patch|delete|head)|got(?:\\.(?:get|post|put|patch|delete|head))?|undici\\.request|(?:http|https)\\.(?:get|request)|requests\\.(?:get|post|put|patch|delete|head)|httpx\\.(?:get|post|put|patch|delete|head)|urllib\\.request\\.urlopen)\\s*\\(\\s*(?:req\\.(?:query|body|params)|request\\.(?:args|form|json))|\\b(?:requests|httpx)\\.request\\s*\\(\\s*[^,\\n]+,\\s*(?:request\\.(?:args|form|json))|\\b(?:axios(?:\\.request)?|(?:http|https)\\.request)\\s*\\(\\s*\\{[^}\\n]*\\b(?:url|uri|baseURL|host|hostname)\\s*:\\s*(?:req\\.(?:query|body|params))"
   },
   {
     id: "sast_path_traversal_fs_user_input",
@@ -273,7 +295,7 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     findingType: "path_traversal",
     message: "File path appears to include user-controlled input.",
     suggestion: "Resolve paths against a fixed base directory and reject traversal outside that directory.",
-    patternRegex: "\\b(?:fs\\.(?:readFile|readFileSync|createReadStream)|open|Path\\(|send_file)\\s*\\([^\\)\\n]*(?:req\\.(?:query|body|params)|request\\.(?:args|form|json)|params?\\[)"
+    patternRegex: "\\b(?:fs(?:\\.promises)?\\.(?:readFile|readFileSync|createReadStream|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rm|rmSync)|open|Path\\(|send_file)\\s*\\([^\\)\\n]*(?:req\\.(?:query|body|params)|request\\.(?:args|form|json)|params?\\[)"
   },
   {
     id: "sast_insecure_deserialization_pickle",
@@ -287,15 +309,26 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\bpickle\\.loads?\\s*\\([^\\)\\n]*(?:request|req\\.|input|body|data)"
   },
   {
+    id: "sast_insecure_deserialization_java_object_input_stream",
+    vibeguardRuleId: "sast_insecure_deserialization_java_object_input_stream",
+    languages: ["java"],
+    severity: "high",
+    detectionLayer: "L2",
+    findingType: "insecure_deserialization",
+    message: "ObjectInputStream deserializes data directly from an HTTP request.",
+    suggestion: "Use a safe data format such as JSON and validate the request body before processing it.",
+    patternRegex: "\\bnew\\s+ObjectInputStream\\s*\\(\\s*request\\s*\\.\\s*(?:getInputStream|getReader)\\s*\\("
+  },
+  {
     id: "sast_command_injection_os_system",
     vibeguardRuleId: "sast_command_injection_os_system",
-    languages: ["javascript", "typescript", "python"],
+    languages: ["javascript", "typescript", "python", "java"],
     severity: "high",
     detectionLayer: "L2",
     findingType: "command_injection",
     message: "Command execution appears to include user-controlled input.",
     suggestion: "Use argument arrays, strict allowlists, and avoid shell=True or string commands.",
-    patternRegex: "\\b(?:os\\.system|subprocess\\.(?:call|run|Popen)|child_process\\.exec)\\s*\\([^\\)\\n]*(?:request|req\\.|input|body|params|\\$\\{)"
+    patternRegex: "\\b(?:os\\.system|subprocess\\.(?:call|run|Popen|check_call|check_output)|child_process\\.exec(?:Sync)?)\\s*\\([^\\)\\n]*(?:request|req\\.|input|body|params|\\$\\{)|\\b(?:Runtime\\s*\\.\\s*getRuntime\\s*\\(\\s*\\)\\s*\\.\\s*exec|new\\s+ProcessBuilder)\\s*\\([^\\)\\n]*request\\s*\\.\\s*(?:getParameter|getHeader|getQueryString)\\s*\\("
   },
   {
     id: "sast_open_redirect_user_input",
@@ -315,9 +348,9 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     severity: "low",
     detectionLayer: "L2",
     findingType: "information_leakage",
-    message: "Detailed error information is returned to the client.",
-    suggestion: "Return a generic error response and log stack traces or exception details server-side only.",
-    patternRegex: "\\b(?:res|response)\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\b(?:res|response)\\.status\\s*\\(\\s*500\\s*\\)\\s*\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\breturn\\s+(?:traceback\\.format_exc\\s*\\(\\s*\\)|str\\s*\\(\\s*(?:err(?:or)?|exception|e)\\s*\\))"
+    message: "Detailed error or sensitive diagnostic information is returned to the client.",
+    suggestion: "Return a generic error response and log stack traces, SQL, and sensitive diagnostics server-side only.",
+    patternRegex: "\\b(?:res|response)\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\b(?:res|response)\\.status\\s*\\(\\s*500\\s*\\)\\s*\\.(?:send|json)\\s*\\([^;\\n]*(?:err(?:or)?|exception)\\.(?:stack|message)|\\breturn\\s+(?:traceback\\.format_exc\\s*\\(\\s*\\)|str\\s*\\(\\s*(?:err(?:or)?|exception|e)\\s*\\))|\\b(?:res|response)(?:\\.status\\s*\\(\\s*5\\d\\d\\s*\\))?\\.(?:send|json)\\s*\\([^;\\n]*(?:\\b(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\\s*:|\\(\\s*(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\\b)|\\breturn\\s*\\{[^}\\n]*(?:\\b(?:error|detail|message)\\s*:[^}\\n]+,\\s*)?\\b(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\\s*:"
   }
 ];
 

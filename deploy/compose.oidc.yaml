@@ -1,0 +1,41 @@
+services:
+  dashboard:
+    command:
+      - findings
+      - serve
+      - --db
+      - /data/findings.db
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --token-env
+      - VIBEGUARD_DASHBOARD_TOKEN
+      - --ingest-token-env
+      - VIBEGUARD_FINDINGS_INGEST_TOKEN
+      - --public-url
+      - ${VIBEGUARD_PUBLIC_URL:?Set the public HTTPS dashboard URL}
+      - --secure-cookies
+      - --oidc-issuer-env
+      - VIBEGUARD_OIDC_ISSUER
+      - --oidc-client-id-env
+      - VIBEGUARD_OIDC_CLIENT_ID
+      - --oidc-client-secret-env
+      - VIBEGUARD_OIDC_CLIENT_SECRET
+      - --oidc-session-secret-env
+      - VIBEGUARD_OIDC_SESSION_SECRET
+      - --oidc-role-claim
+      - ${VIBEGUARD_OIDC_ROLE_CLAIM:-groups}
+      - --oidc-role
+      - ${VIBEGUARD_OIDC_ANALYST_ROLE:?Set an upstream analyst role}=analyst
+      - --oidc-role
+      - ${VIBEGUARD_OIDC_ADMIN_ROLE:?Set an upstream administrator role}=admin
+    environment:
+      VIBEGUARD_PUBLIC_URL: ${VIBEGUARD_PUBLIC_URL:?Set the public HTTPS dashboard URL}
+      VIBEGUARD_OIDC_ISSUER: ${VIBEGUARD_OIDC_ISSUER:?Set the OIDC issuer URL}
+      VIBEGUARD_OIDC_CLIENT_ID: ${VIBEGUARD_OIDC_CLIENT_ID:?Set the OIDC client ID}
+      VIBEGUARD_OIDC_CLIENT_SECRET: ${VIBEGUARD_OIDC_CLIENT_SECRET:?Set the OIDC client secret}
+      VIBEGUARD_OIDC_SESSION_SECRET: ${VIBEGUARD_OIDC_SESSION_SECRET:?Set a long session signing secret}
+      VIBEGUARD_OIDC_ROLE_CLAIM: ${VIBEGUARD_OIDC_ROLE_CLAIM:-groups}
+      VIBEGUARD_OIDC_ANALYST_ROLE: ${VIBEGUARD_OIDC_ANALYST_ROLE:?Set an upstream analyst role}
+      VIBEGUARD_OIDC_ADMIN_ROLE: ${VIBEGUARD_OIDC_ADMIN_ROLE:?Set an upstream administrator role}

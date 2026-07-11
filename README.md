@@ -7,7 +7,7 @@ This repository implements the core `VibeGuard-PRD.md` roadmap through L3 and th
 - VSCode extension shell with real-time diagnostics and a findings sidebar
 - JetBrains plugin module that starts the same bundled LSP server for supported source files
 - L1 scanner for npm/PyPI/Cargo/Go/Maven hallucinated packages, hardcoded secrets, loose config, and expanded AI error patterns
-- Tree-sitter WASM-backed L2 SAST rules for JavaScript, TypeScript, and Python injection, XSS, unsafe deserialization, redirects, and information leakage, with regex fallback for other languages and incomplete edits
+- Tree-sitter WASM-backed L2 SAST rules for JavaScript, TypeScript, and Python injection, XSS, unsafe deserialization, redirects, and information leakage, plus high-confidence Java direct-request checks for JDBC, process execution, and ObjectInputStream deserialization
 - Optional L3 semantic checks with DeepSeek, Claude, OpenAI-compatible, local Ollama, or VibeGuard Pro providers, plus local heuristic fallback
 - Local package verification cache with offline seed mode and optional remote npm/PyPI checks
 - Local SQLite scan history in `~/.vibeguard/findings.db`
@@ -38,6 +38,15 @@ The distribution ZIP is written to `jetbrains/build/distributions/`. Node.js 18 
 `VIBEGUARD_NODE_PATH` or `VIBEGUARD_LSP_PATH` to override the Node executable or LSP script in managed environments.
 See [jetbrains/README.md](jetbrains/README.md) for supported file types and Windows instructions.
 
+## Marketplace Release
+
+The `Marketplace Release` workflow packages both editor extensions on every manual dispatch and uploads the VSIX and
+JetBrains ZIP as workflow artifacts. Pushing an exact version tag such as `v0.1.0` additionally publishes those packages
+after checking that `package.json` and `jetbrains/build.gradle.kts` use the same version. Configure `VSCE_PAT` and
+`JETBRAINS_MARKETPLACE_TOKEN` as GitHub repository secrets; neither token is stored in the repository or used by normal CI.
+Use the Gradle property `-PjetbrainsChannel=eap` to publish a non-default JetBrains Marketplace channel when running the
+publish task outside the workflow.
+
 ## Docker
 
 The Docker image packages the CLI, LSP bundle, and Tree-sitter WASM grammars for a reproducible CI or private deployment
@@ -65,7 +74,8 @@ VIBEGUARD_DASHBOARD_TOKEN=replace-with-a-long-random-value \
 
 For enterprise deployments, use a standards-based OpenID Connect provider. VibeGuard uses authorization code flow with
 PKCE, validates signed ID tokens against the provider JWKS, and stores only a short-lived signed HttpOnly dashboard
-session. Register `<public-url>/auth/callback` as the provider callback URL.
+session. Register `<public-url>/auth/callback` as the provider callback URL. `--public-url` must be a bare HTTPS origin;
+HTTP is accepted only for localhost development.
 
 ```bash
 export VIBEGUARD_OIDC_ISSUER=https://id.example.com
@@ -91,7 +101,9 @@ with `/api/findings?all=true` and inspect `/api/audit`. `/api/session` exposes t
 remains unauthenticated for container orchestration.
 
 The service-token flow grants `admin` access. A browser can authenticate it through a reverse proxy, or a one-time
-`/?token=<service-token>` visit sets an HttpOnly token cookie for that dashboard origin. Prefer OIDC for normal users.
+`/?token=<service-token>` visit sets an HttpOnly, SameSite=Strict token cookie for that dashboard origin; it is also
+marked `Secure` whenever the public origin uses HTTPS, then redirects to the same URL without the token. Prefer OIDC for
+normal users.
 
 For a Docker deployment, mount the directory that holds `findings.db` and publish the dashboard port:
 
@@ -100,6 +112,29 @@ docker run --rm -p 8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN \
   -v "$PWD/.vibeguard:/data" vibeguard:local \
   findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
 ```
+
+### Private Deployment Compose
+
+`deploy/compose.yaml` packages the private dashboard as a long-running Compose service with a persistent SQLite volume,
+health check, disabled privilege escalation, dropped Linux capabilities, and a default `127.0.0.1` host binding. Its
+required environment-variable names and non-secret defaults are documented in `deploy/.env.example`.
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
+docker compose --env-file deploy/.env -f deploy/compose.yaml logs -f dashboard
+```
+
+To use the enterprise OIDC flow, place the dashboard behind an HTTPS reverse proxy and merge the OIDC override. It enables
+secure cookies and requires a bare HTTPS public origin, issuer, confidential client credentials, session secret, and analyst/
+administrator role mappings from the same environment file.
+
+```bash
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml -f deploy/compose.oidc.yaml up -d --build
+```
+
+The service-token and CI ingest-token values remain separate in both configurations. Keep the default loopback bind unless
+a private reverse proxy or network policy is in front of the service.
 
 ### Central CI Ingestion
 
@@ -111,8 +146,36 @@ as `findings.ingested` audit events without credentials.
 
 Every upload may carry a stable project identifier. Use `--findings-project` from a generic CLI environment; the GitHub
 Action defaults it to `GITHUB_REPOSITORY` and exposes `findings_project` only for overrides. The team dashboard renders a
-project-risk table. Use `--project <id>` with CLI history commands or `findings serve` to pin a view, or add
+project-risk table whose assigned project names link to the matching filtered view. Use `--project <id>` with CLI history commands or `findings serve` to pin a view, or add
 `?project=<id>` to authenticated dashboard summary, findings, compliance, or HTML requests when the server is not pinned.
+
+For team-level CI governance, an administrator can issue one project-scoped ingest credential through the protected
+`/api/projects` endpoint. The raw token is returned only when it is created or rotated; SQLite stores only its SHA-256
+digest. A project token can upload only when `scan.project` exactly matches its assigned project, and revocation immediately
+rejects further uploads. The legacy global ingest token remains available as a break-glass or migration credential.
+Administrators can manage the same credential lifecycle from the `Project integrations` link in the protected dashboard;
+the page displays each newly created or rotated token only once, provides a copy action without browser storage, and renders
+a copyable GitHub Action fragment that references the dedicated CI secret without embedding the raw token. The same page
+also manages per-project custom-rule YAML. Rules are parsed before saving, limited to 100 rules and 256 KiB per project,
+and can be downloaded only by a dashboard administrator, the break-glass ingest credential, or the matching project
+credential. CI receives the rules through the separate `GET /api/project-rules/download?project=<id>` endpoint; a missing
+project rule set is treated as intentionally unconfigured unless the workflow marks it required.
+
+```bash
+# Create: returns { project, token, createdAt, updatedAt, created } once.
+curl --fail-with-body -X POST https://guard.example.com/api/projects \
+  -H "Authorization: Bearer $VIBEGUARD_DASHBOARD_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"project":"acme/payments-api"}'
+
+# Rotate an existing credential, or revoke it.
+curl --fail-with-body -X POST https://guard.example.com/api/projects \
+  -H "Authorization: Bearer $VIBEGUARD_DASHBOARD_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"project":"acme/payments-api","rotate":true}'
+curl --fail-with-body -X DELETE 'https://guard.example.com/api/projects?project=acme%2Fpayments-api' \
+  -H "Authorization: Bearer $VIBEGUARD_DASHBOARD_TOKEN"
+```
 
 ```bash
 export VIBEGUARD_DASHBOARD_TOKEN=replace-with-break-glass-token
@@ -189,7 +252,7 @@ node dist/cli.js findings audit --limit 100
 node dist/cli.js rules export-semgrep --output vibeguard-semgrep.yml
 ```
 
-`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM and expects structured JSON findings; without credentials, it falls back to conservative local heuristics for missing authentication, rate limiting, input validation, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VIBEGUARD_LLM_API_KEY`, or `VIBEGUARD_PRO_API_KEY`; the CLI intentionally has no plaintext API-key flag.
+`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM with detected framework, function, and route context and expects structured JSON findings; before source is sent to a remote provider, high-confidence secret literals are replaced with a placeholder, including complete private-key blocks. Local Ollama analysis keeps the source local and does not apply this transport redaction. Without credentials, VibeGuard falls back to conservative local heuristics for missing authentication, rate limiting, input validation, parameterized database queries, IO error handling, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VIBEGUARD_LLM_API_KEY`, or `VIBEGUARD_PRO_API_KEY`; the CLI intentionally has no plaintext API-key flag.
 
 Provider controls:
 
@@ -201,7 +264,9 @@ node dist/cli.js scan src --l3 --llm-provider local --llm-base-url http://localh
 VIBEGUARD_PRO_API_KEY=... node dist/cli.js scan src --l3 --llm-provider vibeguard
 ```
 
-The L1 secret scanner combines provider-specific signatures for keys and tokens, sensitive assignment context such as `apiKey`, `clientSecret`, `Authorization`, and `webhookSecret`, Shannon-entropy scoring for random-looking literals, and false-positive filters for placeholders, hashes, fixtures, UUIDs, and normal encoded data. High-confidence JavaScript/TypeScript and Python secret assignments include quick fixes that replace committed literals with environment-variable reads. The AI pattern library covers common generated-code mistakes such as placeholder credentials, unsafe JWT handling, wildcard CORS with credentials, disabled TLS verification, weak password hashing, plaintext password comparison, insecure random token generation, placeholder framework secrets, and public object-storage ACLs. L2 covers high-confidence SQL injection, XSS, SSRF, path traversal, unsafe deserialization, command injection, open redirect, and error-detail leakage patterns. High-confidence `innerHTML` and unsafe `yaml.load()` findings include mechanical quick fixes.
+Remote LLM base URLs must use HTTPS. HTTP is accepted only for `localhost`, `127.0.0.1`, or IPv6 loopback development endpoints; redirects, URL credentials, query parameters, and fragments are rejected before source or API credentials are sent.
+
+The L1 secret scanner combines provider-specific signatures for keys and tokens, sensitive assignment context such as `apiKey`, `clientSecret`, `Authorization`, and `webhookSecret`, Shannon-entropy scoring for random-looking literals, and false-positive filters for placeholders, hashes, fixtures, UUIDs, and normal encoded data. High-confidence JavaScript/TypeScript and Python secret assignments include quick fixes that replace committed literals with environment-variable reads. The AI pattern library covers common generated-code mistakes such as placeholder credentials, unsafe JWT handling, wildcard CORS with credentials, disabled TLS verification, weak password hashing, plaintext password comparison, insecure random token generation, placeholder framework secrets, and public object-storage ACLs. L2 covers high-confidence SQL injection, XSS, SSRF, path traversal, unsafe deserialization, command injection, open redirect, and error-detail leakage patterns; SSRF covers request-controlled targets across Fetch, Axios, Node HTTP(S), Requests, HTTPX, and common methods, command injection includes synchronous Node and Python execution APIs, while path traversal includes Node `fs` and `fs.promises` reads, writes, appends, streams, and deletes whose paths are user-controlled. High-confidence `innerHTML` and unsafe `yaml.load()` findings include mechanical quick fixes.
 
 Use `--markdown path` to write a PR-friendly Markdown report alongside the normal console output, or `--format markdown` to make Markdown the primary output. CLI JSON, human, and Markdown reports include per-scan performance totals, layer timing totals, the slowest file, and warnings when L1/L2/L3 exceed the PRD performance budgets.
 
@@ -240,6 +305,8 @@ node dist/cli.js config path
 
 Relative `custom_rules` paths resolve from the config file directory. Use `--config path/to/config.json` for a project-specific file or `--no-config` to run with built-in defaults only.
 
+Set `telemetry` to `true` only when you want to contribute anonymous false-positive feedback. VibeGuard sends an event only after a user selects the standard `False positive` dismissal reason. The event includes a truncated SHA-256 rule fingerprint, finding type/layer/severity, and ignore scope; it never includes source code, evidence, package names, file paths, line numbers, project identifiers, authors, finding IDs, or free-form reasons. Delivery failures do not block scans or ignore actions. The default destination is the VibeGuard HTTPS telemetry endpoint; `VIBEGUARD_TELEMETRY_ENDPOINT` can override it for approved localhost development or a private HTTPS collector.
+
 `dedup_with_existing_tools` dismisses duplicate L2 findings when nearby SonarQube, Snyk, Semgrep, or CodeQL annotations already cover the same issue. Override it in the CLI with `--dedup-existing-tools` or `--no-dedup-existing-tools`.
 
 Use `ignored_findings` for exact finding-id dismissals. The CLI can maintain this list without hand-editing JSON:
@@ -267,7 +334,7 @@ node dist/cli.js scan . --findings-db ~/.vibeguard/findings.db
 node dist/cli.js scan . --no-store-findings
 ```
 
-`findings summary` aggregates stored history by severity, type, top detection rules, dismissal reason, git author, and daily trend, providing a stable JSON shape for CI summaries or a future team dashboard. CLI and VSCode scans record the latest git author for files with findings when git history is available, so the summary and dashboard can surface developer risk hotspots. `findings dashboard` writes a standalone HTML dashboard with the same trend, author, and dismissal-reason data, suitable for CI artifacts, team reports, false-positive review, or offline review. VSCode users can run `VibeGuard: Export Findings Dashboard` to generate and open the same dashboard from the command palette.
+`findings summary` aggregates stored history by severity, type, top detection rules, dismissal reason, git author, daily trend, and the active-finding delta between the latest two scans. It also records per-rule false-positive counts and rates only when dismissals use the standard `False positive` reason; a dedicated list sorts these rules by rate so teams can prioritize rule-quality work. The delta separates introduced, resolved, and persistent risks, scoped to the selected project and reporting window. CLI and VSCode scans record the latest git author for files with findings when git history is available, so the summary and dashboard can surface developer risk hotspots. `findings dashboard` writes a standalone HTML dashboard with the same trend, author, dismissal-reason, scan-delta, and rule-feedback data, suitable for CI artifacts, team reports, false-positive review, or offline review. VSCode users can run `VibeGuard: Export Findings Dashboard` to generate and open the same dashboard from the command palette.
 
 `findings compliance` writes a source-free Markdown evidence report for `soc2`, `iso27001`, or both. It maps scan
 history to selected control objectives, open mapped findings, trend cadence, top rules, and dismissal reasons. The report
@@ -286,7 +353,7 @@ GitHub Action scans default to `store_findings: false` so CI jobs do not write l
 
 ## Package Index
 
-The scanner can use a local package-name index before falling back to the seed catalog or remote registry checks. Partial indexes act as an existence cache; full indexes can also prove that a package is missing and suggest close package names for typos or slopsquatting-like hallucinations. Seed mode includes npm, PyPI, Cargo, Go modules, and Maven coordinates; remote registry lookups currently cover npm and PyPI. Local package-name sync can populate indexes for npm, PyPI, Cargo, Go modules, and Maven.
+The scanner can use a local package-name index before falling back to the seed catalog or remote registry checks. Partial indexes act as an existence cache; full indexes can also prove that a package is missing and suggest close package names for typos or slopsquatting-like hallucinations. Python scanning recognizes imports, dependency manifests, executable `pip install` automation calls, notebook-style `!pip install` commands, shell and PowerShell scripts, Dockerfiles, and YAML CI commands. Java dependency parsing supports Maven POM files, Gradle build scripts, and Gradle `*.versions.toml` catalogs with `module`, `group`/`name`, or direct coordinates. Seed mode includes npm, PyPI, Cargo, Go modules, and Maven coordinates; remote registry lookups currently cover npm and PyPI. Local package-name sync can populate indexes for npm, PyPI, Cargo, Go modules, and Maven.
 
 ```bash
 node dist/cli.js packages import npm ./npm-packages.txt --partial --storage sqlite
@@ -310,9 +377,9 @@ When a package is absent from a full local index, VibeGuard combines curated see
 
 `packages sync-config` reads `package_cache.languages`, `package_cache.update_interval`, and `package_cache.lightweight_mode` from config.json. It skips fresh registries, refreshes stale registries, and upgrades partial indexes when lightweight mode is disabled. Use `--force` to refresh everything now, `--limit` to override the lightweight target, and `--url registry=URL` for a registry mirror or test fixture.
 
-The VSCode extension also starts a background package-cache sync on startup. On first run it shows a one-time cold-start note that secret, config, and AI-pattern checks are active immediately while the package-name cache prepares hallucinated-package detection. It prioritizes package managers detected in the current workspace, shows `VibeGuard: package sync` in the status bar while running, logs details to the VibeGuard output channel, and keeps other L1/L2/L3 checks active if the cache refresh fails. Run `VibeGuard: Sync Package Cache` from the command palette to force a refresh.
+The VSCode extension also starts a background package-cache sync on startup. On first run it shows a one-time cold-start note that secret, config, and AI-pattern checks are active immediately while the package-name cache prepares hallucinated-package detection. It prioritizes package managers detected in the current workspace, then queues the other configured registries in the same background sync. It shows the current registry plus completion percentage in the status bar while running, logs details to the VibeGuard output channel, and keeps other L1/L2/L3 checks active if the cache refresh fails. Run `VibeGuard: Sync Package Cache` from the command palette to force a refresh.
 
-In VSCode, normal edit-time scans run L1 immediately for fast feedback, then debounce L2 SAST for 500ms by default. When L3 is enabled, semantic analysis is debounced for 2 seconds after edits by default; saves and manual scans run all enabled layers immediately. Adjust these with `vibeguard.l2DebounceMs` and `vibeguard.l3DebounceMs`. The status bar tooltip includes recent scan timing totals and shows a watch marker when a file exceeds the L1/L2/L3 performance budget.
+In VSCode, normal edit-time scans run L1 immediately for fast feedback, then debounce L2 SAST for 500ms by default. When package verification is `remote`, edit-time scans first use local seed/cache results and schedule the remote npm/PyPI check independently after a 600ms delay from the latest automatic scan, so registry latency does not block diagnostics; the current document version must still match before any asynchronous result is shown. When L3 is enabled, semantic analysis is debounced for 2 seconds after edits by default; saves and manual scans run all enabled layers immediately. Adjust the analysis delays with `vibeguard.l2DebounceMs` and `vibeguard.l3DebounceMs`. The status bar tooltip includes recent scan timing totals and shows a watch marker when a file exceeds the L1/L2/L3 performance budget.
 
 Storage modes:
 
@@ -361,6 +428,8 @@ jobs:
           # findings_project: acme/security-platform
           findings_endpoint: https://guard.example.com/api/ingest
           findings_token_env: VIBEGUARD_FINDINGS_INGEST_TOKEN
+          findings_rules_endpoint: https://guard.example.com/api/project-rules/download?project=acme%2Fsecurity-platform
+          findings_rules_required: true
           findings_upload_required: true
           dashboard: true
           dashboard_path: vibeguard-dashboard.html
@@ -387,10 +456,16 @@ jobs:
 Package verification modes:
 
 - `seed`: instant, offline checks against the built-in known-good/known-hallucinated catalog
-- `remote`: seed + cached remote npm/PyPI verification with a 3 second timeout
+- `remote`: seed + cached remote npm/PyPI verification with a 3 second timeout and at most five in-flight registry requests; repeated references to the same package share one in-flight lookup. An unavailable registry produces a non-blocking warning instead of a hallucinated-package finding, and is retried on a later scan after connectivity recovers rather than cached as a package verdict
 - `off`: disables package existence checks
 
 For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `pr_review_comments: true` to create a single `COMMENT` review containing up to `pr_review_comment_limit` active findings on changed diff lines. It defaults to `false`, requires `pull-requests: write`, skips existing VibeGuard comments at the same path/line/rule, and never includes a finding's code evidence. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path. Set `findings_endpoint` to the private dashboard's `/api/ingest` endpoint and provide its dedicated token only through the environment variable named by `findings_token_env`; `findings_upload_required` is opt-in. Set `store_findings: true` with `dashboard: true` or `compliance: true` to generate the corresponding HTML dashboard or source-free compliance evidence artifact.
+
+Set `findings_rules_endpoint` to the private dashboard's project-rule download endpoint to append centrally managed YAML
+rules to the scan. The Action uses the same environment-backed project credential, accepts only HTTPS endpoints except
+loopback HTTP development, does not follow redirects, and never writes the token to output. A `404` means that no central
+rule set is configured for the project and leaves local `custom_rules` active; other download failures warn by default or
+fail the job with `findings_rules_required: true`.
 
 Set `mode: ai-code-scan` to analyze changed files but report only findings that overlap changed lines attributed to AI. VibeGuard parses zero-context diff hunks, uses `git blame` on the checked-out head for line attribution, and reads the blamed commit message only when `ai_detection: message` or `aggressive` needs it. `author` matches the blamed author, `message` matches the blamed commit body or trailers, and `aggressive` includes either signal plus additions of 50 or more lines. When git history or blame cannot be inspected, VibeGuard falls back to a full scan so CI does not silently miss findings.
 
@@ -450,7 +525,7 @@ rules:
     suggestion: "Use private ACLs and bucket policies."
 ```
 
-Use `--custom-rules ./vibeguard-rules.yml` in the CLI, `custom_rules` in `config.json`, `custom_rules` in the Action, or `vibeguard.customRules` in VSCode. Custom findings use rule ids like `custom.company_public_s3_acl`, so they can be ignored with the normal ignore-rules.yml flow.
+Use `--custom-rules ./vibeguard-rules.yml` in the CLI, `custom_rules` in `config.json`, `custom_rules` in the Action, or `vibeguard.customRules` in VSCode. Private-dashboard administrators can additionally save a validated project ruleset through `Project integrations` and give CI its `findings_rules_endpoint`; Action scans merge that downloaded ruleset with local custom rules. Custom findings use rule ids like `custom.company_public_s3_acl`, so they can be ignored with the normal ignore-rules.yml flow.
 
 ## LSP Server
 
@@ -500,7 +575,7 @@ Dashboard command:
 
 ## VSCode Quick Fixes
 
-VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, and high-confidence `innerHTML` to `textContent` cases. `VibeGuard: Apply All Safe Fixes in Current File` applies non-overlapping L1/L2 mechanical fixes in one reviewed operation, prioritizing higher severities and excluding L3 replacements. L3 replacements supplied by an LLM are deliberately non-preferred and require confirmation in VSCode. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
+VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, explicitly SQLite-backed single-expression SQL f-strings to parameterized `execute()` calls, and high-confidence `innerHTML` to `textContent` cases. `VibeGuard: Apply All Safe Fixes in Current File` applies non-overlapping L1/L2 mechanical fixes in one reviewed operation, prioritizing higher severities and excluding L3 replacements. L3 replacements supplied by an LLM are deliberately non-preferred and require confirmation in VSCode. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
 
 ## Scope Notes
 

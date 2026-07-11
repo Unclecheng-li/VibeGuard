@@ -23,3 +23,13 @@ executable or server location with `VIBEGUARD_NODE_PATH` and `VIBEGUARD_LSP_PATH
 Open a supported JavaScript, TypeScript, Python, Rust, Go, Java, Kotlin, JSON, TOML, XML, or Gradle file to start the
 project-wide language server. The JetBrains Language Services widget shows its status and surfaces the same VibeGuard
 diagnostics and quick fixes as other clients.
+
+## Marketplace Publishing
+
+The Gradle `publishPlugin` task reads `JETBRAINS_MARKETPLACE_TOKEN` from the environment. A version tag is normally
+published through the repository's `Marketplace Release` workflow; local publication is only for release maintainers:
+
+```powershell
+$env:JETBRAINS_MARKETPLACE_TOKEN = "marketplace-token"
+.\gradlew.bat publishPlugin -PjetbrainsChannel=eap
+```

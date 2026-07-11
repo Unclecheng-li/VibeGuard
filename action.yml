@@ -154,6 +154,14 @@ inputs:
     description: "Environment variable name containing the dedicated private-dashboard ingest token."
     required: false
     default: "VIBEGUARD_FINDINGS_INGEST_TOKEN"
+  findings_rules_endpoint:
+    description: "Optional private dashboard GET endpoint for project-scoped custom rules. It uses the same dedicated ingest token."
+    required: false
+    default: ""
+  findings_rules_required:
+    description: "Fail the scan when a configured project custom-rules download fails."
+    required: false
+    default: "false"
   findings_upload_required:
     description: "Fail the scan when a configured private-dashboard findings upload fails."
     required: false
@@ -278,6 +286,38 @@ runs:
         fi
         if [ -n "$findings_project" ]; then
           extra_args+=("--findings-project" "$findings_project")
+        fi
+        findings_rules_endpoint="${{ inputs.findings_rules_endpoint }}"
+        if [ -n "$findings_rules_endpoint" ]; then
+          findings_token_env="${{ inputs.findings_token_env }}"
+          remote_rules_file="${RUNNER_TEMP:-.}/vibeguard-project-rules.yml"
+          rules_download_failed() {
+            rm -f "$remote_rules_file"
+            if [ "${{ inputs.findings_rules_required }}" = "true" ]; then
+              echo "VibeGuard error: project custom rules could not be downloaded." >&2
+              exit 1
+            fi
+            echo "VibeGuard warning: project custom rules could not be downloaded; continuing without them." >&2
+          }
+          if [[ ! "$findings_token_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            rules_download_failed
+          elif ! node -e 'const value = process.argv[1]; try { const url = new URL(value); const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase(); const loopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host); if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password || (url.protocol === "http:" && !loopback)) process.exit(1); } catch { process.exit(1); }' "$findings_rules_endpoint"; then
+            rules_download_failed
+          else
+            findings_token="${!findings_token_env:-}"
+            if [ -z "$findings_token" ]; then
+              rules_download_failed
+            else
+              rules_status=""
+              if rules_status="$(curl --silent --show-error --max-time 15 --output "$remote_rules_file" --write-out "%{http_code}" -H "Authorization: Bearer $findings_token" "$findings_rules_endpoint")" && [ "$rules_status" = "200" ] && [ -s "$remote_rules_file" ]; then
+                extra_args+=("--custom-rules" "$remote_rules_file")
+              elif [ "$rules_status" = "404" ] && [ "${{ inputs.findings_rules_required }}" != "true" ]; then
+                rm -f "$remote_rules_file"
+              else
+                rules_download_failed
+              fi
+            fi
+          fi
         fi
         if [ -n "${{ inputs.findings_endpoint }}" ]; then
           extra_args+=("--findings-endpoint" "${{ inputs.findings_endpoint }}" "--findings-token-env" "${{ inputs.findings_token_env }}")

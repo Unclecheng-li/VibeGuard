@@ -99,6 +99,16 @@ export function parsePackageReferences(filePath: string, text: string, languageI
   if (fileName === "build.gradle" || fileName === "build.gradle.kts") {
     return parseGradleBuild(filePath, text);
   }
+  if (fileName.endsWith(".versions.toml")) {
+    return parseGradleVersionCatalog(filePath, text);
+  }
+  if (
+    ["sh", "bash", "zsh", "ps1", "yml", "yaml"].includes(ext) ||
+    fileName === "dockerfile" ||
+    ["shellscript", "powershell", "yaml", "dockerfile"].includes(languageId ?? "")
+  ) {
+    return parsePipInstallCommands(filePath, text);
+  }
   if (["js", "jsx", "ts", "tsx", "mjs", "cjs"].includes(ext) || ["javascript", "typescript", "javascriptreact", "typescriptreact"].includes(languageId ?? "")) {
     return parseJavaScriptImports(filePath, text);
   }
@@ -180,7 +190,71 @@ function parsePythonImports(filePath: string, text: string): PackageReference[] 
     addPythonReference(references, filePath, text, match[1] ?? "", match.index ?? 0, match[0], "import");
   }
 
-  return dedupeReferences(references);
+  references.push(...parsePipInstallCommands(filePath, text));
+  return dedupeReferences(references).sort((left, right) => left.line - right.line || left.column - right.column);
+}
+
+function parsePipInstallCommands(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  const stringCommand = /\b(?:subprocess\.(?:run|call|check_call)|os\.system)\s*\(\s*["'](?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^"'\r\n]+)/gi;
+  const arrayCommand = /\bsubprocess\.(?:run|call|check_call)\s*\(\s*\[\s*["']pip(?:3)?["']\s*,\s*["']install["']\s*,\s*["']([^"'\r\n]+)["']/gi;
+  const notebookCommand = /^\s*!\s*(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^\r\n#]+)/gim;
+  const scriptCommand = /^\s*(?:-\s+)?(?:run:\s*)?(?:RUN\s+)?(?:sudo\s+)?(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^\r\n#]+)/gim;
+
+  for (const command of [stringCommand, arrayCommand, notebookCommand, scriptCommand]) {
+    for (const match of text.matchAll(command)) {
+      const argumentsText = match[1] ?? "";
+      const matchIndex = match.index ?? 0;
+      const argumentsOffset = match[0].indexOf(argumentsText);
+      addPipArgumentReferences(
+        references,
+        filePath,
+        text,
+        argumentsText,
+        matchIndex + Math.max(0, argumentsOffset)
+      );
+    }
+  }
+  return references;
+}
+
+function addPipArgumentReferences(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  argumentsText: string,
+  argumentsIndex: number
+): void {
+  const flagsWithValues = new Set(["-r", "--requirement", "-c", "--constraint", "-f", "--find-links", "--index-url", "--extra-index-url", "--trusted-host"]);
+  let skipNext = false;
+  const tokenRegex = /[^\s]+/g;
+  for (const tokenMatch of argumentsText.matchAll(tokenRegex)) {
+    const token = tokenMatch[0];
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (flagsWithValues.has(token)) {
+      skipNext = true;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      continue;
+    }
+    const packageMatch = /^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?(?:[<>=!~].*)?$/.exec(token);
+    const rawPackageName = packageMatch?.[1];
+    if (!rawPackageName) {
+      continue;
+    }
+    const packageName = normalizePypiPackage(rawPackageName);
+    if (!packageName) {
+      continue;
+    }
+    const tokenIndex = tokenMatch.index ?? 0;
+    references.push(
+      makeReference(filePath, text, "pypi", packageName, rawPackageName, argumentsIndex + tokenIndex, rawPackageName, "install")
+    );
+  }
 }
 
 function parseRequirements(filePath: string, text: string): PackageReference[] {
@@ -369,6 +443,63 @@ function parseGradleBuild(filePath: string, text: string): PackageReference[] {
   }
 
   return dedupeReferences(references);
+}
+
+/** Parses Gradle version-catalog libraries without trying to infer plugin or source-import coordinates. */
+function parseGradleVersionCatalog(filePath: string, text: string): PackageReference[] {
+  const references: PackageReference[] = [];
+  let inLibraries = false;
+  const lineRegex = /^.*$/gm;
+
+  for (const match of text.matchAll(lineRegex)) {
+    const line = match[0];
+    const lineStart = match.index ?? 0;
+    const stripped = stripTomlComment(line).trim();
+    if (!stripped) {
+      continue;
+    }
+    const section = /^\[([^\]]+)]$/.exec(stripped)?.[1];
+    if (section) {
+      inLibraries = section.trim() === "libraries";
+      continue;
+    }
+    if (!inLibraries) {
+      continue;
+    }
+    const coordinate = readGradleVersionCatalogCoordinate(stripped);
+    if (!coordinate) {
+      continue;
+    }
+    const coordinateIndex = line.indexOf(coordinate);
+    references.push(
+      makeReference(
+        filePath,
+        text,
+        "maven",
+        coordinate,
+        coordinate,
+        lineStart + Math.max(0, coordinateIndex),
+        coordinate,
+        "manifest"
+      )
+    );
+  }
+
+  return dedupeReferences(references);
+}
+
+function readGradleVersionCatalogCoordinate(line: string): string | undefined {
+  const module = /\bmodule\s*=\s*["']([^:"']+):([^:"']+)["']/.exec(line);
+  if (module) {
+    return normalizeMavenCoordinate(module[1] ?? "", module[2] ?? "");
+  }
+  const group = /\bgroup\s*=\s*["']([^"']+)["']/.exec(line)?.[1];
+  const name = /\bname\s*=\s*["']([^"']+)["']/.exec(line)?.[1];
+  if (group && name) {
+    return normalizeMavenCoordinate(group, name);
+  }
+  const direct = /^\s*[A-Za-z0-9_.-]+\s*=\s*["']([^:"']+):([^:"']+)(?::[^"']+)?["']\s*$/.exec(line);
+  return direct ? normalizeMavenCoordinate(direct[1] ?? "", direct[2] ?? "") : undefined;
 }
 
 function addPythonReference(

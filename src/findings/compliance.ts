@@ -1,5 +1,5 @@
 import type { FindingType } from "../types";
-import type { FindingStoreSummary, StoredAuditEvent } from "./storage";
+import type { FindingScanDelta, FindingStoreSummary, StoredAuditEvent } from "./storage";
 
 export type ComplianceFramework = "soc2" | "iso27001";
 export type ComplianceControlStatus = "not_assessed" | "observed" | "attention";
@@ -33,10 +33,11 @@ export interface ComplianceReport {
     activeCount: number;
     dismissedCount: number;
     latestScanAt?: number;
+    latestScanDelta?: FindingScanDelta;
   };
   audit: {
     dismissalReasons: Array<{ reason: string; count: number }>;
-    topRules: Array<{ rule: string; count: number; activeCount: number }>;
+    topRules: Array<{ rule: string; count: number; activeCount: number; falsePositiveCount: number; falsePositiveRate: number }>;
     dashboardActions: Array<{ action: string; outcome: "success" | "denied"; count: number }>;
   };
   frameworks: ComplianceFrameworkReport[];
@@ -149,11 +150,18 @@ export function createComplianceReport(
       findingCount: summary.findingCount,
       activeCount: summary.activeCount,
       dismissedCount: summary.dismissedCount,
-      latestScanAt: summary.latestScanAt
+      latestScanAt: summary.latestScanAt,
+      latestScanDelta: summary.latestScanDelta
     },
     audit: {
       dismissalReasons: summary.dismissedReasonCounts.map((entry) => ({ reason: entry.key, count: entry.dismissedCount })),
-      topRules: summary.topRules.map((entry) => ({ rule: entry.key, count: entry.count, activeCount: entry.activeCount })),
+      topRules: summary.topRules.map((entry) => ({
+        rule: entry.key,
+        count: entry.count,
+        activeCount: entry.activeCount,
+        falsePositiveCount: entry.falsePositiveCount,
+        falsePositiveRate: entry.falsePositiveRate
+      })),
       dashboardActions: summarizeDashboardActions(options.auditEvents ?? [])
     },
     frameworks
@@ -180,6 +188,13 @@ export function formatComplianceMarkdown(report: ComplianceReport): string {
     `| Dismissed findings | ${report.summary.dismissedCount} |`,
     `| Latest scan | ${report.summary.latestScanAt ? formatTimestamp(report.summary.latestScanAt) : "None"} |`
   ];
+  if (report.summary.latestScanDelta) {
+    lines.push(
+      `| New active risks in latest scan | ${report.summary.latestScanDelta.introducedCount} |`,
+      `| Resolved active risks in latest scan | ${report.summary.latestScanDelta.resolvedCount} |`,
+      `| Persistent active risks in latest scan | ${report.summary.latestScanDelta.persistentCount} |`
+    );
+  }
 
   for (const framework of report.frameworks) {
     lines.push("", `## ${frameworkName(framework.framework)}`, "");
@@ -205,9 +220,11 @@ export function formatComplianceMarkdown(report: ComplianceReport): string {
   if (report.audit.topRules.length === 0) {
     lines.push("No findings in this reporting window.");
   } else {
-    lines.push("| Rule | Findings | Active |", "| --- | ---: | ---: |");
+    lines.push("| Rule | Findings | Active | False positive | FP rate |", "| --- | ---: | ---: | ---: | ---: |");
     for (const rule of report.audit.topRules) {
-      lines.push(`| ${escapeMarkdownCell(rule.rule)} | ${rule.count} | ${rule.activeCount} |`);
+      lines.push(
+        `| ${escapeMarkdownCell(rule.rule)} | ${rule.count} | ${rule.activeCount} | ${rule.falsePositiveCount} | ${Math.round(rule.falsePositiveRate * 100)}% |`
+      );
     }
   }
   lines.push("", "### Dashboard Audit Activity", "");
@@ -236,6 +253,13 @@ function createControlEvidence(summary: FindingStoreSummary, definition: Control
     `Trend points: ${summary.trend.length}`,
     `Dismissed findings: ${summary.dismissedCount}`
   ];
+  if (summary.latestScanDelta) {
+    evidence.push(
+      `New active risks in latest scan: ${summary.latestScanDelta.introducedCount}`,
+      `Resolved active risks in latest scan: ${summary.latestScanDelta.resolvedCount}`,
+      `Persistent active risks in latest scan: ${summary.latestScanDelta.persistentCount}`
+    );
+  }
   return {
     id: definition.id,
     title: definition.title,

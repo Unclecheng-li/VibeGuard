@@ -26,6 +26,7 @@ import {
 import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
 import { filterFindingsToAiLineRanges, filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
 import { appendIgnoreRule, defaultIgnoreRulesPath, expandHome, loadIgnoreRules, scopedIgnoreReason } from "./ignore";
+import { cliFalsePositiveTelemetryEvent, isFalsePositiveDismissalReason, reportFalsePositiveTelemetry } from "./telemetry";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { defaultIndexPath } from "./package/cache";
 import { syncConfiguredPackageIndexes, type ConfiguredPackageSyncResult } from "./package/configSync";
@@ -103,6 +104,12 @@ const supportedExtensions = new Set([
   "toml",
   "xml",
   "gradle",
+  "sh",
+  "bash",
+  "zsh",
+  "ps1",
+  "yml",
+  "yaml",
   "txt"
 ]);
 const supportedFileNames = new Set([
@@ -113,7 +120,8 @@ const supportedFileNames = new Set([
   "go.mod",
   "pom.xml",
   "build.gradle",
-  "build.gradle.kts"
+  "build.gradle.kts",
+  "dockerfile"
 ]);
 const ignoredDirectories = new Set(["node_modules", ".git", "out", "dist", "build", "coverage", ".vscode-test"]);
 
@@ -492,6 +500,7 @@ async function runIgnoreRulesCommand(args: string[]): Promise<void> {
 
 async function addIgnoreRuleCommand(args: string[]): Promise<void> {
   let ignoreRulesPath = defaultIgnoreRulesPath();
+  let configPath = defaultConfigPath();
   let targetPath: string | undefined;
   let scope: string | undefined;
   let line: number | undefined;
@@ -505,6 +514,10 @@ async function addIgnoreRuleCommand(args: string[]): Promise<void> {
       ignoreRulesPath = path.resolve(expandHome(args[++index] ?? defaultIgnoreRulesPath()));
     } else if (arg.startsWith("--ignore-rules=")) {
       ignoreRulesPath = path.resolve(expandHome(arg.slice("--ignore-rules=".length)));
+    } else if (arg === "--config") {
+      configPath = path.resolve(expandHome(args[++index] ?? defaultConfigPath()));
+    } else if (arg.startsWith("--config=")) {
+      configPath = path.resolve(expandHome(arg.slice("--config=".length)));
     } else if (arg === "--path") {
       targetPath = args[++index];
     } else if (arg.startsWith("--path=")) {
@@ -547,6 +560,7 @@ async function addIgnoreRuleCommand(args: string[]): Promise<void> {
     reason: scopedIgnoreReason(reason, reasonScope)
   };
   const filePath = await appendIgnoreRule(entry, ignoreRulesPath);
+  await reportCliFalsePositive(rule, reasonScope, entry.reason, configPath);
 
   if (json) {
     console.log(JSON.stringify({ path: filePath, rule: entry }, null, 2));
@@ -557,6 +571,7 @@ async function addIgnoreRuleCommand(args: string[]): Promise<void> {
 
 async function addIgnorePackageCommand(args: string[]): Promise<void> {
   let ignoreRulesPath = defaultIgnoreRulesPath();
+  let configPath = defaultConfigPath();
   let reason: string | undefined = "internal_package";
   let json = false;
   const positional: string[] = [];
@@ -567,6 +582,10 @@ async function addIgnorePackageCommand(args: string[]): Promise<void> {
       ignoreRulesPath = path.resolve(expandHome(args[++index] ?? defaultIgnoreRulesPath()));
     } else if (arg.startsWith("--ignore-rules=")) {
       ignoreRulesPath = path.resolve(expandHome(arg.slice("--ignore-rules=".length)));
+    } else if (arg === "--config") {
+      configPath = path.resolve(expandHome(args[++index] ?? defaultConfigPath()));
+    } else if (arg.startsWith("--config=")) {
+      configPath = path.resolve(expandHome(arg.slice("--config=".length)));
     } else if (arg === "--reason") {
       reason = args[++index];
     } else if (arg.startsWith("--reason=")) {
@@ -594,12 +613,33 @@ async function addIgnorePackageCommand(args: string[]): Promise<void> {
     reason: scopedIgnoreReason(reason, "package")
   };
   const filePath = await appendIgnoreRule(entry, ignoreRulesPath);
+  await reportCliFalsePositive(`hallucinated_package_${registry}`, "package", entry.reason, configPath);
 
   if (json) {
     console.log(JSON.stringify({ path: filePath, rule: entry }, null, 2));
     return;
   }
   console.log(`Added package ignore for ${registry}:${packageName} to ${filePath}.`);
+}
+
+async function reportCliFalsePositive(
+  rule: string,
+  scope: "line" | "file" | "global" | "package",
+  reason: string | undefined,
+  configPath: string
+): Promise<void> {
+  if (!isFalsePositiveDismissalReason(reason)) {
+    return;
+  }
+  try {
+    const loadedConfig = await loadConfig(configPath);
+    await reportFalsePositiveTelemetry({
+      enabled: loadedConfig.config.telemetry,
+      event: cliFalsePositiveTelemetryEvent(rule, "cli", scope)
+    });
+  } catch {
+    // Anonymous feedback must never prevent a local ignore rule from being saved.
+  }
 }
 
 async function initConfig(args: string[]): Promise<void> {
@@ -1417,6 +1457,11 @@ function printHumanFindingsSummary(dbPath: string, summary: FindingStoreSummary)
   console.log(`Scans: ${summary.scanCount}`);
   console.log(`Findings: ${summary.findingCount} (${summary.activeCount} active, ${summary.dismissedCount} dismissed)`);
   console.log(`Latest scan: ${summary.latestScanAt ? new Date(summary.latestScanAt).toISOString() : "none"}`);
+  console.log(
+    `Latest scan change: ${summary.latestScanDelta
+      ? `${summary.latestScanDelta.introducedCount} introduced, ${summary.latestScanDelta.resolvedCount} resolved, ${summary.latestScanDelta.persistentCount} persistent active finding(s)`
+      : "need at least two scans in this window"}`
+  );
   console.log(`Severity: ${formatSummaryBuckets(summary.severityCounts)}`);
   console.log(`Type: ${formatSummaryBuckets(summary.typeCounts)}`);
   console.log(`Dismissal reasons: ${formatSummaryBuckets(summary.dismissedReasonCounts)}`);
@@ -1429,6 +1474,17 @@ function printHumanFindingsSummary(dbPath: string, summary: FindingStoreSummary)
     for (const rule of summary.topRules) {
       console.log(
         `  ${rule.key}: ${rule.count} (${rule.activeCount} active, ${rule.dismissedCount} dismissed, ${rule.severity}/${rule.type})`
+      );
+    }
+  }
+
+  console.log("Rule feedback:");
+  if (summary.falsePositiveRules.length === 0) {
+    console.log("  no false-positive dismissals");
+  } else {
+    for (const rule of summary.falsePositiveRules) {
+      console.log(
+        `  ${rule.key}: ${rule.falsePositiveCount} false-positive dismissal(s), ${Math.round(rule.falsePositiveRate * 100)}% of ${rule.count} finding(s)`
       );
     }
   }
@@ -2182,10 +2238,10 @@ function printIgnoreRulesHelp(): void {
 Usage:
   vibeguard ignore-rules add-rule <rule-id-or-type> [--path glob] [--scope file:glob] [--line n]
                                    [--reason false_positive|not_issue|internal_package|text]
-                                   [--ignore-rules path] [--json]
+                                   [--ignore-rules path] [--config path] [--json]
   vibeguard ignore-rules add-package <npm|pypi|cargo|gomod|maven> <package>
                                       [--reason false_positive|not_issue|internal_package|text]
-                                      [--no-reason] [--ignore-rules path] [--json]
+                                      [--no-reason] [--ignore-rules path] [--config path] [--json]
 
 Examples:
   vibeguard ignore-rules add-rule insecure_config_debug_true --path "**/test_*" --reason not_issue

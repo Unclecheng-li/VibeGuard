@@ -42,6 +42,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build --tag vibeguard:ci .
+      - run: >-
+          VIBEGUARD_DASHBOARD_TOKEN=ci-dashboard-token
+          VIBEGUARD_FINDINGS_INGEST_TOKEN=ci-ingest-token
+          docker compose -f deploy/compose.yaml config --quiet
       - run: docker run --rm vibeguard:ci subscription status --json
       - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" vibeguard:ci scan /workspace --package-verification off --no-store-findings --fail-on none
       - run: mkdir -p "$RUNNER_TEMP/vibeguard-dashboard"

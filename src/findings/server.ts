@@ -10,7 +10,9 @@ import {
 } from "./auth";
 import { createComplianceReport, type ComplianceFramework } from "./compliance";
 import { formatFindingsDashboard } from "./dashboard";
+import { formatProjectIntegrationsDashboard } from "./projectIntegrations";
 import { FindingsIngestError, parseFindingsIngestPayload } from "./ingest";
+import { parseCustomRules } from "../customRules";
 import { SqliteFindingStore } from "./storage";
 
 export interface FindingsDashboardServerOptions {
@@ -49,6 +51,8 @@ export async function startFindingsDashboardServer(
   const ingestMaxFindings = validateIngestMaxFindings(options.ingestMaxFindings);
   const project = normalizeProject(options.project);
   const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
+  // Validate an external OIDC callback origin before opening the database or listening on a port.
+  const oidcPublicUrl = options.oidc?.publicUrl ? normalizeOidcPublicUrl(options.oidc.publicUrl) : undefined;
   const store = new SqliteFindingStore(options.dbPath);
   const authenticator = options.oidc ? new OidcDashboardAuthenticator(options.oidc) : undefined;
   let requestOptions: RequestOptions | undefined;
@@ -93,7 +97,7 @@ export async function startFindingsDashboardServer(
     project,
     since,
     authenticator,
-    publicUrl: normalizePublicUrl(options.oidc?.publicUrl ?? url)
+    publicUrl: oidcPublicUrl ?? normalizePublicUrl(url)
   };
   return {
     url,
@@ -138,6 +142,22 @@ async function handleRequest(
     await handleIngest(request, response, store, options);
     return;
   }
+  if (url.pathname === "/api/projects") {
+    await handleProjectManagement(request, response, url, store, options);
+    return;
+  }
+  if (url.pathname === "/api/project-rules") {
+    await handleProjectRulesManagement(request, response, url, store, options);
+    return;
+  }
+  if (url.pathname === "/api/project-rules/download") {
+    if (request.method !== "GET") {
+      writeText(response, 405, "Method Not Allowed\n", "text/plain; charset=utf-8", { Allow: "GET" });
+      return;
+    }
+    handleProjectRulesDownload(request, response, url, store, options);
+    return;
+  }
   if (request.method !== "GET" && request.method !== "HEAD") {
     writeText(response, 405, "Method Not Allowed\n", "text/plain; charset=utf-8", { Allow: "GET, HEAD" });
     return;
@@ -155,7 +175,7 @@ async function handleRequest(
     return;
   }
 
-  const requiredRole: DashboardRole = url.pathname === "/api/audit"
+  const requiredRole: DashboardRole = url.pathname === "/api/audit" || url.pathname === "/projects"
     ? "admin"
     : url.pathname === "/api/findings" || url.pathname === "/api/compliance"
       ? "analyst"
@@ -169,6 +189,10 @@ async function handleRequest(
     writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
       "WWW-Authenticate": 'Bearer realm="VibeGuard Team Dashboard"'
     });
+    return;
+  }
+  if (authentication.cookieHeaders && url.searchParams.has("token")) {
+    writeRedirect(response, withoutTokenQuery(url), withCookies(undefined, authentication.cookieHeaders));
     return;
   }
   if (!roleAllows(authentication.identity.role, requiredRole)) {
@@ -234,12 +258,22 @@ async function handleRequest(
     writeJson(response, 200, events, withCookies(undefined, authentication.cookieHeaders));
     return;
   }
+  if (url.pathname === "/projects") {
+    const html = formatProjectIntegrationsDashboard({
+      title: options.title ? `${options.title} Project Integrations` : "VibeGuard Project Integrations"
+    });
+    writeText(response, 200, html, "text/html; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
   if (url.pathname === "/" || url.pathname === "/index.html") {
     const summary = store.summary({ since: options.since, topLimit: options.topLimit, project });
     const html = formatFindingsDashboard(summary, {
       dbPath: options.dbPath,
       generatedAt: Date.now(),
-      title: options.title ?? "VibeGuard Team Security Dashboard"
+      title: options.title ?? "VibeGuard Team Security Dashboard",
+      adminUrl: authentication.identity.role === "admin" ? "/projects" : undefined,
+      projectFilterBaseUrl: options.project ? undefined : "/?project=",
+      allProjectsUrl: project ? "/" : undefined
     });
     writeText(response, 200, html, "text/html; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
     return;
@@ -253,12 +287,21 @@ async function handleIngest(
   store: SqliteFindingStore,
   options: RequestOptions
 ): Promise<void> {
-  if (!options.ingestToken) {
-    writeText(response, 404, "Not Found\n", "text/plain; charset=utf-8");
+  const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!bearer) {
+    const hasProjectCredentials = store.listProjectIngestCredentials().length > 0;
+    if (!options.ingestToken && !hasProjectCredentials) {
+      writeText(response, 404, "Not Found\n", "text/plain; charset=utf-8");
+      return;
+    }
+    writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
+      "WWW-Authenticate": 'Bearer realm="VibeGuard Findings Ingest"'
+    });
     return;
   }
-  const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
-  if (!bearer || !tokensMatch(options.ingestToken, bearer)) {
+  const globalTokenAccepted = Boolean(options.ingestToken && tokensMatch(options.ingestToken, bearer));
+  const scopedProject = globalTokenAccepted ? undefined : store.projectForIngestToken(bearer);
+  if (!globalTokenAccepted && !scopedProject) {
     writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
       "WWW-Authenticate": 'Bearer realm="VibeGuard Findings Ingest"'
     });
@@ -273,6 +316,10 @@ async function handleIngest(
     const payload = parseFindingsIngestPayload(await readJsonBody(request), {
       maxFindings: options.ingestMaxFindings
     });
+    if (scopedProject && payload.project !== scopedProject) {
+      writeText(response, 403, "Project-scoped ingest token cannot upload to another project.\n", "text/plain; charset=utf-8");
+      return;
+    }
     const run = store.recordScanRun(payload);
     try {
       store.recordAuditEvent({
@@ -281,7 +328,8 @@ async function handleIngest(
         outcome: "success",
         details: {
           finding_count: run.findingCount,
-          file_count: run.fileCount
+          file_count: run.fileCount,
+          ...(scopedProject ? { project: scopedProject } : {})
         }
       });
     } catch {
@@ -300,6 +348,193 @@ async function handleIngest(
     }
     writeText(response, 400, "Invalid findings ingest payload\n", "text/plain; charset=utf-8");
   }
+}
+
+async function handleProjectManagement(
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL,
+  store: SqliteFindingStore,
+  options: RequestOptions
+): Promise<void> {
+  const authentication = authenticateRequest(request, url, options);
+  if (!authentication.identity) {
+    writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
+      "WWW-Authenticate": 'Bearer realm="VibeGuard Team Dashboard"'
+    });
+    return;
+  }
+  if (!roleAllows(authentication.identity.role, "admin")) {
+    recordDashboardAudit(store, authentication.identity, "dashboard.access_denied", "denied", {
+      path: url.pathname,
+      required_role: "admin"
+    });
+    writeText(response, 403, "Forbidden\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+
+  if (request.method === "GET") {
+    recordDashboardAudit(store, authentication.identity, "dashboard.project_ingest_listed", "success");
+    writeJson(response, 200, store.listProjectIngestCredentials(), withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+  if (request.method === "POST") {
+    try {
+      const input = parseProjectCredentialRequest(await readJsonBody(request));
+      const credential = store.issueProjectIngestCredential(input.project, input.rotate);
+      if (!credential) {
+        writeText(response, 409, "Project ingest credential already exists. Set rotate to true to replace it.\n", "text/plain; charset=utf-8");
+        return;
+      }
+      recordDashboardAudit(store, authentication.identity, "dashboard.project_ingest_configured", "success", {
+        project: credential.project,
+        rotated: !credential.created
+      });
+      writeJson(response, credential.created ? 201 : 200, credential, withCookies(undefined, authentication.cookieHeaders));
+    } catch {
+      writeText(response, 400, "Invalid project credential request\n", "text/plain; charset=utf-8");
+    }
+    return;
+  }
+  if (request.method === "DELETE") {
+    let project: string | undefined;
+    try {
+      project = normalizeProject(url.searchParams.get("project") ?? undefined);
+    } catch {
+      writeText(response, 400, "Invalid project identifier\n", "text/plain; charset=utf-8");
+      return;
+    }
+    if (!project) {
+      writeText(response, 400, "Project identifier is required\n", "text/plain; charset=utf-8");
+      return;
+    }
+    if (!store.revokeProjectIngestCredential(project)) {
+      writeText(response, 404, "Project ingest credential not found\n", "text/plain; charset=utf-8");
+      return;
+    }
+    recordDashboardAudit(store, authentication.identity, "dashboard.project_ingest_revoked", "success", { project });
+    writeJson(response, 200, { project, revoked: true }, withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+  writeText(response, 405, "Method Not Allowed\n", "text/plain; charset=utf-8", { Allow: "GET, POST, DELETE" });
+}
+
+async function handleProjectRulesManagement(
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL,
+  store: SqliteFindingStore,
+  options: RequestOptions
+): Promise<void> {
+  const authentication = authenticateRequest(request, url, options);
+  if (!authentication.identity) {
+    writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
+      "WWW-Authenticate": 'Bearer realm="VibeGuard Team Dashboard"'
+    });
+    return;
+  }
+  if (!roleAllows(authentication.identity.role, "admin")) {
+    recordDashboardAudit(store, authentication.identity, "dashboard.access_denied", "denied", {
+      path: url.pathname,
+      required_role: "admin"
+    });
+    writeText(response, 403, "Forbidden\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+
+  if (request.method === "GET") {
+    recordDashboardAudit(store, authentication.identity, "dashboard.project_rules_listed", "success");
+    writeJson(response, 200, store.listProjectCustomRules(), withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+  if (request.method === "PUT") {
+    try {
+      const input = parseProjectCustomRulesRequest(await readJsonBody(request));
+      const rules = store.saveProjectCustomRules(input.project, input.yaml, input.ruleCount);
+      recordDashboardAudit(store, authentication.identity, "dashboard.project_rules_saved", "success", {
+        project: rules.project,
+        rule_count: rules.ruleCount
+      });
+      writeJson(response, 200, rules, withCookies(undefined, authentication.cookieHeaders));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Invalid project custom rules.";
+      writeText(response, 400, `${detail}\n`, "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+    }
+    return;
+  }
+  if (request.method === "DELETE") {
+    let project: string | undefined;
+    try {
+      project = normalizeProject(url.searchParams.get("project") ?? undefined);
+    } catch {
+      writeText(response, 400, "Invalid project identifier\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+      return;
+    }
+    if (!project) {
+      writeText(response, 400, "Project identifier is required\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+      return;
+    }
+    if (!store.deleteProjectCustomRules(project)) {
+      writeText(response, 404, "Project custom rules not found\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+      return;
+    }
+    recordDashboardAudit(store, authentication.identity, "dashboard.project_rules_deleted", "success", { project });
+    writeJson(response, 200, { project, deleted: true }, withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+  writeText(response, 405, "Method Not Allowed\n", "text/plain; charset=utf-8", { Allow: "GET, PUT, DELETE" });
+}
+
+function handleProjectRulesDownload(
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL,
+  store: SqliteFindingStore,
+  options: RequestOptions
+): void {
+  let project: string | undefined;
+  try {
+    project = normalizeProject(url.searchParams.get("project") ?? undefined);
+  } catch {
+    writeText(response, 400, "Invalid project identifier\n", "text/plain; charset=utf-8");
+    return;
+  }
+  if (!project) {
+    writeText(response, 400, "Project identifier is required\n", "text/plain; charset=utf-8");
+    return;
+  }
+
+  const authentication = authenticateRequest(request, url, options);
+  const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  const globalTokenAccepted = Boolean(bearer && options.ingestToken && tokensMatch(options.ingestToken, bearer));
+  const scopedProject = globalTokenAccepted || !bearer ? undefined : store.projectForIngestToken(bearer);
+  const admin = authentication.identity && roleAllows(authentication.identity.role, "admin");
+  if (!admin && !globalTokenAccepted && !scopedProject) {
+    writeText(response, 401, "Unauthorized\n", "text/plain; charset=utf-8", {
+      "WWW-Authenticate": 'Bearer realm="VibeGuard Project Rules"'
+    });
+    return;
+  }
+  if (!admin && scopedProject !== undefined && scopedProject !== project) {
+    writeText(response, 403, "Project-scoped ingest token cannot read rules for another project.\n", "text/plain; charset=utf-8");
+    return;
+  }
+
+  const rules = store.getProjectCustomRules(project);
+  if (!rules) {
+    writeText(response, 404, "Project custom rules not found\n", "text/plain; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
+    return;
+  }
+  if (authentication.identity) {
+    recordDashboardAudit(store, authentication.identity, "dashboard.project_rules_downloaded", "success", { project });
+  } else {
+    try {
+      store.recordAuditEvent({ authentication: "ingest", action: "project_rules.downloaded", details: { project } });
+    } catch {
+      // Download remains available when an audit event cannot be written.
+    }
+  }
+  writeText(response, 200, rules.yaml, "text/yaml; charset=utf-8", withCookies(undefined, authentication.cookieHeaders));
 }
 
 async function handleLogin(url: URL, response: ServerResponse, options: RequestOptions): Promise<void> {
@@ -350,7 +585,7 @@ function authenticateRequest(request: IncomingMessage, url: URL, options: Reques
     return {
       identity: { subject: "service-token", role: "admin", authentication: "token" },
       cookieHeaders: queryToken && tokensMatch(token, queryToken)
-        ? [`vibeguard_team_token=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/`]
+        ? [serviceTokenCookie(token, options.publicUrl)]
         : undefined
     };
   }
@@ -373,6 +608,41 @@ function normalizePublicUrl(value: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
+function normalizeOidcPublicUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("OIDC dashboard public URL must be an absolute URL.");
+  }
+  if (!isSecureDashboardUrl(url)) {
+    throw new Error("OIDC dashboard public URL must use HTTPS outside localhost development.");
+  }
+  if (url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+    throw new Error("OIDC dashboard public URL must be a bare origin without credentials, a path, query parameters, or fragments.");
+  }
+  return url.origin;
+}
+
+function isSecureDashboardUrl(url: URL): boolean {
+  if (url.protocol === "https:") {
+    return true;
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return url.protocol === "http:" && (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
+}
+
+function serviceTokenCookie(token: string, publicUrl: string): string {
+  const secure = new URL(publicUrl).protocol === "https:" ? "; Secure" : "";
+  return `vibeguard_team_token=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/${secure}`;
+}
+
+function withoutTokenQuery(url: URL): string {
+  const location = new URL(url);
+  location.searchParams.delete("token");
+  return `${location.pathname}${location.search}`;
+}
+
 function normalizeProject(value: string | undefined): string | undefined {
   const project = value?.trim();
   if (!project) {
@@ -393,6 +663,49 @@ function requestProjectFilter(url: URL, options: RequestOptions): string | undef
   } catch {
     return "invalid";
   }
+}
+
+function parseProjectCredentialRequest(value: unknown): { project: string; rotate: boolean } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Request must be an object.");
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input.project !== "string") {
+    throw new Error("Project is required.");
+  }
+  const project = normalizeProject(input.project);
+  if (!project) {
+    throw new Error("Project is required.");
+  }
+  if (input.rotate !== undefined && typeof input.rotate !== "boolean") {
+    throw new Error("Rotate must be boolean.");
+  }
+  return { project, rotate: input.rotate === true };
+}
+
+function parseProjectCustomRulesRequest(value: unknown): { project: string; yaml: string; ruleCount: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Request must be an object.");
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input.project !== "string") {
+    throw new Error("Project is required.");
+  }
+  const project = normalizeProject(input.project);
+  if (!project) {
+    throw new Error("Project is required.");
+  }
+  if (typeof input.yaml !== "string" || input.yaml.trim().length === 0) {
+    throw new Error("Custom rules YAML is required.");
+  }
+  if (Buffer.byteLength(input.yaml, "utf8") > 256 * 1024) {
+    throw new Error("Custom rules YAML must not exceed 256 KiB.");
+  }
+  const rules = parseCustomRules(input.yaml, `Custom rules for ${project}`).rules;
+  if (rules.length > 100) {
+    throw new Error("A project may define at most 100 custom rules.");
+  }
+  return { project, yaml: input.yaml.endsWith("\n") ? input.yaml : `${input.yaml}\n`, ruleCount: rules.length };
 }
 
 function publicIdentity(identity: DashboardIdentity): Pick<DashboardIdentity, "subject" | "role" | "name" | "email" | "authentication"> {

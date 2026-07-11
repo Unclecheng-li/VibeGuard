@@ -10,6 +10,7 @@ import {
   shouldSyncPackageIndex,
   syncConfiguredPackageIndexes
 } from "../src/package/configSync";
+import type { ConfiguredPackageSyncProgress } from "../src/package/configSync";
 import type { PackageIndexStore, PackageStorage } from "../src/package/storage";
 import type { PackageIndexEntry, PackageRegistry, PackageResolution, VibeGuardConfig } from "../src/types";
 
@@ -18,6 +19,7 @@ test("syncs missing configured package indexes and skips fresh indexes", async (
   const index = new MemoryPackageIndex(now);
   index.seed("npm", ["react"], "partial", now - 60_000);
   const fetchedUrls: string[] = [];
+  const progress: ConfiguredPackageSyncProgress[] = [];
   const config = testConfig({
     languages: ["npm", "maven"],
     update_interval: "daily",
@@ -41,7 +43,8 @@ test("syncs missing configured package indexes and skips fresh indexes", async (
           }
         })
       );
-    }
+    },
+    onProgress: (event) => progress.push(event)
   });
 
   assert.equal(result.lightweightMode, true);
@@ -57,6 +60,12 @@ test("syncs missing configured package indexes and skips fresh indexes", async (
   assert.equal(await index.get("maven", "junit:junit"), true);
   assert.match(fetchedUrls[0], /rows=1000/);
   assert.match(fetchedUrls[0], /start=0/);
+  assert.deepEqual(progress, [
+    { registry: "npm", completed: 0, total: 2, phase: "starting" },
+    { registry: "npm", completed: 1, total: 2, phase: "completed", status: "skipped" },
+    { registry: "maven", completed: 1, total: 2, phase: "starting" },
+    { registry: "maven", completed: 2, total: 2, phase: "completed", status: "synced" }
+  ]);
 });
 
 test("full configured package sync refreshes partial indexes before they expire", async () => {
@@ -120,8 +129,8 @@ test("package sync decisions respect intervals, force, and lightweight limits", 
   assert.equal(configuredPackageSyncLimit(dailyConfig, "npm", 42), 42);
 });
 
-test("selects detected package registries while respecting configured languages", () => {
-  assert.deepEqual(selectConfiguredPackageSyncRegistries(["npm", "pypi"], ["npm", "maven"]), ["npm"]);
+test("prioritizes detected package registries while retaining configured background sync", () => {
+  assert.deepEqual(selectConfiguredPackageSyncRegistries(["npm", "pypi", "maven"], ["maven", "npm", "cargo"]), ["maven", "npm", "pypi"]);
   assert.deepEqual(selectConfiguredPackageSyncRegistries(["pypi"], ["npm"]), ["pypi"]);
   assert.deepEqual(selectConfiguredPackageSyncRegistries(["npm", "npm", "maven"], []), ["npm", "maven"]);
   assert.deepEqual(selectConfiguredPackageSyncRegistries([], ["npm"]), []);

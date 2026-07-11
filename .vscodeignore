@@ -5,6 +5,7 @@ out/**
 .vscode-test/**
 .vscode/**
 .github/**
+deploy/**
 jetbrains/**
 Dockerfile
 .dockerignore

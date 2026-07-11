@@ -1,0 +1,47 @@
+name: vibeguard
+
+services:
+  dashboard:
+    image: ${VIBEGUARD_IMAGE:-vibeguard:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command:
+      - findings
+      - serve
+      - --db
+      - /data/findings.db
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --token-env
+      - VIBEGUARD_DASHBOARD_TOKEN
+      - --ingest-token-env
+      - VIBEGUARD_FINDINGS_INGEST_TOKEN
+    environment:
+      NODE_ENV: production
+      VIBEGUARD_DASHBOARD_TOKEN: ${VIBEGUARD_DASHBOARD_TOKEN:?Set a long dashboard administrator token}
+      VIBEGUARD_FINDINGS_INGEST_TOKEN: ${VIBEGUARD_FINDINGS_INGEST_TOKEN:?Set a distinct CI ingest token}
+    ports:
+      - "${VIBEGUARD_DASHBOARD_BIND:-127.0.0.1}:${VIBEGUARD_DASHBOARD_PORT:-8787}:8787"
+    volumes:
+      - vibeguard-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:8787/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  vibeguard-data:

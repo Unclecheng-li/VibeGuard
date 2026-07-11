@@ -5,6 +5,11 @@ export interface FindingsDashboardOptions {
   dbPath?: string;
   generatedAt?: number;
   title?: string;
+  adminUrl?: string;
+  /** Enables project-filter links for the server-hosted dashboard. */
+  projectFilterBaseUrl?: string;
+  /** Link back to the unfiltered dashboard when a project filter is active. */
+  allProjectsUrl?: string;
 }
 
 const severityOrder: Severity[] = ["critical", "high", "medium", "low", "info"];
@@ -77,6 +82,20 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
       font-size: 13px;
       text-align: right;
     }
+    .header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 14px; }
+    .admin-link {
+      color: var(--blue);
+      border: 1px solid #a9c6ef;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 700;
+      padding: 7px 9px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .admin-link:hover { background: #edf4ff; }
+    .project-link { color: var(--blue); text-decoration: none; }
+    .project-link:hover { text-decoration: underline; }
     .grid {
       display: grid;
       gap: 14px;
@@ -189,6 +208,7 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
       .meta { text-align: left; }
+      .header-actions { align-items: flex-start; justify-content: flex-start; }
       .kpis, .sections { grid-template-columns: 1fr; }
       .bar-row { grid-template-columns: 74px minmax(0, 1fr) 54px; }
     }
@@ -199,9 +219,13 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
     <header>
       <div>
         <h1>${escapeHtml(title)}</h1>
-        <p class="meta" style="text-align:left">${escapeHtml(formatWindow(summary))}</p>
+        <p class="meta" style="text-align:left">${escapeHtml(formatWindow(summary))}${summary.project ? ` | Project: ${escapeHtml(summary.project)}` : ""}</p>
       </div>
-      <p class="meta">Generated ${escapeHtml(formatDateTime(generatedAt))}${options.dbPath ? `<br>${escapeHtml(options.dbPath)}` : ""}</p>
+      <div class="header-actions">
+        ${options.allProjectsUrl ? `<a class="admin-link" href="${escapeHtml(options.allProjectsUrl)}">All projects</a>` : ""}
+        ${options.adminUrl ? `<a class="admin-link" href="${escapeHtml(options.adminUrl)}">Project integrations</a>` : ""}
+        <p class="meta">Generated ${escapeHtml(formatDateTime(generatedAt))}${options.dbPath ? `<br>${escapeHtml(options.dbPath)}` : ""}</p>
+      </div>
     </header>
 
     <section class="grid kpis" aria-label="Finding totals">
@@ -219,9 +243,17 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
           <h2 id="trend-heading">Daily Finding Trend</h2>
           ${trendChart}
         </section>
+        <section class="panel" aria-labelledby="latest-change-heading">
+          <h2 id="latest-change-heading">Latest Scan Change</h2>
+          ${renderLatestScanDelta(summary)}
+        </section>
         <section class="panel" aria-labelledby="rules-heading">
           <h2 id="rules-heading">Top Detection Rules</h2>
           ${renderRulesTable(summary)}
+        </section>
+        <section class="panel" aria-labelledby="rule-feedback-heading">
+          <h2 id="rule-feedback-heading">Rule Feedback</h2>
+          ${renderFalsePositiveRulesTable(summary)}
         </section>
         <section class="panel" aria-labelledby="authors-heading">
           <h2 id="authors-heading">Developer Risk</h2>
@@ -229,7 +261,7 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
         </section>
         <section class="panel" aria-labelledby="projects-heading">
           <h2 id="projects-heading">Project Risk</h2>
-          ${renderProjectsTable(summary)}
+          ${renderProjectsTable(summary, options)}
         </section>
       </div>
       <div class="stack">
@@ -323,13 +355,52 @@ function renderRulesTable(summary: FindingStoreSummary): string {
         <td class="num">${rule.count}</td>
         <td class="num">${rule.activeCount}</td>
         <td class="num">${rule.dismissedCount}</td>
+        <td class="num">${rule.falsePositiveCount}</td>
+        <td class="num">${Math.round(rule.falsePositiveRate * 100)}%</td>
       </tr>`
     )
     .join("\n");
   return `<table>
-    <thead><tr><th>Rule</th><th>Severity</th><th>Type</th><th class="num">Total</th><th class="num">Active</th><th class="num">Dismissed</th></tr></thead>
+    <thead><tr><th>Rule</th><th>Severity</th><th>Type</th><th class="num">Total</th><th class="num">Active</th><th class="num">Dismissed</th><th class="num">False Positive</th><th class="num">FP Rate</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+function renderFalsePositiveRulesTable(summary: FindingStoreSummary): string {
+  if (summary.falsePositiveRules.length === 0) {
+    return `<div class="empty">No false-positive dismissals recorded in this window.</div>`;
+  }
+  const rows = summary.falsePositiveRules
+    .map(
+      (rule) => `<tr>
+        <td class="rule">${escapeHtml(rule.key)}</td>
+        <td>${escapeHtml(rule.severity)}</td>
+        <td class="num">${rule.falsePositiveCount}</td>
+        <td class="num">${rule.count}</td>
+        <td class="num">${Math.round(rule.falsePositiveRate * 100)}%</td>
+      </tr>`
+    )
+    .join("\n");
+  return `<table>
+    <thead><tr><th>Rule</th><th>Severity</th><th class="num">False Positive</th><th class="num">Findings</th><th class="num">FP Rate</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderLatestScanDelta(summary: FindingStoreSummary): string {
+  const delta = summary.latestScanDelta;
+  if (!delta) {
+    return `<div class="empty">Run at least two scans in the selected window to compare active findings.</div>`;
+  }
+  return `<table>
+    <thead><tr><th>Active finding change</th><th class="num">Count</th></tr></thead>
+    <tbody>
+      <tr><td>Introduced</td><td class="num">${delta.introducedCount}</td></tr>
+      <tr><td>Resolved</td><td class="num">${delta.resolvedCount}</td></tr>
+      <tr><td>Persistent</td><td class="num">${delta.persistentCount}</td></tr>
+    </tbody>
+  </table>
+  <p class="meta">Compared <span class="rule">${escapeHtml(delta.previousScanId)}</span> with latest scan <span class="rule">${escapeHtml(delta.currentScanId)}</span> at ${escapeHtml(formatDateTime(delta.currentCompletedAt))}.</p>`;
 }
 
 function renderAuthorsTable(summary: FindingStoreSummary): string {
@@ -354,14 +425,14 @@ function renderAuthorsTable(summary: FindingStoreSummary): string {
   </table>`;
 }
 
-function renderProjectsTable(summary: FindingStoreSummary): string {
+function renderProjectsTable(summary: FindingStoreSummary, options: FindingsDashboardOptions): string {
   if (summary.projectCounts.length === 0) {
     return `<div class="empty">No project attribution recorded yet.</div>`;
   }
   const rows = summary.projectCounts
     .map(
       (project) => `<tr>
-        <td class="rule">${escapeHtml(project.key)}</td>
+        <td>${renderProjectLabel(project.key, options.projectFilterBaseUrl)}</td>
         <td class="num">${project.scanCount}</td>
         <td class="num">${project.findingCount}</td>
         <td class="num">${project.activeCount}</td>
@@ -374,6 +445,14 @@ function renderProjectsTable(summary: FindingStoreSummary): string {
     <thead><tr><th>Project</th><th class="num">Scans</th><th class="num">Findings</th><th class="num">Active</th><th class="num">Critical/High</th><th class="num">High-Risk Rate</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+function renderProjectLabel(project: string, filterBaseUrl: string | undefined): string {
+  if (!filterBaseUrl || project === "Unassigned") {
+    return `<span class="rule">${escapeHtml(project)}</span>`;
+  }
+  const href = `${filterBaseUrl}${encodeURIComponent(project)}`;
+  return `<a class="project-link rule" href="${escapeHtml(href)}">${escapeHtml(project)}</a>`;
 }
 
 function renderTrendChart(summary: FindingStoreSummary): string {

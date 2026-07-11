@@ -17,6 +17,12 @@ interface SemanticRuleResult {
   suggestion: string;
 }
 
+export interface SecurityReviewContext {
+  framework: string;
+  functionNames: string[];
+  routes: string[];
+}
+
 export class LocalSemanticAnalyzer implements L3AnalyzerLike {
   analyze(source: SourceFile, timestamp: number): Finding[] {
     return analyzeSecurityDimensions(source, timestamp);
@@ -56,6 +62,7 @@ export function analyzeSecurityDimensions(source: SourceFile, timestamp: number)
 }
 
 export function buildSecurityReviewPrompt(source: SourceFile, code: string): string {
+  const context = buildSecurityReviewContext(source);
   return [
     "Analyze this function and check if it's missing critical security measures.",
     "",
@@ -65,6 +72,9 @@ export function buildSecurityReviewPrompt(source: SourceFile, code: string): str
     "Function context:",
     `- File: ${source.filePath}`,
     `- Language: ${source.languageId ?? "unknown"}`,
+    `- Framework: ${context.framework}`,
+    `- Functions: ${formatContextValues(context.functionNames)}`,
+    `- Routes: ${formatContextValues(context.routes)}`,
     "",
     "Check for missing:",
     "1. Input validation (if accepts user input)",
@@ -76,6 +86,79 @@ export function buildSecurityReviewPrompt(source: SourceFile, code: string): str
     "",
     "Return JSON with missing, severity, and suggestion."
   ].join("\n");
+}
+
+export function buildSecurityReviewContext(source: SourceFile): SecurityReviewContext {
+  return {
+    framework: detectFramework(source),
+    functionNames: detectedFunctionNames(source.text),
+    routes: detectedRoutes(source.text)
+  };
+}
+
+function detectFramework(source: SourceFile): string {
+  const text = source.text;
+  if (/\b(?:from\s+fastapi\s+import|FastAPI\s*\()/i.test(text)) {
+    return "FastAPI";
+  }
+  if (/\b(?:from\s+flask\s+import|Flask\s*\(|Blueprint\s*\()/i.test(text)) {
+    return "Flask";
+  }
+  if (/\b(?:django|urlpatterns|path\s*\()/i.test(text)) {
+    return "Django";
+  }
+  if (/\b(?:@nestjs|NestFactory)\b/i.test(text)) {
+    return "NestJS";
+  }
+  if (/\b(?:from\s+['"]express['"]|require\s*\(\s*['"]express['"]\s*\)|express\s*\()/i.test(text)) {
+    return "Express";
+  }
+  if (/\b(?:from\s+['"]koa['"]|require\s*\(\s*['"]koa['"]\s*\)|new\s+Koa\s*\()/i.test(text)) {
+    return "Koa";
+  }
+  if (source.languageId === "typescriptreact" || /<\s*[A-Z][A-Za-z0-9]*/.test(text)) {
+    return "React";
+  }
+  return "Unknown";
+}
+
+function detectedFunctionNames(text: string): string[] {
+  const names = new Set<string>();
+  const patterns = [
+    /\b(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g,
+    /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>/g,
+    /\b(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      if (match[1]) {
+        names.add(match[1]);
+      }
+    }
+  }
+  return [...names].slice(0, 12);
+}
+
+function detectedRoutes(text: string): string[] {
+  const routes = new Set<string>();
+  const patterns = [
+    /\b(?:app|router)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    /@(?:app|router|blueprint)\.(route|get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/gi
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const method = match[1]?.toUpperCase() ?? "ROUTE";
+      const path = match[2];
+      if (path) {
+        routes.add(`${method} ${path}`);
+      }
+    }
+  }
+  return [...routes].slice(0, 12);
+}
+
+function formatContextValues(values: readonly string[]): string {
+  return values.length > 0 ? values.join(", ") : "Not confidently detected";
 }
 
 function findJavaScriptEndpoints(text: string): EndpointCandidate[] {
@@ -153,6 +236,24 @@ function evaluateEndpoint(endpoint: EndpointCandidate): SemanticRuleResult[] {
     });
   }
 
+  if (usesUserInput(endpoint) && usesDatabase(lower) && hasDynamicSql(lower) && !hasParameterizedQuery(lower)) {
+    results.push({
+      ruleId: "l3_missing_parameterized_queries",
+      severity: "high",
+      message: `Endpoint ${endpoint.method.toUpperCase()} ${endpoint.path} appears to build a database query from request input without bound parameters.`,
+      suggestion: "Use a prepared statement or query parameters instead of interpolating request values into SQL."
+    });
+  }
+
+  if (performsIo(lower) && !hasErrorHandling(lower)) {
+    results.push({
+      ruleId: "l3_missing_error_handling",
+      severity: "low",
+      message: `Endpoint ${endpoint.method.toUpperCase()} ${endpoint.path} performs IO without obvious error handling.`,
+      suggestion: "Handle failures with try/catch, promise rejection handling, or framework-specific error middleware and return a safe error response."
+    });
+  }
+
   if (returnsHtml(endpoint) && !hasOutputEncoding(lower)) {
     results.push({
       ruleId: "l3_missing_output_encoding",
@@ -177,6 +278,29 @@ function usesUserInput(endpoint: EndpointCandidate): boolean {
   return /\b(req\.(?:body|query|params)|request\.(?:json|form|args)|body|query|params)\b/i.test(endpoint.snippet);
 }
 
+function usesDatabase(lowerSnippet: string): boolean {
+  return /\b(?:db|database|pool|client|connection|conn|session|cursor|repository)\s*\.\s*(?:query|execute|raw|find|create|update|delete|insert)\b|\b(?:select|insert|update|delete)\b/.test(
+    lowerSnippet
+  );
+}
+
+function hasDynamicSql(lowerSnippet: string): boolean {
+  return /\b(?:select|insert|update|delete)\b[\s\S]{0,300}(?:\$\{|\+|\{[a-z_$]|%\s*(?:\(|[a-z_$]))/.test(lowerSnippet);
+}
+
+function hasParameterizedQuery(lowerSnippet: string): boolean {
+  return /\b(?:query|execute)\s*\(\s*[^,\n]+,\s*(?:\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|params?\b|values?\b)/.test(lowerSnippet);
+}
+
+function performsIo(lowerSnippet: string): boolean {
+  return (
+    usesDatabase(lowerSnippet) ||
+    /\b(?:fetch|axios\.(?:get|post|put|patch|delete)|requests\.(?:get|post|put|patch|delete)|http\.get|fs\.(?:readFile|readFileSync|writeFile|writeFileSync|createReadStream)|open|send_file|(?:child_process\.)?exec|subprocess\.(?:call|run|popen))\s*\(/.test(
+      lowerSnippet
+    )
+  );
+}
+
 function returnsHtml(endpoint: EndpointCandidate): boolean {
   return /\b(?:res\.send|return)\s*\(?\s*[`"'][\s\S]{0,120}<[a-z][\s\S]*>/i.test(endpoint.snippet);
 }
@@ -191,6 +315,10 @@ function hasRateLimit(lowerSnippet: string): boolean {
 
 function hasInputValidation(lowerSnippet: string): boolean {
   return /\b(validate|validated|validator|schema|zod|joi|yup|pydantic|sanitize|escape|safeparse|parse_obj|basemodel)\b/.test(lowerSnippet);
+}
+
+function hasErrorHandling(lowerSnippet: string): boolean {
+  return /\btry\s*(?:\{|:)|\bcatch\s*\(|\.catch\s*\(|\bexcept\b|\bonerror\b|\b(?:handle|error)_?handler\b/.test(lowerSnippet);
 }
 
 function hasOutputEncoding(lowerSnippet: string): boolean {

@@ -250,7 +250,7 @@
         "vibeguard.llmBaseUrl": {
           "type": "string",
           "default": "",
-          "description": "Optional provider base URL override for L3 semantic analysis, useful for compatible gateways or local Ollama hosts."
+          "description": "Optional provider base URL override for L3 semantic analysis. Remote endpoints must use HTTPS; HTTP is allowed only for loopback local development hosts."
         },
         "vibeguard.dedupWithExistingTools": {
           "type": "boolean",

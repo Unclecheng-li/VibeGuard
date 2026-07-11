@@ -1,4 +1,14 @@
-import type { DetectionLayer, Finding, ScanOptions, ScanPerformance, ScanPerformanceBudgets, ScanResult, ScanTimings, SourceFile } from "./types";
+import type {
+  DetectionLayer,
+  Finding,
+  PackageReference,
+  ScanOptions,
+  ScanPerformance,
+  ScanPerformanceBudgets,
+  ScanResult,
+  ScanTimings,
+  SourceFile
+} from "./types";
 import { detectCustomRules } from "./customRules";
 import { dedupWithExistingToolAnnotations } from "./dedup";
 import { applyIgnoredFindingIds, applyIgnoreRules } from "./ignore";
@@ -153,8 +163,15 @@ async function detectHallucinatedPackages(source: SourceFile, options: ScanOptio
   const references = parsePackageReferences(source.filePath, source.text, source.languageId);
   const findings: Finding[] = [];
 
-  for (const reference of references) {
-    const resolution = await verifier.verify(reference, mode);
+  const resolutions = await mapWithConcurrency(references, 5, (reference) => verifier.verify(reference, mode));
+  for (const [index, reference] of references.entries()) {
+    const resolution = resolutions[index];
+    if (resolution.exists === null) {
+      if (mode === "remote") {
+        findings.push(createUnverifiedPackageFinding(source.filePath, reference, resolution.message, options.now ?? Date.now()));
+      }
+      continue;
+    }
     if (resolution.exists !== false) {
       continue;
     }
@@ -203,6 +220,61 @@ async function detectHallucinatedPackages(source: SourceFile, options: ScanOptio
   }
 
   return findings;
+}
+
+function createUnverifiedPackageFinding(
+  file: string,
+  reference: PackageReference,
+  detail: string | undefined,
+  timestamp: number
+): Finding {
+  const message = `"${reference.packageName}" could not be verified in ${reference.registry}.`;
+  const suggestion = [
+    "VibeGuard could not confirm this package because the local index had no answer and the remote registry was unavailable.",
+    detail,
+    "Check registry connectivity or synchronize the local package-name index before installing it."
+  ]
+    .filter((item): item is string => Boolean(item))
+    .join(" ");
+  const finding: Finding = {
+    id: "",
+    type: "other",
+    severity: "medium",
+    message,
+    file,
+    line: reference.line,
+    column: reference.column,
+    endLine: reference.endLine,
+    endColumn: reference.endColumn,
+    evidence: reference.packageName,
+    suggestion,
+    detection_layer: "L1",
+    detection_rule: `package_verification_unavailable_${reference.registry}`,
+    timestamp,
+    dismissed: false
+  };
+  finding.id = packageFindingId(finding.file, finding.detection_rule, finding.line, finding.column, reference.packageName);
+  return finding;
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await worker(items[index]);
+      }
+    })
+  );
+  return results;
 }
 
 function formatPackageSuggestion(packageName: string, registry: string, suggestions: string[], detail?: string): string {
