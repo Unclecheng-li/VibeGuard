@@ -192,6 +192,12 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Set up Node.js 22
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: ${{ github.action_path }}/package-lock.json
     - name: Install VibeGuard dependencies
       shell: bash
       working-directory: ${{ github.action_path }}

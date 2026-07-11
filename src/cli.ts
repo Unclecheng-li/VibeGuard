@@ -33,7 +33,7 @@ import { syncConfiguredPackageIndexes, type ConfiguredPackageSyncResult } from "
 import { readPackageNameFile } from "./package/importer";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage, type PackageStorageKind } from "./package/storage";
-import { fetchPackageNames, type SyncableRegistry } from "./package/sync";
+import { fetchNpmChangeSnapshot, fetchPackageNames, type SyncableRegistry } from "./package/sync";
 import { defaultSqlitePath } from "./package/sqliteStore";
 import {
   buildScanReport,
@@ -1686,6 +1686,14 @@ async function syncPackageIndex(args: string[]): Promise<void> {
     throw new Error("Usage: vibeguard packages sync <npm|pypi|cargo|gomod|maven> [--limit n] [--full|--partial] [--url URL]");
   }
 
+  let npmSnapshot;
+  if (registry === "npm") {
+    try {
+      npmSnapshot = await fetchNpmChangeSnapshot(sourceUrl);
+    } catch {
+      // A full sync remains valid when a mirror omits its optional replication snapshot endpoint.
+    }
+  }
   const syncResult = await fetchPackageNames({
     registry,
     sourceUrl,
@@ -1697,7 +1705,8 @@ async function syncPackageIndex(args: string[]): Promise<void> {
     indexPath,
     sqlitePath
   });
-  const entry = await storage.packageIndex.importPackageNames(registry, syncResult.names, effectiveCoverage);
+  const syncMetadata = npmSnapshot ? { ...syncResult.syncMetadata, ...npmSnapshot } : syncResult.syncMetadata;
+  const entry = await storage.packageIndex.importPackageNames(registry, syncResult.names, effectiveCoverage, syncMetadata);
   const payload = {
     ...entry,
     imported: syncResult.names.length,
@@ -1940,13 +1949,20 @@ function printConfiguredPackageSyncReport(
 
   for (const entry of result.results) {
     if (entry.status === "skipped") {
+      const status = entry.reason === "not-modified" ? "registry not modified (304), skipped" : "fresh, skipped";
       console.log(
-        `${entry.registry}: fresh, skipped (${entry.packageCount ?? 0} package(s), ${entry.coverage ?? "unknown"} coverage, updated ${formatTimestamp(entry.updatedAt)})`
+        `${entry.registry}: ${status} (${entry.packageCount ?? 0} package(s), ${entry.coverage ?? "unknown"} coverage, updated ${formatTimestamp(entry.updatedAt)})`
       );
     } else if (entry.status === "synced") {
-      console.log(
-        `${entry.registry}: synced ${entry.imported ?? 0} package name(s), ${entry.coverage ?? entry.effectiveCoverage ?? "partial"} coverage (${entry.reason})`
-      );
+      if (entry.incremental) {
+        console.log(
+          `${entry.registry}: applied ${entry.additions ?? 0} addition(s) and ${entry.removals ?? 0} removal(s) from ${entry.changesFetched ?? 0} incremental change(s), ${entry.coverage ?? entry.effectiveCoverage ?? "partial"} coverage (${entry.reason})`
+        );
+      } else {
+        console.log(
+          `${entry.registry}: synced ${entry.imported ?? 0} package name(s), ${entry.coverage ?? entry.effectiveCoverage ?? "partial"} coverage (${entry.reason})`
+        );
+      }
       if (entry.pagesFetched && entry.pagesFetched > 1) {
         console.log(`${entry.registry}: fetched ${entry.pagesFetched} page(s).`);
       }
@@ -2134,7 +2150,7 @@ Examples:
   vibeguard packages import npm ./npm-packages.txt --partial
   vibeguard packages sync npm --limit 100000 --partial
   vibeguard packages sync-config --config ~/.vibeguard/config.json
-  vibeguard scan src --package-index ~/.vibeguard/package-index.json
+  vibeguard scan src --package-index ~/.vibeguard/package-index.json.gz
 `);
 }
 

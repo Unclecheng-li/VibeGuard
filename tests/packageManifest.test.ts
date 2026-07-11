@@ -15,14 +15,17 @@ test("VSCode manifest exposes dashboard, batch-fix, and Pro subscription command
   };
   const command = manifest.contributes.commands.find((item) => item.command === "vibeguard.exportDashboard");
   const batchFixCommand = manifest.contributes.commands.find((item) => item.command === "vibeguard.applyAllSafeFixes");
+  const proBatchFixCommand = manifest.contributes.commands.find((item) => item.command === "vibeguard.applyAllProFixes");
   const subscriptionCommand = manifest.contributes.commands.find((item) => item.command === "vibeguard.showSubscriptionStatus");
 
   assert.ok(manifest.activationEvents.includes("onCommand:vibeguard.exportDashboard"));
   assert.ok(manifest.activationEvents.includes("onCommand:vibeguard.applyAllSafeFixes"));
+  assert.ok(manifest.activationEvents.includes("onCommand:vibeguard.applyAllProFixes"));
   assert.ok(manifest.activationEvents.includes("onCommand:vibeguard.showSubscriptionStatus"));
   assert.ok(command);
   assert.equal(command.title, "VibeGuard: Export Findings Dashboard");
   assert.equal(batchFixCommand?.title, "VibeGuard: Apply All Safe Fixes in Current File");
+  assert.equal(proBatchFixCommand?.title, "VibeGuard: Review and Apply All Pro Fixes in Current File");
   assert.equal(subscriptionCommand?.title, "VibeGuard: Show Pro Subscription Status");
   assert.match(vscodeIgnore, /^deploy\/\*\*$/m);
 });

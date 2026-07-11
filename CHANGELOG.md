@@ -25,6 +25,10 @@
 - Mechanical quick fixes for high-confidence L2 `innerHTML` and unsafe `yaml.load()` findings, plus L1 YAML loader findings.
 - Package-name remote sync expanded beyond npm/PyPI to Cargo crates, Go module index, and Maven Central search for richer local indexes.
 - Config-driven package index refresh via `vibeguard packages sync-config`, honoring `package_cache.languages`, `update_interval`, and `lightweight_mode`.
+- Configured package-index refreshes now persist ETag/Last-Modified metadata and use same-source conditional requests, refreshing a `304 Not Modified` index timestamp without downloading or reimporting its package list.
+- JSON package-name indexes now default to gzip-compressed `package-index.json.gz`; existing plain `package-index.json` indexes are read automatically and migrate on their next write.
+- Stale npm package indexes now use the same-source replication `_changes` sequence to apply additions and deletions incrementally; `packages sync npm` also saves its initial sequence, while changed mirrors, forced refreshes, and unsupported change feeds retain the full-sync fallback.
+- Added `VibeGuard: Review and Apply All Pro Fixes in Current File`, which combines deterministic L1/L2 fixes with a multi-select, evidence-validated review of non-overlapping L3 replacements when the official Pro provider is configured.
 - VSCode startup background package-cache sync with workspace package-manager detection, status-bar progress, output logging, and a manual `VibeGuard: Sync Package Cache` command.
 - VSCode first-run onboarding now explains that L1 secret/config/AI-pattern checks are active immediately while package-cache sync prepares hallucinated-package detection.
 - L3 semantic analysis can now use DeepSeek/OpenAI-compatible, Claude, or local Ollama providers, with CLI/LSP environment-variable credentials, VSCode SecretStorage commands, structured JSON finding parsing, and local fallback.
@@ -67,8 +71,23 @@
 - One-time service-token dashboard sign-in now redirects to a URL with the token query parameter removed while preserving non-sensitive filters.
 - Expanded high-confidence L2 path-traversal coverage to Node.js `fs` and `fs.promises` write, append, stream, and deletion operations when their paths include user-controlled input.
 - Expanded high-confidence L2 SSRF coverage to Axios configuration targets, Node HTTP(S), HTTPX, Requests request methods, and common non-GET/POST outbound calls without treating request bodies as URL targets.
+- Added high-confidence Java L2 SSRF detection for servlet request input passed directly to `RestTemplate`, `WebClient`, JDK `HttpRequest`, or OkHttp `Request.Builder` URL targets.
 - Expanded high-confidence L2 command-injection coverage to Node `execSync` and Python `subprocess.check_call` / `check_output` when commands include user-controlled input.
 - Remote L3 providers now receive high-confidence secret literals and complete private-key blocks only as redacted placeholders; local Ollama analysis remains local and unredacted.
 - Unavailable npm/PyPI verification results are no longer cached as package verdicts, so remote-mode scans automatically retry when registry connectivity returns.
 - Concurrent references to the same unknown npm/PyPI dependency now share a single remote verification request.
 - VSCode cold-start package sync now prioritizes detected workspace package managers before queuing every other configured registry.
+- Local and remote L3 context now recognizes Spring MVC mappings, class-level route prefixes, Java controller methods, and common Spring authentication, rate-limit, validation, and error-handling controls.
+- Remote L3 prompts now include only the source filename, not the local directory path, alongside existing high-confidence secret redaction.
+- L3 prompt construction now prioritizes bounded Express, Python, and Spring route-handler bodies with original file line numbers, adds request-to-sink data-flow review guidance, and treats supplied source text as untrusted data rather than model instructions.
+- Local and remote L3 analysis now recognizes scoped Express/Router authentication and rate-limit middleware, avoiding missing-control findings only for the routes those middleware registrations cover.
+- Local L3 analysis now resolves Django `urlpatterns` `path` and `re_path` function views plus conservative standalone `views.py` response functions, recognizing common authentication, rate limiting, HTTP-method, and Django form-validation controls.
+- Critical VSCode alerts now include a local `Learn More` action that opens source and shows the finding's rule, evidence, suggestion, and safe-fix availability.
+- The shared LSP server now follows the PRD's layered timing model for JetBrains and other clients: immediate L1, debounced L2/L3, and full analysis on save with stale-result protection.
+- Added high-confidence Java L2 path-traversal checks for direct servlet request input reaching `Files`, `Paths`, or `File` APIs, with Semgrep export support.
+- Extended cold-start remote package verification beyond npm/PyPI to Cargo, Go module proxy, and Maven Central, including Maven coordinate-result checks and non-caching handling for unavailable or rate-limited registries.
+- Added Java L2 checks for request-controlled Servlet/Spring redirect targets and 5xx responses that expose exception messages, with Semgrep export support.
+- Added L1 Java external-class import verification through Maven Central's class index, while excluding JDK, static, and wildcard imports that cannot be safely resolved this way.
+- Java import verification now also excludes Java SE `javax` platform APIs and DOM/SAX namespaces while preserving checks for external `javax` packages such as Servlet, JPA, and JAXB.
+- Cargo cold-start package verification now treats Rust crate underscores and Cargo package hyphens as equivalent, so `use actix_web::...` resolves `actix-web` immediately and known hallucinated crate imports are flagged before index sync completes.
+- Pinned development, CI, release builds, Docker images, and the composite GitHub Action to Node.js 22 LTS after verifying an intermittent Node.js 24.14.1 V8 shutdown failure in the Tree-sitter and SQLite test combination; test runs now fail early with an LTS runtime instruction instead of reaching that runtime failure.

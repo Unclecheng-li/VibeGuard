@@ -119,6 +119,8 @@ export interface ScanPerformance {
 export interface PackageReference {
   registry: PackageRegistry;
   packageName: string;
+  /** Maven artifacts use coordinates; Java source imports are checked as fully qualified classes. */
+  mavenLookup?: "coordinate" | "class";
   rawSpecifier: string;
   line: number;
   column: number;
@@ -157,11 +159,20 @@ export interface CustomRuleLike {
   languages?: string[];
 }
 
+export interface PackageIndexSyncMetadata {
+  sourceUrl?: string;
+  etag?: string;
+  lastModified?: string;
+  changeSourceUrl?: string;
+  changeSequence?: string;
+}
+
 export interface PackageIndexEntry {
   registry: PackageRegistry;
   coverage: "partial" | "full";
   updatedAt: number;
   packageCount: number;
+  syncMetadata?: PackageIndexSyncMetadata;
 }
 
 export interface PackageNameIndexLike {

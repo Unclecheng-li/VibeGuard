@@ -59,15 +59,27 @@ test("exports VibeGuard rules as Semgrep YAML", () => {
   assert.equal(redirectRule?.metadata.vibeguard.finding_type, "open_redirect");
   assert.equal(redirectRule?.severity, "WARNING");
 
+  const javaRedirectRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_open_redirect_java_request_input");
+  assert.deepEqual(javaRedirectRule?.languages, ["java"]);
+  assert.match(javaRedirectRule?.["pattern-regex"] ?? "", /sendRedirect/);
+
   const pathTraversalRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_path_traversal_fs_user_input");
   assert.equal(pathTraversalRule?.metadata.vibeguard.finding_type, "path_traversal");
   assert.match(pathTraversalRule?.["pattern-regex"] ?? "", /writeFile/);
   assert.match(pathTraversalRule?.["pattern-regex"] ?? "", /promises/);
 
+  const javaPathTraversalRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_path_traversal_java_request_input");
+  assert.deepEqual(javaPathTraversalRule?.languages, ["java"]);
+  assert.match(javaPathTraversalRule?.["pattern-regex"] ?? "", /Files/);
+
   const ssrfRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_ssrf_fetch_user_url");
   assert.equal(ssrfRule?.metadata.vibeguard.finding_type, "ssrf");
   assert.match(ssrfRule?.["pattern-regex"] ?? "", /axios/);
   assert.match(ssrfRule?.["pattern-regex"] ?? "", /httpx/);
+
+  const javaSsrfRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_ssrf_java_request_url");
+  assert.deepEqual(javaSsrfRule?.languages, ["java"]);
+  assert.match(javaSsrfRule?.["pattern-regex"] ?? "", /RestTemplate/i);
 
   const commandRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_command_injection_os_system");
   assert.equal(commandRule?.metadata.vibeguard.finding_type, "command_injection");
@@ -77,6 +89,10 @@ test("exports VibeGuard rules as Semgrep YAML", () => {
   const leakageRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_information_leakage_error_details");
   assert.equal(leakageRule?.metadata.vibeguard.finding_type, "information_leakage");
   assert.match(leakageRule?.["pattern-regex"] ?? "", /database/);
+
+  const javaLeakageRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_information_leakage_java_error_details");
+  assert.deepEqual(javaLeakageRule?.languages, ["java"]);
+  assert.match(javaLeakageRule?.["pattern-regex"] ?? "", /sendError/);
 });
 
 test("allows custom Semgrep rule id prefixes", () => {

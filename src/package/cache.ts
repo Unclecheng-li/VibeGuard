@@ -1,8 +1,19 @@
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
-import type { PackageIndexEntry, PackageNameIndexLike, PackageRegistry, PackageResolution } from "../types";
+import { gzip, gunzip } from "zlib";
+import { promisify } from "util";
+import type {
+  PackageIndexEntry,
+  PackageIndexSyncMetadata,
+  PackageNameIndexLike,
+  PackageRegistry,
+  PackageResolution
+} from "../types";
 import { suggestPackageNames } from "./suggestions";
+
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 
 export interface PackageCacheStore {
   get(registry: PackageRegistry, packageName: string): Promise<PackageResolution | undefined>;
@@ -13,6 +24,7 @@ interface IndexRegistryData {
   coverage: "partial" | "full";
   updatedAt: number;
   packages: string[];
+  syncMetadata?: PackageIndexSyncMetadata;
 }
 
 interface IndexFileData {
@@ -72,7 +84,10 @@ export class JsonPackageCache implements PackageCacheStore {
 }
 
 export class JsonPackageNameIndex implements PackageNameIndexLike {
-  private registries = new Map<PackageRegistry, { coverage: "partial" | "full"; updatedAt: number; packages: Set<string> }>();
+  private registries = new Map<
+    PackageRegistry,
+    { coverage: "partial" | "full"; updatedAt: number; packages: Set<string>; syncMetadata?: PackageIndexSyncMetadata }
+  >();
   private loaded = false;
 
   constructor(private readonly filePath: string = defaultIndexPath()) {}
@@ -106,7 +121,8 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
   async importPackageNames(
     registry: PackageRegistry,
     packageNames: Iterable<string>,
-    coverage: "partial" | "full" = "partial"
+    coverage: "partial" | "full" = "partial",
+    syncMetadata?: PackageIndexSyncMetadata
   ): Promise<PackageIndexEntry> {
     await this.load();
     const existing = this.registries.get(registry);
@@ -122,7 +138,8 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
     const entry = {
       coverage,
       updatedAt: Date.now(),
-      packages
+      packages,
+      syncMetadata: mergeSyncMetadata(existing?.syncMetadata, syncMetadata)
     };
     this.registries.set(registry, entry);
     await this.save();
@@ -130,7 +147,68 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
       registry,
       coverage,
       updatedAt: entry.updatedAt,
-      packageCount: packages.size
+      packageCount: packages.size,
+      ...(entry.syncMetadata ? { syncMetadata: entry.syncMetadata } : {})
+    };
+  }
+
+  async touch(registry: PackageRegistry, syncMetadata?: PackageIndexSyncMetadata): Promise<PackageIndexEntry> {
+    await this.load();
+    const existing = this.registries.get(registry);
+    if (!existing) {
+      throw new Error(`Cannot refresh missing ${registry} package index.`);
+    }
+    const entry = {
+      ...existing,
+      updatedAt: Date.now(),
+      syncMetadata: mergeSyncMetadata(existing.syncMetadata, syncMetadata)
+    };
+    this.registries.set(registry, entry);
+    await this.save();
+    return {
+      registry,
+      coverage: entry.coverage,
+      updatedAt: entry.updatedAt,
+      packageCount: entry.packages.size,
+      ...(entry.syncMetadata ? { syncMetadata: entry.syncMetadata } : {})
+    };
+  }
+
+  async applyPackageNameChanges(
+    registry: PackageRegistry,
+    additions: Iterable<string>,
+    removals: Iterable<string>,
+    syncMetadata?: PackageIndexSyncMetadata
+  ): Promise<PackageIndexEntry> {
+    await this.load();
+    const existing = this.registries.get(registry);
+    if (!existing) {
+      throw new Error(`Cannot apply changes to missing ${registry} package index.`);
+    }
+    const packages = new Set(existing.packages);
+    for (const packageName of additions) {
+      const normalized = normalizePackageName(packageName);
+      if (normalized) {
+        packages.add(normalized);
+      }
+    }
+    for (const packageName of removals) {
+      packages.delete(normalizePackageName(packageName));
+    }
+    const entry = {
+      coverage: existing.coverage,
+      updatedAt: Date.now(),
+      packages,
+      syncMetadata: mergeSyncMetadata(existing.syncMetadata, syncMetadata)
+    };
+    this.registries.set(registry, entry);
+    await this.save();
+    return {
+      registry,
+      coverage: entry.coverage,
+      updatedAt: entry.updatedAt,
+      packageCount: packages.size,
+      ...(entry.syncMetadata ? { syncMetadata: entry.syncMetadata } : {})
     };
   }
 
@@ -141,7 +219,8 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
         registry,
         coverage: data.coverage,
         updatedAt: data.updatedAt,
-        packageCount: data.packages.size
+        packageCount: data.packages.size,
+        ...(data.syncMetadata ? { syncMetadata: data.syncMetadata } : {})
       }))
       .sort((a, b) => a.registry.localeCompare(b.registry));
   }
@@ -152,8 +231,9 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
     }
     this.loaded = true;
     try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as IndexFileData;
+      const raw = await this.readIndexFile();
+      const contents = isGzip(raw) ? (await gunzipAsync(raw)).toString("utf8") : raw.toString("utf8");
+      const parsed = JSON.parse(contents) as IndexFileData;
       for (const [registry, data] of Object.entries(parsed.registries ?? {})) {
         if (!isRegistry(registry) || !data) {
           continue;
@@ -161,7 +241,8 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
         this.registries.set(registry, {
           coverage: data.coverage === "full" ? "full" : "partial",
           updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : 0,
-          packages: new Set((data.packages ?? []).map(normalizePackageName).filter(Boolean))
+          packages: new Set((data.packages ?? []).map(normalizePackageName).filter(Boolean)),
+          ...(data.syncMetadata ? { syncMetadata: data.syncMetadata } : {})
         });
       }
     } catch (error) {
@@ -179,11 +260,41 @@ export class JsonPackageNameIndex implements PackageNameIndexLike {
       registries[registry] = {
         coverage: data.coverage,
         updatedAt: data.updatedAt,
-        packages: [...data.packages].sort()
+        packages: [...data.packages].sort(),
+        ...(data.syncMetadata ? { syncMetadata: data.syncMetadata } : {})
       };
     }
-    await fs.writeFile(this.filePath, JSON.stringify({ registries }, null, 2), "utf8");
+    const contents = JSON.stringify({ registries }, null, 2);
+    await fs.writeFile(this.filePath, this.filePath.endsWith(".gz") ? await gzipAsync(contents) : contents, "utf8");
   }
+
+  private async readIndexFile(): Promise<Buffer> {
+    try {
+      return await fs.readFile(this.filePath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const legacyFilePath = this.legacyFilePath();
+      if (code !== "ENOENT" || !legacyFilePath) {
+        throw error;
+      }
+      return fs.readFile(legacyFilePath);
+    }
+  }
+
+  private legacyFilePath(): string | undefined {
+    return this.filePath.endsWith(".json.gz") ? this.filePath.slice(0, -3) : undefined;
+  }
+}
+
+function mergeSyncMetadata(
+  existing: PackageIndexSyncMetadata | undefined,
+  incoming: PackageIndexSyncMetadata | undefined
+): PackageIndexSyncMetadata | undefined {
+  if (incoming?.sourceUrl && existing?.sourceUrl && incoming.sourceUrl !== existing.sourceUrl) {
+    return incoming;
+  }
+  const merged = { ...existing, ...incoming };
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 export function defaultCachePath(): string {
@@ -191,7 +302,7 @@ export function defaultCachePath(): string {
 }
 
 export function defaultIndexPath(): string {
-  return path.join(os.homedir(), ".vibeguard", "package-index.json");
+  return path.join(os.homedir(), ".vibeguard", "package-index.json.gz");
 }
 
 function cacheKey(registry: PackageRegistry, packageName: string): string {
@@ -204,4 +315,8 @@ function normalizePackageName(packageName: string): string {
 
 function isRegistry(value: string): value is PackageRegistry {
   return ["npm", "pypi", "cargo", "gomod", "maven"].includes(value);
+}
+
+function isGzip(value: Buffer): boolean {
+  return value.length >= 2 && value[0] === 0x1f && value[1] === 0x8b;
 }

@@ -1,4 +1,4 @@
-import type { PackageIndexEntry, PackageNameIndexLike, PackageRegistry } from "../types";
+import type { PackageIndexEntry, PackageIndexSyncMetadata, PackageNameIndexLike, PackageRegistry } from "../types";
 import {
   JsonPackageCache,
   JsonPackageNameIndex,
@@ -19,8 +19,16 @@ export interface PackageIndexStore extends PackageNameIndexLike {
   importPackageNames(
     registry: PackageRegistry,
     packageNames: Iterable<string>,
-    coverage?: "partial" | "full"
+    coverage?: "partial" | "full",
+    syncMetadata?: PackageIndexSyncMetadata
   ): Promise<PackageIndexEntry>;
+  applyPackageNameChanges(
+    registry: PackageRegistry,
+    additions: Iterable<string>,
+    removals: Iterable<string>,
+    syncMetadata?: PackageIndexSyncMetadata
+  ): Promise<PackageIndexEntry>;
+  touch(registry: PackageRegistry, syncMetadata?: PackageIndexSyncMetadata): Promise<PackageIndexEntry>;
   stats(): Promise<PackageIndexEntry[]>;
 }
 

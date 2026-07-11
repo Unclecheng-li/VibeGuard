@@ -23,6 +23,17 @@ test("VSCode routes L3 fixes through a confirmation command", async () => {
   assert.match(source, /command: "vibeguard\.applyFix"/);
 });
 
+test("VSCode reviews current L3 edits before applying a Pro file batch", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /registerCommand\("vibeguard\.applyAllProFixes"/);
+  assert.match(source, /configuredLlmProvider\(loadedConfig\.config\) !== "vibeguard"/);
+  assert.match(source, /pickReviewedL3Fixes/);
+  assert.match(source, /Review VibeGuard Pro LLM Fixes/);
+  assert.match(source, /l3FixStillMatchesDocument/);
+  assert.match(source, /Apply reviewed fixes/);
+});
+
 test("VSCode keeps Pro credentials on the configured service origin", async () => {
   const source = await fs.readFile("src/extension.ts", "utf8");
 
@@ -51,4 +62,15 @@ test("VSCode defers remote package verification outside the realtime L1 path", a
   assert.match(source, /includeL3: true,[\s\S]{0,160}scheduleRemotePackageVerification: true/);
   assert.match(source, /packageVerification: "remote"/);
   assert.match(source, /document\.version !== documentVersion/);
+});
+
+test("critical VSCode alerts provide local finding details before the user dismisses them", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /"Learn More"/);
+  assert.match(source, /showFindingDetails\(critical\)/);
+  assert.match(source, /Finding Details/);
+  assert.match(source, /Rule: \$\{finding\.detection_rule\}/);
+  assert.match(source, /Evidence: \$\{finding\.evidence\}/);
+  assert.match(source, /Available fix: \$\{finding\.fix\.description\}/);
 });

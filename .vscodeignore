@@ -9,6 +9,7 @@ deploy/**
 jetbrains/**
 Dockerfile
 .dockerignore
+.nvmrc
 scripts/**
 .gitignore
 tsconfig.json

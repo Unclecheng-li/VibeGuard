@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import type {
   PackageIndexEntry,
+  PackageIndexSyncMetadata,
   PackageNameIndexLike,
   PackageRegistry,
   PackageResolution
@@ -139,7 +140,8 @@ class SqlitePackageDatabase {
   importPackageNames(
     registry: PackageRegistry,
     packageNames: Iterable<string>,
-    coverage: "partial" | "full" = "partial"
+    coverage: "partial" | "full" = "partial",
+    syncMetadata?: PackageIndexSyncMetadata
   ): PackageIndexEntry {
     this.initialize();
     const updatedAt = Date.now();
@@ -163,13 +165,14 @@ class SqlitePackageDatabase {
 
       this.database
         .prepare(
-          `INSERT INTO package_index_registry (registry, coverage, updated_at)
-           VALUES (?, ?, ?)
+          `INSERT INTO package_index_registry (registry, coverage, updated_at, sync_metadata)
+           VALUES (?, ?, ?, ?)
            ON CONFLICT(registry) DO UPDATE SET
              coverage = excluded.coverage,
-             updated_at = excluded.updated_at`
+             updated_at = excluded.updated_at,
+             sync_metadata = COALESCE(excluded.sync_metadata, package_index_registry.sync_metadata)`
         )
-        .run(registry, coverage, updatedAt);
+        .run(registry, coverage, updatedAt, serializeSyncMetadata(syncMetadata));
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -180,19 +183,97 @@ class SqlitePackageDatabase {
       .prepare("SELECT COUNT(*) AS package_count FROM package_index_package WHERE registry = ?")
       .get(registry);
 
-    return {
+    return this.indexEntry(registry, coverage, updatedAt, Number(count?.package_count ?? 0));
+  }
+
+  touchIndex(registry: PackageRegistry, syncMetadata?: PackageIndexSyncMetadata): PackageIndexEntry {
+    this.initialize();
+    const existing = this.database
+      .prepare("SELECT coverage, sync_metadata FROM package_index_registry WHERE registry = ?")
+      .get(registry);
+    if (!existing) {
+      throw new Error(`Cannot refresh missing ${registry} package index.`);
+    }
+    const mergedSyncMetadata = mergeSyncMetadata(parseSyncMetadata(existing.sync_metadata), syncMetadata);
+    const updatedAt = Date.now();
+    this.database
+      .prepare(
+        `UPDATE package_index_registry
+         SET updated_at = ?, sync_metadata = COALESCE(?, sync_metadata)
+         WHERE registry = ?`
+      )
+      .run(updatedAt, serializeSyncMetadata(mergedSyncMetadata), registry);
+    const count = this.database
+      .prepare("SELECT COUNT(*) AS package_count FROM package_index_package WHERE registry = ?")
+      .get(registry);
+    return this.indexEntry(
       registry,
-      coverage,
+      existing.coverage === "full" ? "full" : "partial",
       updatedAt,
-      packageCount: Number(count?.package_count ?? 0)
-    };
+      Number(count?.package_count ?? 0),
+      mergedSyncMetadata
+    );
+  }
+
+  applyIndexChanges(
+    registry: PackageRegistry,
+    additions: Iterable<string>,
+    removals: Iterable<string>,
+    syncMetadata?: PackageIndexSyncMetadata
+  ): PackageIndexEntry {
+    this.initialize();
+    const existing = this.database
+      .prepare("SELECT coverage, sync_metadata FROM package_index_registry WHERE registry = ?")
+      .get(registry);
+    if (!existing) {
+      throw new Error(`Cannot apply changes to missing ${registry} package index.`);
+    }
+
+    const coverage = existing.coverage === "full" ? "full" : "partial";
+    const mergedSyncMetadata = mergeSyncMetadata(parseSyncMetadata(existing.sync_metadata), syncMetadata);
+    const updatedAt = Date.now();
+    this.database.exec("BEGIN");
+    try {
+      const insertPackage = this.database.prepare(
+        `INSERT OR IGNORE INTO package_index_package (registry, package_name)
+         VALUES (?, ?)`
+      );
+      for (const packageName of additions) {
+        const normalized = normalizePackageName(packageName);
+        if (normalized) {
+          insertPackage.run(registry, normalized);
+        }
+      }
+      const deletePackage = this.database.prepare(
+        "DELETE FROM package_index_package WHERE registry = ? AND package_name = ?"
+      );
+      for (const packageName of removals) {
+        deletePackage.run(registry, normalizePackageName(packageName));
+      }
+      this.database
+        .prepare(
+          `UPDATE package_index_registry
+           SET updated_at = ?, sync_metadata = COALESCE(?, sync_metadata)
+           WHERE registry = ?`
+        )
+        .run(updatedAt, serializeSyncMetadata(mergedSyncMetadata), registry);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const count = this.database
+      .prepare("SELECT COUNT(*) AS package_count FROM package_index_package WHERE registry = ?")
+      .get(registry);
+    return this.indexEntry(registry, coverage, updatedAt, Number(count?.package_count ?? 0), mergedSyncMetadata);
   }
 
   stats(): PackageIndexEntry[] {
     this.initialize();
     const rows = this.database
       .prepare(
-        `SELECT r.registry, r.coverage, r.updated_at, COUNT(p.package_name) AS package_count
+        `SELECT r.registry, r.coverage, r.updated_at, r.sync_metadata, COUNT(p.package_name) AS package_count
          FROM package_index_registry r
          LEFT JOIN package_index_package p ON p.registry = r.registry
          GROUP BY r.registry, r.coverage, r.updated_at
@@ -200,12 +281,15 @@ class SqlitePackageDatabase {
       )
       .all();
 
-    return rows.map((row) => ({
-      registry: row.registry as PackageRegistry,
-      coverage: row.coverage === "full" ? "full" : "partial",
-      updatedAt: Number(row.updated_at),
-      packageCount: Number(row.package_count ?? 0)
-    }));
+    return rows.map((row) =>
+      this.indexEntry(
+        row.registry as PackageRegistry,
+        row.coverage === "full" ? "full" : "partial",
+        Number(row.updated_at),
+        Number(row.package_count ?? 0),
+        parseSyncMetadata(row.sync_metadata)
+      )
+    );
   }
 
   close(): void {
@@ -232,7 +316,8 @@ class SqlitePackageDatabase {
       CREATE TABLE IF NOT EXISTS package_index_registry (
         registry TEXT PRIMARY KEY,
         coverage TEXT NOT NULL CHECK (coverage IN ('partial', 'full')),
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        sync_metadata TEXT
       );
       CREATE TABLE IF NOT EXISTS package_index_package (
         registry TEXT NOT NULL,
@@ -241,6 +326,26 @@ class SqlitePackageDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_package_index_registry ON package_index_package(registry);
     `);
+    const columns = this.database.prepare("PRAGMA table_info(package_index_registry)").all();
+    if (!columns.some((column) => column.name === "sync_metadata")) {
+      this.database.exec("ALTER TABLE package_index_registry ADD COLUMN sync_metadata TEXT");
+    }
+  }
+
+  private indexEntry(
+    registry: PackageRegistry,
+    coverage: "partial" | "full",
+    updatedAt: number,
+    packageCount: number,
+    syncMetadata?: PackageIndexSyncMetadata
+  ): PackageIndexEntry {
+    return {
+      registry,
+      coverage,
+      updatedAt,
+      packageCount,
+      ...(syncMetadata ? { syncMetadata } : {})
+    };
   }
 }
 
@@ -286,9 +391,23 @@ export class SqlitePackageNameIndex implements PackageNameIndexLike {
   async importPackageNames(
     registry: PackageRegistry,
     packageNames: Iterable<string>,
-    coverage: "partial" | "full" = "partial"
+    coverage: "partial" | "full" = "partial",
+    syncMetadata?: PackageIndexSyncMetadata
   ): Promise<PackageIndexEntry> {
-    return this.store.importPackageNames(registry, packageNames, coverage);
+    return this.store.importPackageNames(registry, packageNames, coverage, syncMetadata);
+  }
+
+  async touch(registry: PackageRegistry, syncMetadata?: PackageIndexSyncMetadata): Promise<PackageIndexEntry> {
+    return this.store.touchIndex(registry, syncMetadata);
+  }
+
+  async applyPackageNameChanges(
+    registry: PackageRegistry,
+    additions: Iterable<string>,
+    removals: Iterable<string>,
+    syncMetadata?: PackageIndexSyncMetadata
+  ): Promise<PackageIndexEntry> {
+    return this.store.applyIndexChanges(registry, additions, removals, syncMetadata);
   }
 
   async stats(): Promise<PackageIndexEntry[]> {
@@ -335,6 +454,44 @@ function loadSqlite(): SqliteModule {
 
 function normalizePackageName(packageName: string): string {
   return packageName.trim().toLowerCase().replace(/_/g, "-");
+}
+
+function serializeSyncMetadata(value: PackageIndexSyncMetadata | undefined): string | null {
+  return value && Object.keys(value).length > 0 ? JSON.stringify(value) : null;
+}
+
+function parseSyncMetadata(value: unknown): PackageIndexSyncMetadata | undefined {
+  if (typeof value !== "string" || !value) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return undefined;
+    }
+    const input = parsed as Record<string, unknown>;
+    const metadata: PackageIndexSyncMetadata = {
+      ...(typeof input.sourceUrl === "string" ? { sourceUrl: input.sourceUrl } : {}),
+      ...(typeof input.etag === "string" ? { etag: input.etag } : {}),
+      ...(typeof input.lastModified === "string" ? { lastModified: input.lastModified } : {}),
+      ...(typeof input.changeSourceUrl === "string" ? { changeSourceUrl: input.changeSourceUrl } : {}),
+      ...(typeof input.changeSequence === "string" ? { changeSequence: input.changeSequence } : {})
+    };
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeSyncMetadata(
+  existing: PackageIndexSyncMetadata | undefined,
+  incoming: PackageIndexSyncMetadata | undefined
+): PackageIndexSyncMetadata | undefined {
+  if (incoming?.sourceUrl && existing?.sourceUrl && incoming.sourceUrl !== existing.sourceUrl) {
+    return incoming;
+  }
+  const merged = { ...existing, ...incoming };
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 function parseJsonStringArray(value: unknown): string[] | undefined {

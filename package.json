@@ -39,6 +39,7 @@
     "onCommand:vibeguard.showSubscriptionStatus",
     "onCommand:vibeguard.applyFix",
     "onCommand:vibeguard.applyAllSafeFixes",
+    "onCommand:vibeguard.applyAllProFixes",
     "onView:vibeguardFindings"
   ],
   "contributes": {
@@ -110,6 +111,10 @@
       {
         "command": "vibeguard.applyAllSafeFixes",
         "title": "VibeGuard: Apply All Safe Fixes in Current File"
+      },
+      {
+        "command": "vibeguard.applyAllProFixes",
+        "title": "VibeGuard: Review and Apply All Pro Fixes in Current File"
       }
     ],
     "menus": {
@@ -162,7 +167,7 @@
             "off"
           ],
           "default": "seed",
-          "description": "How VibeGuard verifies package names. Seed mode is instant and offline; remote mode also checks npm/PyPI registries."
+          "description": "How VibeGuard verifies package names. Seed mode is instant and offline; remote mode also checks npm, PyPI, Cargo, Go modules, and Maven Central."
         },
         "vibeguard.configPath": {
           "type": "string",
@@ -317,7 +322,7 @@
     "compile": "tsc -p ./",
     "build": "node scripts/build.js",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && node --test \"out/tests/**/*.test.js\"",
+    "test": "node scripts/assert-node-lts.js && npm run compile && node --test \"out/tests/**/*.test.js\"",
     "lint": "tsc --noEmit -p ./",
     "vscode:prepublish": "npm run build",
     "package:vsix": "vsce package --out vibeguard-0.1.0.vsix"

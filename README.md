@@ -6,10 +6,10 @@ This repository implements the core `VibeGuard-PRD.md` roadmap through L3 and th
 
 - VSCode extension shell with real-time diagnostics and a findings sidebar
 - JetBrains plugin module that starts the same bundled LSP server for supported source files
-- L1 scanner for npm/PyPI/Cargo/Go/Maven hallucinated packages, hardcoded secrets, loose config, and expanded AI error patterns
+- L1 scanner for npm/PyPI/Cargo/Go/Maven hallucinated packages, including exact external Java class imports, hardcoded secrets, loose config, and expanded AI error patterns
 - Tree-sitter WASM-backed L2 SAST rules for JavaScript, TypeScript, and Python injection, XSS, unsafe deserialization, redirects, and information leakage, plus high-confidence Java direct-request checks for JDBC, process execution, and ObjectInputStream deserialization
 - Optional L3 semantic checks with DeepSeek, Claude, OpenAI-compatible, local Ollama, or VibeGuard Pro providers, plus local heuristic fallback
-- Local package verification cache with offline seed mode and optional remote npm/PyPI checks
+- Local package verification cache with offline seed mode and optional remote checks for npm, PyPI, Cargo, Go modules, and Maven
 - Local SQLite scan history in `~/.vibeguard/findings.db`
 - CLI scanner for local and CI usage
 - Shared `~/.vibeguard/config.json` defaults for CLI and VSCode scans
@@ -17,10 +17,13 @@ This repository implements the core `VibeGuard-PRD.md` roadmap through L3 and th
 ## Development
 
 ```bash
+nvm use
 npm install
 npm run build
 npm test
 ```
+
+Development, CI, and the Docker image use Node.js 22 LTS. Node.js 24.14.1 has an intermittent V8 shutdown failure when this project's Tree-sitter WASM and experimental SQLite tests run together; use Node 22 for test and release work until that runtime regression is resolved.
 
 To try the extension in VSCode, open this folder in VSCode and run the extension host from the debugger after building.
 
@@ -234,7 +237,7 @@ node dist/cli.js scan . --sarif vibeguard.sarif --github-annotations
 node dist/cli.js scan . --markdown vibeguard-report.md
 node dist/cli.js scan . --format markdown
 node dist/cli.js scan . --ignore-rules ~/.vibeguard/ignore-rules.yml
-node dist/cli.js scan src --package-index ~/.vibeguard/package-index.json
+node dist/cli.js scan src --package-index ~/.vibeguard/package-index.json.gz
 node dist/cli.js scan src --custom-rules ./vibeguard-rules.yml
 node dist/cli.js scan src --no-dedup-existing-tools
 node dist/cli.js config init
@@ -252,7 +255,11 @@ node dist/cli.js findings audit --limit 100
 node dist/cli.js rules export-semgrep --output vibeguard-semgrep.yml
 ```
 
-`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM with detected framework, function, and route context and expects structured JSON findings; before source is sent to a remote provider, high-confidence secret literals are replaced with a placeholder, including complete private-key blocks. Local Ollama analysis keeps the source local and does not apply this transport redaction. Without credentials, VibeGuard falls back to conservative local heuristics for missing authentication, rate limiting, input validation, parameterized database queries, IO error handling, and output encoding around obvious route handlers. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VIBEGUARD_LLM_API_KEY`, or `VIBEGUARD_PRO_API_KEY`; the CLI intentionally has no plaintext API-key flag.
+`--l3` enables semantic endpoint checks. When a configured provider has credentials, VibeGuard calls the LLM with detected framework, function, and route context and expects structured JSON findings; before source is sent to a remote provider, high-confidence secret literals are replaced with a placeholder, including complete private-key blocks, and only the source filename is included rather than its directory path. Local Ollama analysis keeps the source local and does not apply this transport redaction. Without credentials, VibeGuard falls back to conservative local heuristics for missing authentication, rate limiting, input validation, parameterized database queries, IO error handling, and output encoding around Express, FastAPI/Flask, Django, and Spring MVC route handlers. Django support resolves same-file `urlpatterns` `path`/`re_path` entries and standalone `views.py` function views that return Django/DRF responses, while recognizing common auth, rate-limit, HTTP-method, and form-validation decorators. Spring context includes class-level `@RequestMapping` prefixes and method-level mappings, while recognized `@PreAuthorize`, `@RateLimiter`, `@Valid`, and `try`/`catch` controls suppress the corresponding missing-control finding. An LLM may optionally return a replacement for the exact evidence snippet; VibeGuard validates its range, rejects fenced/diff-like output, and exposes it as a non-preferred Quick Fix for review. CLI/LSP API keys are read from environment variables such as `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VIBEGUARD_LLM_API_KEY`, or `VIBEGUARD_PRO_API_KEY`; the CLI intentionally has no plaintext API-key flag. Rust `use` declarations match Cargo package names with either hyphens or underscores, so `use actix_web::...` is resolved against the `actix-web` package during cold-start seed checks as well as in the local index.
+
+When L3 recognizes Express, Python, or Spring route handlers, it sends bounded handler blocks with their original file line numbers instead of blindly truncating the file prefix. The prompt asks the model to trace request-derived values through aliases and helper calls to security-sensitive sinks, and treats comments, strings, and all source text as untrusted data rather than instructions.
+
+For Express and Router files, local L3 also recognizes same-file `app.use`/`router.use` authentication and rate-limit middleware. Controls registered for a path prefix apply only to matching routes, and the detected control scopes are included with remote L3 route reviews.
 
 Provider controls:
 
@@ -266,7 +273,7 @@ VIBEGUARD_PRO_API_KEY=... node dist/cli.js scan src --l3 --llm-provider vibeguar
 
 Remote LLM base URLs must use HTTPS. HTTP is accepted only for `localhost`, `127.0.0.1`, or IPv6 loopback development endpoints; redirects, URL credentials, query parameters, and fragments are rejected before source or API credentials are sent.
 
-The L1 secret scanner combines provider-specific signatures for keys and tokens, sensitive assignment context such as `apiKey`, `clientSecret`, `Authorization`, and `webhookSecret`, Shannon-entropy scoring for random-looking literals, and false-positive filters for placeholders, hashes, fixtures, UUIDs, and normal encoded data. High-confidence JavaScript/TypeScript and Python secret assignments include quick fixes that replace committed literals with environment-variable reads. The AI pattern library covers common generated-code mistakes such as placeholder credentials, unsafe JWT handling, wildcard CORS with credentials, disabled TLS verification, weak password hashing, plaintext password comparison, insecure random token generation, placeholder framework secrets, and public object-storage ACLs. L2 covers high-confidence SQL injection, XSS, SSRF, path traversal, unsafe deserialization, command injection, open redirect, and error-detail leakage patterns; SSRF covers request-controlled targets across Fetch, Axios, Node HTTP(S), Requests, HTTPX, and common methods, command injection includes synchronous Node and Python execution APIs, while path traversal includes Node `fs` and `fs.promises` reads, writes, appends, streams, and deletes whose paths are user-controlled. High-confidence `innerHTML` and unsafe `yaml.load()` findings include mechanical quick fixes.
+The L1 secret scanner combines provider-specific signatures for keys and tokens, sensitive assignment context such as `apiKey`, `clientSecret`, `Authorization`, and `webhookSecret`, Shannon-entropy scoring for random-looking literals, and false-positive filters for placeholders, hashes, fixtures, UUIDs, and normal encoded data. High-confidence JavaScript/TypeScript and Python secret assignments include quick fixes that replace committed literals with environment-variable reads. The AI pattern library covers common generated-code mistakes such as placeholder credentials, unsafe JWT handling, wildcard CORS with credentials, disabled TLS verification, weak password hashing, plaintext password comparison, insecure random token generation, placeholder framework secrets, and public object-storage ACLs. L2 covers high-confidence SQL injection, XSS, SSRF, path traversal, unsafe deserialization, command injection, open redirect, and error-detail leakage patterns; SSRF covers request-controlled URL targets across Fetch, Axios, Node HTTP(S), Requests, HTTPX, Java `RestTemplate`, `WebClient`, JDK `HttpRequest`, and OkHttp `Request.Builder`, command injection includes synchronous Node and Python execution APIs, while path traversal includes Node `fs` and `fs.promises` reads, writes, appends, streams, and deletes plus Java `Files`, `Paths`, and `File` operations whose paths are direct servlet request input. Java open-redirect checks cover request-controlled Servlet, `RedirectView`, and `redirect:` targets; Java error-detail checks cover 5xx Servlet or Spring responses that return an exception message. High-confidence `innerHTML` and unsafe `yaml.load()` findings include mechanical quick fixes.
 
 Use `--markdown path` to write a PR-friendly Markdown report alongside the normal console output, or `--format markdown` to make Markdown the primary output. CLI JSON, human, and Markdown reports include per-scan performance totals, layer timing totals, the slowest file, and warnings when L1/L2/L3 exceed the PRD performance budgets.
 
@@ -353,7 +360,7 @@ GitHub Action scans default to `store_findings: false` so CI jobs do not write l
 
 ## Package Index
 
-The scanner can use a local package-name index before falling back to the seed catalog or remote registry checks. Partial indexes act as an existence cache; full indexes can also prove that a package is missing and suggest close package names for typos or slopsquatting-like hallucinations. Python scanning recognizes imports, dependency manifests, executable `pip install` automation calls, notebook-style `!pip install` commands, shell and PowerShell scripts, Dockerfiles, and YAML CI commands. Java dependency parsing supports Maven POM files, Gradle build scripts, and Gradle `*.versions.toml` catalogs with `module`, `group`/`name`, or direct coordinates. Seed mode includes npm, PyPI, Cargo, Go modules, and Maven coordinates; remote registry lookups currently cover npm and PyPI. Local package-name sync can populate indexes for npm, PyPI, Cargo, Go modules, and Maven.
+The scanner can use a local package-name index before falling back to the seed catalog or remote registry checks. Partial indexes act as an existence cache; full indexes can also prove that a package is missing and suggest close package names for typos or slopsquatting-like hallucinations. Python scanning recognizes imports, dependency manifests, executable `pip install` automation calls, notebook-style `!pip install` commands, shell and PowerShell scripts, Dockerfiles, and YAML CI commands. Java dependency parsing supports Maven POM files, Gradle build scripts, Gradle `*.versions.toml` catalogs with `module`, `group`/`name`, or direct coordinates, plus exact non-static external class imports. Java SE namespaces, including platform `javax` crypto/XML APIs and DOM/SAX, are excluded from Maven class lookup; external `javax` packages such as Servlet, JPA, and JAXB remain eligible. Seed and remote verification support npm, PyPI, Cargo, Go modules, and Maven coordinates; remote Maven lookup also verifies exact Java import classes through its class index, while Maven Central responses are checked for a matching result rather than HTTP success alone. Local package-name sync can populate indexes for all five registries.
 
 ```bash
 node dist/cli.js packages import npm ./npm-packages.txt --partial --storage sqlite
@@ -373,19 +380,21 @@ Supported import formats are newline-delimited package names, JSON arrays, `{ "p
 
 Remote sync sources default to npm `_all_docs`, PyPI Simple API, crates.io, Go module index, and Maven Central search. Cargo and Maven sync paginate through crates.io and Maven Central search results when needed. Use `--limit` for a cold-start/lightweight partial index where the upstream supports bounded results; VibeGuard will not store truncated remote results as `full` coverage.
 
+Configured refreshes persist registry ETag and Last-Modified metadata with the local index. Once an index is due, VibeGuard sends conditional requests only to the same registry URL; a `304 Not Modified` response refreshes the local timestamp without downloading or re-importing the package list. For npm `_all_docs` sources, both `packages sync npm` and the first configured full sync store a conservative replication sequence. Later stale refreshes consume same-source `_changes` batches, applying package additions and removals without downloading the complete index. Manual forced refreshes, changed registry URLs, and mirrors that do not expose a compatible change stream automatically use the full-refresh path.
+
 When a package is absent from a full local index, VibeGuard combines curated seed suggestions with fuzzy matches from the synced index. The first close match is exposed as an editor/CLI fix when the import specifier can be safely replaced.
 
 `packages sync-config` reads `package_cache.languages`, `package_cache.update_interval`, and `package_cache.lightweight_mode` from config.json. It skips fresh registries, refreshes stale registries, and upgrades partial indexes when lightweight mode is disabled. Use `--force` to refresh everything now, `--limit` to override the lightweight target, and `--url registry=URL` for a registry mirror or test fixture.
 
 The VSCode extension also starts a background package-cache sync on startup. On first run it shows a one-time cold-start note that secret, config, and AI-pattern checks are active immediately while the package-name cache prepares hallucinated-package detection. It prioritizes package managers detected in the current workspace, then queues the other configured registries in the same background sync. It shows the current registry plus completion percentage in the status bar while running, logs details to the VibeGuard output channel, and keeps other L1/L2/L3 checks active if the cache refresh fails. Run `VibeGuard: Sync Package Cache` from the command palette to force a refresh.
 
-In VSCode, normal edit-time scans run L1 immediately for fast feedback, then debounce L2 SAST for 500ms by default. When package verification is `remote`, edit-time scans first use local seed/cache results and schedule the remote npm/PyPI check independently after a 600ms delay from the latest automatic scan, so registry latency does not block diagnostics; the current document version must still match before any asynchronous result is shown. When L3 is enabled, semantic analysis is debounced for 2 seconds after edits by default; saves and manual scans run all enabled layers immediately. Adjust the analysis delays with `vibeguard.l2DebounceMs` and `vibeguard.l3DebounceMs`. The status bar tooltip includes recent scan timing totals and shows a watch marker when a file exceeds the L1/L2/L3 performance budget.
+In VSCode, normal edit-time scans run L1 immediately for fast feedback, then debounce L2 SAST for 500ms by default. When package verification is `remote`, edit-time scans first use local seed/cache results and schedule the remote registry check independently after a 600ms delay from the latest automatic scan, so registry latency does not block diagnostics; the current document version must still match before any asynchronous result is shown. When L3 is enabled, semantic analysis is debounced for 2 seconds after edits by default; saves and manual scans run all enabled layers immediately. Adjust the analysis delays with `vibeguard.l2DebounceMs` and `vibeguard.l3DebounceMs`. The status bar tooltip includes recent scan timing totals and shows a watch marker when a file exceeds the L1/L2/L3 performance budget.
 
 Storage modes:
 
 - `auto`: use SQLite when the current Node runtime supports `node:sqlite`, otherwise JSON
 - `sqlite`: store package resolution cache and package index in `~/.vibeguard/packages.db`
-- `json`: store verification results in `~/.vibeguard/package-cache.json` and package names in `~/.vibeguard/package-index.json`
+- `json`: store verification results in `~/.vibeguard/package-cache.json` and package names in gzip-compressed `~/.vibeguard/package-index.json.gz`; legacy `package-index.json` files are read automatically and migrate on the next index write
 
 ## GitHub Action
 
@@ -439,7 +448,7 @@ jobs:
           compliance_days: 90
           ignore_rules: .vibeguard/ignore-rules.yml
           custom_rules: .vibeguard/custom-rules.yml
-          package_index: .vibeguard/package-index.json
+          package_index: .vibeguard/package-index.json.gz
           storage: auto
       - uses: actions/upload-artifact@v4
         if: always() && steps.vibeguard.outputs.dashboard_path != ''
@@ -456,10 +465,12 @@ jobs:
 Package verification modes:
 
 - `seed`: instant, offline checks against the built-in known-good/known-hallucinated catalog
-- `remote`: seed + cached remote npm/PyPI verification with a 3 second timeout and at most five in-flight registry requests; repeated references to the same package share one in-flight lookup. An unavailable registry produces a non-blocking warning instead of a hallucinated-package finding, and is retried on a later scan after connectivity recovers rather than cached as a package verdict
+- `remote`: seed + cached remote npm, PyPI, Cargo, Go module, and Maven Central verification with a 3 second timeout and at most five in-flight registry requests; exact Java class imports use Maven Central's class index rather than the coordinate cache. Repeated references to the same package share one in-flight lookup. Only definitive misses are cached; an unavailable, rate-limited, or malformed registry response produces a non-blocking warning and is retried on a later scan after connectivity recovers
 - `off`: disables package existence checks
 
 For pull request feedback, the Action can emit GitHub workflow annotations with `github_annotations: true`, append a Markdown report to the job summary with `step_summary: true`, and optionally create/update a sticky PR comment with `pr_comment: true`. Set `pr_review_comments: true` to create a single `COMMENT` review containing up to `pr_review_comment_limit` active findings on changed diff lines. It defaults to `false`, requires `pull-requests: write`, skips existing VibeGuard comments at the same path/line/rule, and never includes a finding's code evidence. Set `sarif` to write a SARIF 2.1.0 report that can be uploaded with `github/codeql-action/upload-sarif`; set `markdown` to keep the Markdown report as an artifact path. Set `findings_endpoint` to the private dashboard's `/api/ingest` endpoint and provide its dedicated token only through the environment variable named by `findings_token_env`; `findings_upload_required` is opt-in. Set `store_findings: true` with `dashboard: true` or `compliance: true` to generate the corresponding HTML dashboard or source-free compliance evidence artifact.
+
+The composite Action sets up Node.js 22 before installing and building VibeGuard, so callers do not need to select a Node version separately.
 
 Set `findings_rules_endpoint` to the private dashboard's project-rule download endpoint to append centrally managed YAML
 rules to the scan. The Action uses the same environment-backed project credential, accepts only HTTPS endpoints except
@@ -534,7 +545,7 @@ npm run build
 node dist/lspServer.js --stdio
 ```
 
-The LSP server publishes VibeGuard diagnostics with the same scanner used by the VSCode extension and CLI. It also exposes LSP `quickfix` code actions for findings that have safe mechanical fixes, so non-VSCode LSP clients can apply the same package-name, secret-assignment, config, and SAST edits.
+The LSP server publishes VibeGuard diagnostics with the same scanner used by the VSCode extension and CLI. On edits it publishes L1 immediately, debounces L2 by 500ms and L3 by 2s, and runs all enabled layers immediately when a document is saved; `l2DebounceMs` and `l3DebounceMs` can override those values through LSP configuration. It also exposes LSP `quickfix` code actions for findings that have safe mechanical fixes, so non-VSCode LSP clients can apply the same package-name, secret-assignment, config, and SAST edits.
 
 ## VSCode Settings
 
@@ -568,6 +579,7 @@ LLM commands:
 - `VibeGuard: Delete LLM API Key`
 - `VibeGuard: Show LLM Status`
 - `VibeGuard: Show Pro Subscription Status`
+- `VibeGuard: Review and Apply All Pro Fixes in Current File`
 
 Dashboard command:
 
@@ -575,7 +587,7 @@ Dashboard command:
 
 ## VSCode Quick Fixes
 
-VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, explicitly SQLite-backed single-expression SQL f-strings to parameterized `execute()` calls, and high-confidence `innerHTML` to `textContent` cases. `VibeGuard: Apply All Safe Fixes in Current File` applies non-overlapping L1/L2 mechanical fixes in one reviewed operation, prioritizing higher severities and excluding L3 replacements. L3 replacements supplied by an LLM are deliberately non-preferred and require confirmation in VSCode. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
+VibeGuard publishes diagnostics with quick actions. When a finding has a safe mechanical fix, the editor lightbulb or an LSP client quickfix can apply it directly. Current fixes cover known package-name replacements, hardcoded secret assignments to environment-variable reads, debug/CORS/host-check toggles, `yaml.load()` to `yaml.safe_load()`, explicitly SQLite-backed single-expression SQL f-strings to parameterized `execute()` calls, and high-confidence `innerHTML` to `textContent` cases. Critical VSCode alerts include a local `Learn More` action that opens the finding location and appends its rule, evidence, suggestion, and available fix to the VibeGuard output channel. `VibeGuard: Apply All Safe Fixes in Current File` applies non-overlapping L1/L2 mechanical fixes in one reviewed operation. With the VibeGuard Pro provider and credential selected, `VibeGuard: Review and Apply All Pro Fixes in Current File` combines those mechanical fixes with a multi-select review of non-overlapping L3 replacements; each L3 edit must still match the current document evidence before the final confirmation. The VSCode extension also exposes ignore actions for the current finding, the current file, the global rule, or a hallucinated package name.
 
 ## Scope Notes
 

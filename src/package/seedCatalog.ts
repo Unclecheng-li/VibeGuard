@@ -164,22 +164,29 @@ export const packageAliases: Record<string, string> = {
 };
 
 export function seedExists(registry: PackageRegistry, packageName: string): boolean | undefined {
-  const normalized = packageName.toLowerCase();
-  if (knownPackages[registry].some((name) => name.toLowerCase() === normalized)) {
+  const normalized = seedPackageKey(registry, packageName);
+  if (knownPackages[registry].some((name) => seedPackageKey(registry, name) === normalized)) {
     return true;
   }
-  if (Object.keys(knownHallucinatedPackages[registry]).some((name) => name.toLowerCase() === normalized)) {
+  if (Object.keys(knownHallucinatedPackages[registry]).some((name) => seedPackageKey(registry, name) === normalized)) {
     return false;
   }
   return undefined;
 }
 
 export function seedSuggestions(registry: PackageRegistry, packageName: string): string[] {
-  const lowerName = packageName.toLowerCase();
-  const direct = Object.entries(knownHallucinatedPackages[registry]).find(([name]) => name.toLowerCase() === lowerName);
+  const normalized = seedPackageKey(registry, packageName);
+  const direct = Object.entries(knownHallucinatedPackages[registry]).find(([name]) => seedPackageKey(registry, name) === normalized);
   if (direct) {
     return direct[1];
   }
 
   return suggestPackageNames(packageName, knownPackages[registry], 3);
+}
+
+function seedPackageKey(registry: PackageRegistry, packageName: string): string {
+  const normalized = packageName.trim().toLowerCase();
+  // Cargo exposes a hyphenated package name, while Rust source refers to the
+  // default crate target with underscores (for example actix-web -> actix_web).
+  return registry === "cargo" ? normalized.replace(/[-_]/g, "-") : normalized;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planSafeBatchFixes } from "../src/batchFixes";
+import { planProBatchFixes, planSafeBatchFixes } from "../src/batchFixes";
 import type { Finding } from "../src/types";
 
 test("plans non-overlapping mechanical fixes by severity", () => {
@@ -20,6 +20,18 @@ test("excludes L3 replacements from batch fixes", () => {
 
   assert.deepEqual(plan.findings.map((finding) => finding.id), ["mechanical"]);
   assert.deepEqual(plan.excludedL3.map((finding) => finding.id), ["llm"]);
+});
+
+test("plans non-overlapping L3 replacements for Pro review without displacing mechanical fixes", () => {
+  const plan = planProBatchFixes([
+    finding("generated-overlap", "critical", 1, 5, "generated", "L3"),
+    finding("mechanical", "high", 1, 5, "safe"),
+    finding("generated", "medium", 6, 10, "generated", "L3")
+  ]);
+
+  assert.deepEqual(plan.safeFindings.map((finding) => finding.id), ["mechanical"]);
+  assert.deepEqual(plan.reviewableL3Findings.map((finding) => finding.id), ["generated"]);
+  assert.deepEqual(plan.skipped.map((finding) => finding.id), ["generated-overlap"]);
 });
 
 function finding(

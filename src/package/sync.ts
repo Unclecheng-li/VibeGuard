@@ -1,4 +1,4 @@
-import type { PackageRegistry } from "../types";
+import type { PackageIndexSyncMetadata, PackageRegistry } from "../types";
 
 export type SyncableRegistry = PackageRegistry;
 
@@ -7,6 +7,7 @@ export interface PackageSyncOptions {
   sourceUrl?: string;
   limit?: number;
   fetchImpl?: typeof fetch;
+  conditional?: PackageIndexSyncMetadata;
 }
 
 export interface PackageSyncResult {
@@ -17,7 +18,29 @@ export interface PackageSyncResult {
   totalAvailable?: number;
   pagesFetched?: number;
   truncated: boolean;
-  format: "npm-all-docs" | "pypi-simple" | "cargo-crates" | "gomod-index" | "maven-search";
+  format: "npm-all-docs" | "npm-changes" | "pypi-simple" | "cargo-crates" | "gomod-index" | "maven-search";
+  notModified?: boolean;
+  syncMetadata?: PackageIndexSyncMetadata;
+}
+
+export interface NpmPackageChangesOptions {
+  sourceUrl?: string;
+  since: string;
+  fetchImpl?: typeof fetch;
+}
+
+export interface NpmPackageChangesResult {
+  additions: string[];
+  removals: string[];
+  sourceUrl: string;
+  lastSequence: string;
+  pagesFetched: number;
+  changesFetched: number;
+}
+
+export interface NpmChangeSnapshot {
+  changeSourceUrl: string;
+  changeSequence: string;
 }
 
 interface ParsedRemoteNames {
@@ -26,13 +49,38 @@ interface ParsedRemoteNames {
   format: PackageSyncResult["format"];
 }
 
+interface ParsedNpmChanges {
+  changes: { id: string; deleted: boolean }[];
+  lastSequence: string;
+  resultCount: number;
+}
+
+const NPM_CHANGES_PAGE_SIZE = 1000;
+
 export async function fetchPackageNames(options: PackageSyncOptions): Promise<PackageSyncResult> {
   if (isPaginatedRegistry(options.registry) && isHttpSourceUrl(options.sourceUrl ?? defaultSourceUrl(options.registry))) {
     return fetchPaginatedPackageNames(options);
   }
 
   const sourceUrl = buildSourceUrl(options.registry, options.sourceUrl, options.limit);
-  const page = await fetchPackageNamePage(options.registry, sourceUrl, options.fetchImpl);
+  const conditional = conditionalForSource(options.conditional, sourceUrl);
+  const page = await fetchPackageNamePage(options.registry, sourceUrl, options.fetchImpl, conditional);
+  if (page.notModified) {
+    return {
+      registry: options.registry,
+      names: [],
+      sourceUrl,
+      fetchedAt: Date.now(),
+      pagesFetched: 0,
+      truncated: false,
+      format: defaultFormat(options.registry),
+      notModified: true,
+      syncMetadata: page.syncMetadata
+    };
+  }
+  if (!page.parsed) {
+    throw new Error(`Package sync returned no package data for ${options.registry}.`);
+  }
   const allNames = uniqueNames(page.parsed.names);
   const limitedNames = options.limit ? allNames.slice(0, options.limit) : allNames;
   const truncatedByLimit = Boolean(options.limit && allNames.length > options.limit);
@@ -46,8 +94,102 @@ export async function fetchPackageNames(options: PackageSyncOptions): Promise<Pa
     totalAvailable: page.parsed.totalAvailable,
     pagesFetched: 1,
     truncated: truncatedByLimit || truncatedByRegistryTotal,
-    format: page.parsed.format
+    format: page.parsed.format,
+    syncMetadata: page.syncMetadata
   };
+}
+
+export function canUseNpmIncrementalSync(metadata: PackageIndexSyncMetadata | undefined, sourceUrl?: string): boolean {
+  const changeSourceUrl = npmChangesUrl(sourceUrl);
+  return Boolean(
+    changeSourceUrl &&
+      metadata?.changeSourceUrl === changeSourceUrl &&
+      typeof metadata.changeSequence === "string" &&
+      metadata.changeSequence.length > 0
+  );
+}
+
+export async function fetchNpmPackageChanges(options: NpmPackageChangesOptions): Promise<NpmPackageChangesResult> {
+  const sourceUrl = npmChangesUrl(options.sourceUrl);
+  if (!sourceUrl) {
+    throw new Error("npm incremental sync requires an _all_docs source URL.");
+  }
+
+  const additions = new Set<string>();
+  const removals = new Set<string>();
+  let sequence = options.since;
+  let pagesFetched = 0;
+  let changesFetched = 0;
+
+  for (;;) {
+    const pageUrl = setQueryParams(sourceUrl, {
+      since: sequence,
+      limit: String(NPM_CHANGES_PAGE_SIZE)
+    });
+    const response = await (options.fetchImpl ?? fetch)(pageUrl, {
+      headers: {
+        accept: "application/json",
+        "user-agent": "VibeGuard/0.1"
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`npm incremental sync failed: HTTP ${response.status}`);
+    }
+
+    const page = parseNpmChanges(await response.text());
+    pagesFetched += 1;
+    changesFetched += page.changes.length;
+    for (const change of page.changes) {
+      if (change.deleted) {
+        additions.delete(change.id);
+        removals.add(change.id);
+      } else {
+        removals.delete(change.id);
+        additions.add(change.id);
+      }
+    }
+
+    if (page.resultCount < NPM_CHANGES_PAGE_SIZE) {
+      return {
+        additions: [...additions],
+        removals: [...removals],
+        sourceUrl,
+        lastSequence: page.lastSequence,
+        pagesFetched,
+        changesFetched
+      };
+    }
+    if (page.lastSequence === sequence) {
+      throw new Error("npm incremental sync did not advance its change sequence.");
+    }
+    sequence = page.lastSequence;
+  }
+}
+
+export async function fetchNpmChangeSnapshot(
+  sourceUrl?: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<NpmChangeSnapshot | undefined> {
+  const changeSourceUrl = npmChangesUrl(sourceUrl);
+  const snapshotUrl = npmSnapshotUrl(sourceUrl);
+  if (!changeSourceUrl || !snapshotUrl) {
+    return undefined;
+  }
+  const response = await fetchImpl(snapshotUrl, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "VibeGuard/0.1"
+    }
+  });
+  if (!response.ok) {
+    return undefined;
+  }
+  const parsed = JSON.parse(await response.text()) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    return undefined;
+  }
+  const sequence = sequenceValue((parsed as Record<string, unknown>).update_seq);
+  return sequence ? { changeSourceUrl, changeSequence: sequence } : undefined;
 }
 
 async function fetchPaginatedPackageNames(options: PackageSyncOptions): Promise<PackageSyncResult> {
@@ -65,6 +207,9 @@ async function fetchPaginatedPackageNames(options: PackageSyncOptions): Promise<
     const nextUrl = buildPaginatedSourceUrl(options.registry, options.sourceUrl, pageSize, pageIndex);
     sourceUrl ||= nextUrl;
     const page = await fetchPackageNamePage(options.registry, nextUrl, options.fetchImpl);
+    if (page.notModified || !page.parsed) {
+      throw new Error(`Package sync returned no package data for ${options.registry}.`);
+    }
     pagesFetched += 1;
     format = page.parsed.format;
     totalAvailable = page.parsed.totalAvailable ?? totalAvailable;
@@ -99,24 +244,54 @@ async function fetchPaginatedPackageNames(options: PackageSyncOptions): Promise<
 async function fetchPackageNamePage(
   registry: SyncableRegistry,
   sourceUrl: string,
-  fetcher: typeof fetch = fetch
-): Promise<{ raw: string; parsed: ParsedRemoteNames }> {
+  fetcher: typeof fetch = fetch,
+  conditional?: PackageIndexSyncMetadata
+): Promise<{ parsed?: ParsedRemoteNames; notModified: boolean; syncMetadata?: PackageIndexSyncMetadata }> {
+  const headers: Record<string, string> = {
+    accept: acceptHeader(registry),
+    "user-agent": "VibeGuard/0.1"
+  };
+  if (conditional?.etag) {
+    headers["if-none-match"] = conditional.etag;
+  }
+  if (conditional?.lastModified) {
+    headers["if-modified-since"] = conditional.lastModified;
+  }
   const response = await fetcher(sourceUrl, {
-    headers: {
-      accept: acceptHeader(registry),
-      "user-agent": "VibeGuard/0.1"
-    }
+    headers
   });
+
+  const syncMetadata = readSyncMetadata(response, sourceUrl, conditional);
+  if (response.status === 304) {
+    return { notModified: true, syncMetadata };
+  }
 
   if (!response.ok) {
     throw new Error(`Package sync failed for ${registry}: HTTP ${response.status}`);
   }
 
-  const raw = await response.text();
   return {
-    raw,
-    parsed: parseRegistryResponse(registry, raw)
+    parsed: parseRegistryResponse(registry, await response.text()),
+    notModified: false,
+    syncMetadata
   };
+}
+
+function readSyncMetadata(response: Response, sourceUrl: string, previous?: PackageIndexSyncMetadata): PackageIndexSyncMetadata {
+  const etag = response.headers?.get("etag") ?? previous?.etag;
+  const lastModified = response.headers?.get("last-modified") ?? previous?.lastModified;
+  return {
+    sourceUrl,
+    ...(etag ? { etag } : {}),
+    ...(lastModified ? { lastModified } : {})
+  };
+}
+
+function conditionalForSource(
+  metadata: PackageIndexSyncMetadata | undefined,
+  sourceUrl: string
+): PackageIndexSyncMetadata | undefined {
+  return metadata?.sourceUrl === sourceUrl ? metadata : undefined;
 }
 
 export function parseNpmAllDocs(raw: string): ParsedRemoteNames {
@@ -134,6 +309,36 @@ export function parseNpmAllDocs(raw: string): ParsedRemoteNames {
     names: object.rows.map(rowPackageName).filter(isString),
     totalAvailable: typeof object.total_rows === "number" ? object.total_rows : undefined,
     format: "npm-all-docs"
+  };
+}
+
+export function parseNpmChanges(raw: string): ParsedNpmChanges {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("npm incremental sync response was not an object.");
+  }
+  const object = parsed as Record<string, unknown>;
+  if (!Array.isArray(object.results)) {
+    throw new Error("npm incremental sync response did not include results.");
+  }
+  const lastSequence = sequenceValue(object.last_seq);
+  if (!lastSequence) {
+    throw new Error("npm incremental sync response did not include last_seq.");
+  }
+  return {
+    changes: object.results
+      .map((result) => {
+        if (!result || typeof result !== "object") {
+          return undefined;
+        }
+        const row = result as Record<string, unknown>;
+        return isString(row.id) && !row.id.startsWith("_design/")
+          ? { id: row.id, deleted: row.deleted === true }
+          : undefined;
+      })
+      .filter((change): change is { id: string; deleted: boolean } => Boolean(change)),
+    lastSequence,
+    resultCount: object.results.length
   };
 }
 
@@ -245,6 +450,36 @@ function buildSourceUrl(registry: SyncableRegistry, sourceUrl: string | undefine
   const param = registry === "cargo" ? "per_page" : registry === "maven" ? "rows" : "limit";
   const value = registry === "cargo" ? String(Math.min(limit, 100)) : String(limit);
   return withQueryParam(base, param, value);
+}
+
+function npmChangesUrl(sourceUrl?: string): string | undefined {
+  try {
+    const url = new URL(sourceUrl ?? defaultSourceUrl("npm"));
+    if (url.protocol !== "http:" && url.protocol !== "https:" || !/\/_all_docs\/?$/.test(url.pathname)) {
+      return undefined;
+    }
+    url.pathname = url.pathname.replace(/\/_all_docs\/?$/, "/_changes");
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function npmSnapshotUrl(sourceUrl?: string): string | undefined {
+  try {
+    const url = new URL(sourceUrl ?? defaultSourceUrl("npm"));
+    if (url.protocol !== "http:" && url.protocol !== "https:" || !/\/_all_docs\/?$/.test(url.pathname)) {
+      return undefined;
+    }
+    url.pathname = url.pathname.replace(/\/_all_docs\/?$/, "/");
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function buildPaginatedSourceUrl(
@@ -437,4 +672,11 @@ function decodeHtmlEntities(value: string): string {
 
 function isString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function sequenceValue(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : undefined;
 }

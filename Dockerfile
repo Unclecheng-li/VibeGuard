@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 
 WORKDIR /opt/vibeguard
 
@@ -10,7 +10,7 @@ COPY scripts ./scripts
 COPY src ./src
 RUN npm run build
 
-FROM node:24-bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends git \

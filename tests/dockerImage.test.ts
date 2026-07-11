@@ -11,7 +11,7 @@ test("Docker image builds the bundled CLI and keeps git available for AI scans",
     fs.readFile(path.join(repositoryRoot, ".dockerignore"), "utf8")
   ]);
 
-  assert.match(dockerfile, /^FROM node:24-bookworm-slim AS build/m);
+  assert.match(dockerfile, /^FROM node:22-bookworm-slim AS build/m);
   assert.match(dockerfile, /RUN npm ci/);
   assert.match(dockerfile, /RUN npm run build/);
   assert.match(dockerfile, /apt-get install --yes --no-install-recommends git/);
@@ -19,4 +19,21 @@ test("Docker image builds the bundled CLI and keeps git available for AI scans",
   assert.match(dockerfile, /ENTRYPOINT \["node", "\/opt\/vibeguard\/dist\/cli\.js"\]/);
   assert.match(dockerignore, /^node_modules\/$/m);
   assert.match(dockerignore, /^dist\/$/m);
+});
+
+test("development and release workflows pin Node.js 22 LTS", async () => {
+  const [nvmrc, ci, release, packageRaw] = await Promise.all([
+    fs.readFile(path.join(repositoryRoot, ".nvmrc"), "utf8"),
+    fs.readFile(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8"),
+    fs.readFile(path.join(repositoryRoot, ".github", "workflows", "release.yml"), "utf8"),
+    fs.readFile(path.join(repositoryRoot, "package.json"), "utf8")
+  ]);
+  const packageJson = JSON.parse(packageRaw) as { scripts?: Record<string, string> };
+
+  assert.equal(nvmrc.trim(), "22");
+  assert.doesNotMatch(ci, /node-version:\s*24/);
+  assert.match(ci, /node-version:\s*22/);
+  assert.doesNotMatch(release, /node-version:\s*24/);
+  assert.match(release, /node-version:\s*22/);
+  assert.match(packageJson.scripts?.test ?? "", /assert-node-lts/);
 });

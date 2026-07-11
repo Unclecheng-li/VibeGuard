@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import * as vscode from "vscode";
-import { planSafeBatchFixes } from "./batchFixes";
+import { planProBatchFixes, planSafeBatchFixes } from "./batchFixes";
 import {
   cloneDefaultConfig,
   defaultConfigPath,
@@ -153,6 +153,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("vibeguard.applyFix", (finding: Finding) => applyFindingFix(finding)),
     vscode.commands.registerCommand("vibeguard.applyAllSafeFixes", () => applyAllSafeFixes()),
+    vscode.commands.registerCommand("vibeguard.applyAllProFixes", () => applyAllProFixes()),
     vscode.languages.registerCodeActionsProvider(codeActionSelector, new VibeGuardCodeActionProvider(), {
       providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]
     }),
@@ -445,6 +446,24 @@ async function openFinding(finding: Finding): Promise<void> {
   const range = findingRange(finding);
   editor.selection = new vscode.Selection(range.start, range.end);
   editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
+async function showFindingDetails(finding: Finding): Promise<void> {
+  await openFinding(finding);
+  output.appendLine("Finding Details");
+  output.appendLine("===============");
+  output.appendLine(`${finding.severity.toUpperCase()} ${finding.file}:${finding.line}:${finding.column}`);
+  output.appendLine(`Rule: ${finding.detection_rule} (${finding.detection_layer})`);
+  output.appendLine(`Message: ${finding.message}`);
+  output.appendLine(`Evidence: ${finding.evidence}`);
+  if (finding.suggestion) {
+    output.appendLine(`Suggestion: ${finding.suggestion}`);
+  }
+  if (finding.fix) {
+    output.appendLine(`Available fix: ${finding.fix.description}`);
+  }
+  output.appendLine("");
+  output.show(true);
 }
 
 interface ScheduleScanOptions {
@@ -741,13 +760,15 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
   }
   popupSeen.add(critical.id);
   const replace = critical.detection_layer === "L3" ? undefined : critical.fix?.description;
-  const actions = replace ? [replace, "Ignore", "Manage Ignore Rules"] : ["Ignore", "Manage Ignore Rules"];
+  const actions = replace ? [replace, "Ignore", "Learn More", "Manage Ignore Rules"] : ["Ignore", "Learn More", "Manage Ignore Rules"];
   void vscode.window.showWarningMessage(`VibeGuard: ${critical.message}`, ...actions).then(async (choice) => {
     if (choice === replace && critical.fix) {
       await applyFindingFix(critical);
     } else if (choice === "Ignore") {
       await ignoreFinding(critical, "line");
       await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+    } else if (choice === "Learn More") {
+      await showFindingDetails(critical);
     } else if (choice === "Manage Ignore Rules") {
       await openIgnoreRules();
     }
@@ -800,6 +821,81 @@ async function applyAllSafeFixes(): Promise<void> {
   }
   const document = await vscode.workspace.openTextDocument(editor.document.uri);
   await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+}
+
+async function applyAllProFixes(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    void vscode.window.showInformationMessage("VibeGuard: no active editor to fix.");
+    return;
+  }
+  const loadedConfig = await loadConfiguredVibeGuardConfigForWorkspace();
+  if (configuredLlmProvider(loadedConfig.config) !== "vibeguard") {
+    void vscode.window.showWarningMessage("VibeGuard Pro batch fixes require the VibeGuard LLM provider.");
+    return;
+  }
+  const proCredential =
+    (await extensionContext.secrets.get(llmSecretKey("vibeguard"))) ?? getLlmApiKeyFromEnv("vibeguard");
+  if (!proCredential) {
+    void vscode.window.showWarningMessage("Set a VibeGuard Pro credential before applying Pro batch fixes.");
+    return;
+  }
+
+  const plan = planProBatchFixes(findingsForDocument(editor.document));
+  const currentL3Findings = plan.reviewableL3Findings.filter((finding) => l3FixStillMatchesDocument(editor.document, finding));
+  const staleL3Count = plan.reviewableL3Findings.length - currentL3Findings.length;
+  if (plan.safeFindings.length === 0 && currentL3Findings.length === 0) {
+    void vscode.window.showInformationMessage("VibeGuard: no current non-overlapping fixes are available in this file.");
+    return;
+  }
+
+  const reviewed = currentL3Findings.length > 0 ? await pickReviewedL3Fixes(currentL3Findings) : [];
+  if (currentL3Findings.length > 0 && !reviewed) {
+    return;
+  }
+  const selectedL3 = (reviewed ?? []).filter((finding) => l3FixStillMatchesDocument(editor.document, finding));
+  const selected = [...plan.safeFindings, ...selectedL3];
+  if (selected.length === 0) {
+    return;
+  }
+
+  const detail = [
+    `${plan.safeFindings.length} safe fix${plan.safeFindings.length === 1 ? "" : "es"}.`,
+    `${selectedL3.length} reviewed LLM replacement${selectedL3.length === 1 ? "" : "s"}.`,
+    plan.skipped.length > 0 ? `${plan.skipped.length} overlapping fix${plan.skipped.length === 1 ? "" : "es"} skipped.` : "",
+    staleL3Count > 0 ? `${staleL3Count} stale LLM replacement${staleL3Count === 1 ? "" : "s"} excluded.` : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const choice = await vscode.window.showWarningMessage(`VibeGuard Pro: ${detail}`, "Apply reviewed fixes");
+  if (choice !== "Apply reviewed fixes") {
+    return;
+  }
+  const applied = await vscode.workspace.applyEdit(workspaceEditForFindings(editor.document.uri, selected));
+  if (!applied) {
+    void vscode.window.showErrorMessage("VibeGuard could not apply all selected Pro fixes.");
+    return;
+  }
+  const document = await vscode.workspace.openTextDocument(editor.document.uri);
+  await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+}
+
+async function pickReviewedL3Fixes(findings: Finding[]): Promise<Finding[] | undefined> {
+  const selected = await vscode.window.showQuickPick(
+    findings.map((finding) => ({
+      label: `Line ${finding.line}: ${finding.fix?.description ?? "LLM replacement"}`,
+      description: truncateInline(finding.evidence, 100),
+      detail: `Replace with: ${truncateInline(finding.fix?.edits[0]?.newText ?? "", 180)}`,
+      picked: true,
+      finding
+    })),
+    {
+      canPickMany: true,
+      title: "Review VibeGuard Pro LLM Fixes",
+      placeHolder: "Select the reviewed LLM replacements to apply"
+    }
+  );
+  return selected?.map((item) => item.finding);
 }
 
 function updateStatus(): void {
@@ -954,6 +1050,24 @@ function workspaceEditForFindings(uri: vscode.Uri, findings: Finding[]): vscode.
     }
   }
   return edit;
+}
+
+function l3FixStillMatchesDocument(document: vscode.TextDocument, finding: Finding): boolean {
+  if (finding.detection_layer !== "L3" || finding.fix?.edits.length !== 1) {
+    return false;
+  }
+  const edit = finding.fix.edits[0];
+  try {
+    const range = new vscode.Range(edit.startLine - 1, edit.startColumn - 1, edit.endLine - 1, edit.endColumn - 1);
+    return document.getText(range) === finding.evidence;
+  } catch {
+    return false;
+  }
+}
+
+function truncateInline(value: string, maximumLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= maximumLength ? normalized : `${normalized.slice(0, Math.max(1, maximumLength - 3))}...`;
 }
 
 async function ignoreFinding(finding: Finding | undefined, scope: "line" | "file" | "global"): Promise<void> {
@@ -1445,9 +1559,15 @@ function logPackageSyncResult(
   }
   for (const entry of result.results) {
     if (entry.status === "synced") {
-      output.appendLine(
-        `${entry.registry}: synced ${entry.imported ?? 0} package name(s), ${entry.coverage ?? "partial"} coverage (${entry.reason})`
-      );
+      if (entry.incremental) {
+        output.appendLine(
+          `${entry.registry}: applied ${entry.additions ?? 0} addition(s) and ${entry.removals ?? 0} removal(s) from ${entry.changesFetched ?? 0} incremental change(s), ${entry.coverage ?? "partial"} coverage (${entry.reason})`
+        );
+      } else {
+        output.appendLine(
+          `${entry.registry}: synced ${entry.imported ?? 0} package name(s), ${entry.coverage ?? "partial"} coverage (${entry.reason})`
+        );
+      }
       if (entry.pagesFetched && entry.pagesFetched > 1) {
         output.appendLine(`${entry.registry}: fetched ${entry.pagesFetched} page(s).`);
       }

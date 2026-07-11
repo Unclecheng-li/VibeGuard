@@ -80,12 +80,28 @@ const sastRules: SastRule[] = [
     suggestion: "Allowlist outbound hosts and validate URL schemes before making server-side requests."
   },
   {
+    id: "sast_ssrf_java_request_url",
+    type: "ssrf",
+    regex: /\b(?:restTemplate\.(?:getForObject|getForEntity|postForObject|postForEntity|put|delete|exchange)|webClient\.(?:get|post|put|patch|delete)\s*\(\s*\)\s*\.uri|HttpRequest\.newBuilder|new\s+Request\.Builder\s*\(\s*\)\s*\.url)\s*\([^\n]*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(/gi,
+    severity: "medium",
+    message: "Java HTTP client appears to use a request-controlled URL.",
+    suggestion: "Allowlist outbound hosts and validate URL schemes before making server-side requests."
+  },
+  {
     id: "sast_path_traversal_fs_user_input",
     type: "path_traversal",
     regex: /\b(?:fs(?:\.promises)?\.(?:readFile|readFileSync|createReadStream|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rm|rmSync)|open|Path\(|send_file)\s*\([^)\n]*(?:req\.(?:query|body|params)|request\.(?:args|form|json)|params?\[)/gi,
     severity: "high",
     message: "File path appears to include user-controlled input.",
     suggestion: "Resolve paths against a fixed base directory and reject traversal outside that directory."
+  },
+  {
+    id: "sast_path_traversal_java_request_input",
+    type: "path_traversal",
+    regex: /\b(?:Files\.(?:readAllBytes|readString|write|writeString|delete|deleteIfExists|newInputStream|newOutputStream)|Paths\.get|new\s+File)\s*\([^\n]*(?:request\s*\.\s*(?:getParameter|getHeader|getQueryString))\s*\(/gi,
+    severity: "high",
+    message: "Java file operation appears to use a request-controlled path.",
+    suggestion: "Resolve paths against a fixed base directory, validate the normalized path, and reject traversal outside it."
   },
   {
     id: "sast_insecure_deserialization_pickle",
@@ -129,12 +145,28 @@ const sastRules: SastRule[] = [
     suggestion: "Redirect only to relative paths or allowlisted hosts after validating the destination."
   },
   {
+    id: "sast_open_redirect_java_request_input",
+    type: "open_redirect",
+    regex: /\b(?:response|resp|httpServletResponse)\s*\.\s*sendRedirect\s*\(\s*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(|\bnew\s+RedirectView\s*\(\s*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(|\breturn\s*["']redirect:[^"']*["']\s*\+\s*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(/gi,
+    severity: "medium",
+    message: "Java redirect target appears to come directly from HTTP request input.",
+    suggestion: "Redirect only to relative paths or allowlisted hosts after validating the destination."
+  },
+  {
     id: "sast_information_leakage_error_details",
     type: "information_leakage",
     regex: /\b(?:res|response)\.(?:send|json)\s*\([^;\n]*(?:err(?:or)?|exception)\.(?:stack|message)|\b(?:res|response)\.status\s*\(\s*500\s*\)\s*\.(?:send|json)\s*\([^;\n]*(?:err(?:or)?|exception)\.(?:stack|message)|\breturn\s+(?:traceback\.format_exc\s*\(\s*\)|str\s*\(\s*(?:err(?:or)?|exception|e)\s*\))|\b(?:res|response)(?:\.status\s*\(\s*5\d\d\s*\))?\.(?:send|json)\s*\([^;\n]*(?:\b(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\s*:|\(\s*(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\b)|\breturn\s*\{[^}\n]*(?:\b(?:error|detail|message)\s*:[^}\n]+,\s*)?\b(?:sql|query|stack|traceback|connection(?:string)?|database(?:url)?|api[_-]?key|secret|password|credential)\s*:/gi,
     severity: "low",
     message: "Detailed error or sensitive diagnostic information is returned to the client.",
     suggestion: "Return a generic error response and log stack traces, SQL, and sensitive diagnostics server-side only."
+  },
+  {
+    id: "sast_information_leakage_java_error_details",
+    type: "information_leakage",
+    regex: /\b(?:response|resp|httpServletResponse)\s*\.\s*sendError\s*\(\s*(?:5\d\d|HttpStatus\s*\.\s*INTERNAL_SERVER_ERROR)\s*,\s*(?:[A-Za-z_$][A-Za-z0-9_$]*(?:error|exception)|e)\s*\.\s*(?:getMessage|toString)\s*\(\s*\)|\bResponseEntity\s*\.\s*(?:status\s*\(\s*(?:5\d\d|HttpStatus\s*\.\s*INTERNAL_SERVER_ERROR)\s*\)|internalServerError\s*\(\s*\))\s*\.\s*body\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$]*(?:error|exception)|e)\s*\.\s*(?:getMessage|toString)\s*\(\s*\)/gi,
+    severity: "low",
+    message: "Java error response exposes an exception message to the client.",
+    suggestion: "Return a generic error response and log exception details server-side only."
   }
 ];
 

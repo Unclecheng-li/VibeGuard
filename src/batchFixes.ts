@@ -6,11 +6,15 @@ export interface BatchFixPlan {
   excludedL3: Finding[];
 }
 
+export interface ProBatchFixPlan {
+  safeFindings: Finding[];
+  reviewableL3Findings: Finding[];
+  skipped: Finding[];
+}
+
 /** Selects non-overlapping, deterministic fixes for a single document. */
 export function planSafeBatchFixes(findings: Finding[]): BatchFixPlan {
-  const fixable = findings
-    .filter((finding) => !finding.dismissed && finding.fix && finding.fix.edits.length > 0)
-    .sort((left, right) => severityRank(left.severity) - severityRank(right.severity) || compareFindings(left, right));
+  const fixable = sortedFixableFindings(findings);
   const selected: Finding[] = [];
   const skipped: Finding[] = [];
   const excludedL3: Finding[] = [];
@@ -35,6 +39,51 @@ export function planSafeBatchFixes(findings: Finding[]): BatchFixPlan {
     skipped,
     excludedL3
   };
+}
+
+/**
+ * Plans a Pro batch with deterministic fixes first and review-required L3 replacements second.
+ * A generated edit never displaces a mechanical fix when their ranges overlap.
+ */
+export function planProBatchFixes(findings: Finding[]): ProBatchFixPlan {
+  const safeFindings: Finding[] = [];
+  const reviewableL3Findings: Finding[] = [];
+  const skipped: Finding[] = [];
+  const acceptedEdits: TextEdit[] = [];
+
+  for (const finding of sortedFixableFindings(findings).filter((item) => item.detection_layer !== "L3")) {
+    acceptFinding(finding, safeFindings, skipped, acceptedEdits);
+  }
+  for (const finding of sortedFixableFindings(findings).filter((item) => item.detection_layer === "L3")) {
+    acceptFinding(finding, reviewableL3Findings, skipped, acceptedEdits);
+  }
+
+  return {
+    safeFindings: safeFindings.sort(compareFindings),
+    reviewableL3Findings: reviewableL3Findings.sort(compareFindings),
+    skipped
+  };
+}
+
+function sortedFixableFindings(findings: Finding[]): Finding[] {
+  return findings
+    .filter((finding) => !finding.dismissed && finding.fix && finding.fix.edits.length > 0)
+    .sort((left, right) => severityRank(left.severity) - severityRank(right.severity) || compareFindings(left, right));
+}
+
+function acceptFinding(
+  finding: Finding,
+  selected: Finding[],
+  skipped: Finding[],
+  acceptedEdits: TextEdit[]
+): void {
+  const edits = finding.fix?.edits ?? [];
+  if (edits.some((edit) => !isValidEdit(edit) || acceptedEdits.some((accepted) => editsOverlap(edit, accepted)))) {
+    skipped.push(finding);
+    return;
+  }
+  selected.push(finding);
+  acceptedEdits.push(...edits);
 }
 
 function severityRank(severity: Severity): number {

@@ -1,4 +1,4 @@
-import type { PackageNameIndexLike, PackageReference, PackageResolution, PackageVerifierLike } from "../types";
+import type { PackageNameIndexLike, PackageReference, PackageRegistry, PackageResolution, PackageVerifierLike } from "../types";
 import { MemoryPackageCache, type PackageCacheStore } from "./cache";
 import { seedExists, seedSuggestions } from "./seedCatalog";
 
@@ -32,7 +32,8 @@ export class PackageVerifier implements PackageVerifierLike {
   }
 
   async verify(reference: PackageReference, mode: "seed" | "remote"): Promise<PackageResolution> {
-    const indexed = await this.packageIndex?.get(reference.registry, reference.packageName);
+    const isMavenClassImport = reference.registry === "maven" && reference.mavenLookup === "class";
+    const indexed = isMavenClassImport ? undefined : await this.packageIndex?.get(reference.registry, reference.packageName);
     if (indexed !== undefined) {
       const similarPackages = indexed ? [] : await this.suggestions(reference.registry, reference.packageName);
       return {
@@ -46,7 +47,7 @@ export class PackageVerifier implements PackageVerifierLike {
       };
     }
 
-    const seeded = seedExists(reference.registry, reference.packageName);
+    const seeded = isMavenClassImport ? undefined : seedExists(reference.registry, reference.packageName);
     if (seeded !== undefined) {
       const similarPackages = seeded ? [] : await this.suggestions(reference.registry, reference.packageName);
       return {
@@ -67,7 +68,7 @@ export class PackageVerifier implements PackageVerifierLike {
       };
     }
 
-    if (mode !== "remote" || (reference.registry !== "npm" && reference.registry !== "pypi")) {
+    if (mode !== "remote") {
       return {
         registry: reference.registry,
         packageName: reference.packageName,
@@ -79,10 +80,10 @@ export class PackageVerifier implements PackageVerifierLike {
       };
     }
 
-    return this.verifyRemoteOnce(reference as PackageReference & { registry: "npm" | "pypi" });
+    return this.verifyRemoteOnce(reference);
   }
 
-  private async verifyRemoteOnce(reference: PackageReference & { registry: "npm" | "pypi" }): Promise<PackageResolution> {
+  private async verifyRemoteOnce(reference: PackageReference): Promise<PackageResolution> {
     const key = remoteVerificationKey(reference);
     const existing = this.inFlightRemoteVerifications.get(key);
     if (existing) {
@@ -100,7 +101,7 @@ export class PackageVerifier implements PackageVerifierLike {
     }
   }
 
-  private async verifyAndCacheRemote(reference: PackageReference & { registry: "npm" | "pypi" }): Promise<PackageResolution> {
+  private async verifyAndCacheRemote(reference: PackageReference): Promise<PackageResolution> {
     const resolution = await this.verifyRemote(reference);
     // A transient network failure is not a package-resolution result. Keeping it
     // in the normal TTL cache would suppress verification after connectivity recovers.
@@ -110,12 +111,12 @@ export class PackageVerifier implements PackageVerifierLike {
     return resolution;
   }
 
-  private async verifyRemote(reference: PackageReference & { registry: "npm" | "pypi" }): Promise<PackageResolution> {
+  private async verifyRemote(reference: PackageReference): Promise<PackageResolution> {
     await this.acquireRemoteRequestSlot();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const url = remoteUrl(reference.registry, reference.packageName);
+      const url = remoteUrl(reference);
       const response = await this.fetchImpl(url, {
         method: "GET",
         signal: controller.signal,
@@ -124,15 +125,15 @@ export class PackageVerifier implements PackageVerifierLike {
           "user-agent": "VibeGuard/0.1"
         }
       });
-      const exists = response.status >= 200 && response.status < 300;
+      const exists = await remoteResponseExists(reference.registry, response);
       return {
         registry: reference.registry,
         packageName: reference.packageName,
         exists,
-        source: "remote",
+        source: exists === null ? "unverified" : "remote",
         lastVerified: Date.now(),
-        similarPackages: exists ? [] : await this.suggestions(reference.registry, reference.packageName),
-        message: exists ? undefined : `Registry returned ${response.status}.`
+        similarPackages: exists === true ? [] : await this.suggestions(reference.registry, reference.packageName),
+        message: remoteVerificationMessage(reference, response.status, exists)
       };
     } catch (error) {
       return {
@@ -174,13 +175,98 @@ export class PackageVerifier implements PackageVerifierLike {
   }
 }
 
-function remoteUrl(registry: "npm" | "pypi", packageName: string): string {
-  if (registry === "npm") {
-    return `https://registry.npmjs.org/${encodeURIComponent(packageName)}`;
+function remoteUrl(reference: PackageReference): string {
+  switch (reference.registry) {
+    case "npm":
+      return `https://registry.npmjs.org/${encodeURIComponent(reference.packageName)}`;
+    case "pypi":
+      return `https://pypi.org/pypi/${encodeURIComponent(reference.packageName)}/json`;
+    case "cargo":
+      return `https://crates.io/api/v1/crates/${encodeURIComponent(reference.packageName)}`;
+    case "gomod":
+      return `https://proxy.golang.org/${escapeGoModulePath(reference.packageName)}/@latest`;
+    case "maven":
+      return mavenSearchUrl(reference);
   }
-  return `https://pypi.org/pypi/${encodeURIComponent(packageName)}/json`;
 }
 
-function remoteVerificationKey(reference: PackageReference & { registry: "npm" | "pypi" }): string {
-  return `${reference.registry}:${reference.packageName.trim().toLowerCase().replace(/_/g, "-")}`;
+async function remoteResponseExists(registry: PackageRegistry, response: Response): Promise<boolean | null> {
+  if (response.status === 404) {
+    return false;
+  }
+  if (!response.ok) {
+    return null;
+  }
+  if (registry !== "maven") {
+    return true;
+  }
+
+  try {
+    const parsed = JSON.parse(await response.text()) as unknown;
+    const responseBody = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).response : undefined;
+    const numFound = responseBody && typeof responseBody === "object" ? (responseBody as Record<string, unknown>).numFound : undefined;
+    return typeof numFound === "number" && Number.isFinite(numFound) ? numFound > 0 : null;
+  } catch {
+    return null;
+  }
+}
+
+function remoteVerificationMessage(reference: PackageReference, status: number, exists: boolean | null): string | undefined {
+  if (exists === true) {
+    return undefined;
+  }
+  if (exists === false) {
+    if (reference.registry === "maven") {
+      return reference.mavenLookup === "class"
+        ? "Maven Central returned no matching imported class."
+        : "Maven Central returned no matching coordinate.";
+    }
+    return `Registry returned ${status}.`;
+  }
+  return `Registry verification was unavailable (HTTP ${status}).`;
+}
+
+function mavenSearchUrl(reference: PackageReference): string {
+  const url = new URL("https://search.maven.org/solrsearch/select");
+  if (reference.mavenLookup === "class") {
+    url.searchParams.set("q", `fc:\"${reference.packageName}\"`);
+  } else {
+    const separator = reference.packageName.indexOf(":");
+    const groupId = separator > 0 ? reference.packageName.slice(0, separator) : "";
+    const artifactId = separator > 0 ? reference.packageName.slice(separator + 1) : "";
+    if (!groupId || !artifactId || artifactId.includes(":")) {
+      throw new Error("Maven package coordinates must use groupId:artifactId format.");
+    }
+    url.searchParams.set("q", `g:\"${groupId}\" AND a:\"${artifactId}\"`);
+  }
+  url.searchParams.set("rows", "1");
+  url.searchParams.set("wt", "json");
+  return url.toString();
+}
+
+function escapeGoModulePath(modulePath: string): string {
+  return modulePath
+    .split("/")
+    .map((segment) =>
+      [...segment]
+        .map((character) => {
+          if (character === "!") {
+            return "!!";
+          }
+          if (character >= "A" && character <= "Z") {
+            return `!${character.toLowerCase()}`;
+          }
+          return encodeURIComponent(character);
+        })
+        .join("")
+    )
+    .join("/");
+}
+
+function remoteVerificationKey(reference: PackageReference): string {
+  const normalized =
+    reference.registry === "npm" || reference.registry === "pypi" || reference.registry === "cargo"
+      ? reference.packageName.trim().toLowerCase().replace(/_/g, "-")
+      : reference.packageName.trim();
+  return `${reference.registry}:${normalized}`;
 }

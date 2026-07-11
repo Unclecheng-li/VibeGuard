@@ -9,10 +9,11 @@ test("GitHub Action exposes findings dashboard and compliance report inputs and 
     inputs: Record<string, { default?: string; description?: string }>;
     outputs: Record<string, { value?: string }>;
     runs: {
-      steps: Array<{ id?: string; run?: string }>;
+      steps: Array<{ id?: string; name?: string; uses?: string; run?: string; with?: Record<string, string | number> }>;
     };
   };
   const runStep = manifest.runs.steps.find((step) => step.id === "vibeguard");
+  const nodeSetupStep = manifest.runs.steps.find((step) => step.name === "Set up Node.js 22");
 
   assert.equal(manifest.inputs.dashboard.default, "false");
   assert.equal(manifest.inputs.dashboard_path.default, "");
@@ -32,6 +33,9 @@ test("GitHub Action exposes findings dashboard and compliance report inputs and 
   assert.match(manifest.inputs.llm_provider.description ?? "", /vibeguard/);
   assert.equal(manifest.outputs.dashboard_path.value, "${{ steps.vibeguard.outputs.dashboard_path }}");
   assert.equal(manifest.outputs.compliance_path.value, "${{ steps.vibeguard.outputs.compliance_path }}");
+  assert.equal(nodeSetupStep?.uses, "actions/setup-node@v4");
+  assert.equal(nodeSetupStep?.with?.["node-version"], 22);
+  assert.equal(nodeSetupStep?.with?.["cache-dependency-path"], "${{ github.action_path }}/package-lock.json");
   assert.ok(runStep);
   assert.match(runStep.run ?? "", /findings dashboard/);
   assert.match(runStep.run ?? "", /store_findings/);

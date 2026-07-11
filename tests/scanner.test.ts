@@ -323,6 +323,76 @@ test("retries remote package verification after connectivity recovers instead of
   assert.equal(cached.get("npm:remote-only-package")?.exists, true);
 });
 
+test("remotely verifies unknown Cargo, Go, and Maven package references", async () => {
+  const requestedUrls: string[] = [];
+  const verifier = new PackageVerifier({
+    fetchImpl: async (url) => {
+      const value = String(url);
+      requestedUrls.push(value);
+      if (value.startsWith("https://search.maven.org/")) {
+        return new Response(JSON.stringify({ response: { numFound: 1, docs: [{ g: "com.example", a: "remote-artifact" }] } }), {
+          status: 200
+        });
+      }
+      return new Response("{}", { status: 200 });
+    }
+  });
+  const references: PackageReference[] = [
+    packageReference("cargo", "remote-cargo-package"),
+    packageReference("gomod", "example.com/Acme/RemotePackage"),
+    packageReference("maven", "com.example:remote-artifact")
+  ];
+
+  const results = await Promise.all(references.map((reference) => verifier.verify(reference, "remote")));
+
+  assert.equal(results.every((result) => result.exists === true && result.source === "remote"), true);
+  assert.equal(requestedUrls.some((url) => url === "https://crates.io/api/v1/crates/remote-cargo-package"), true);
+  assert.equal(
+    requestedUrls.some((url) => url === "https://proxy.golang.org/example.com/!acme/!remote!package/@latest"),
+    true
+  );
+  const mavenUrl = new URL(requestedUrls.find((url) => url.startsWith("https://search.maven.org/")) ?? "https://invalid.test");
+  assert.equal(mavenUrl.searchParams.get("q"), 'g:"com.example" AND a:"remote-artifact"');
+  assert.equal(mavenUrl.searchParams.get("rows"), "1");
+});
+
+test("caches only definitive missing results from extended remote registries", async () => {
+  const calls = new Map<string, number>();
+  const verifier = new PackageVerifier({
+    fetchImpl: async (url) => {
+      const value = String(url);
+      const registry = value.includes("crates.io") ? "cargo" : value.includes("search.maven.org") ? "maven" : "gomod";
+      calls.set(registry, (calls.get(registry) ?? 0) + 1);
+      if (registry === "cargo") {
+        return new Response("{}", { status: 404 });
+      }
+      if (registry === "maven") {
+        return new Response(JSON.stringify({ response: { numFound: 0, docs: [] } }), { status: 200 });
+      }
+      return new Response("rate limited", { status: 429 });
+    }
+  });
+  const cargo = packageReference("cargo", "missing-cargo-package");
+  const maven = packageReference("maven", "com.example:missing-artifact");
+  const gomod = packageReference("gomod", "example.com/blocked/module");
+
+  const [missingCargo, missingMaven, unavailableGo] = await Promise.all([
+    verifier.verify(cargo, "remote"),
+    verifier.verify(maven, "remote"),
+    verifier.verify(gomod, "remote")
+  ]);
+  await Promise.all([verifier.verify(cargo, "remote"), verifier.verify(maven, "remote"), verifier.verify(gomod, "remote")]);
+
+  assert.equal(missingCargo.exists, false);
+  assert.equal(missingMaven.exists, false);
+  assert.match(missingMaven.message ?? "", /no matching coordinate/i);
+  assert.equal(unavailableGo.exists, null);
+  assert.equal(unavailableGo.source, "unverified");
+  assert.equal(calls.get("cargo"), 1);
+  assert.equal(calls.get("maven"), 1);
+  assert.equal(calls.get("gomod"), 2);
+});
+
 test("keeps unknown seed-mode packages quiet until remote verification is requested", async () => {
   const result = await scanSourceFile(
     {
@@ -369,6 +439,31 @@ tokio-secure-auth = "0.1"
   assert.equal(result.findings.length, 1);
   assert.equal(result.findings[0].detection_rule, "hallucinated_package_cargo");
   assert.match(result.findings[0].suggestion ?? "", /tokio/);
+});
+
+test("matches Rust crate imports to hyphenated Cargo seed package names", async () => {
+  const validReference = parsePackageReferences("main.rs", "use actix_web::App;", "rust")[0];
+  assert.ok(validReference);
+  const validResolution = await new PackageVerifier().verify(validReference, "seed");
+  assert.equal(validResolution.exists, true);
+  assert.equal(validResolution.source, "seed");
+
+  const result = await scanSourceFile(
+    {
+      filePath: "main.rs",
+      languageId: "rust",
+      text: "use actix_web_secure_middleware::Auth;"
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].detection_rule, "hallucinated_package_cargo");
+  assert.match(result.findings[0].suggestion ?? "", /actix-web/);
 });
 
 test("detects hallucinated Go modules from go.mod", async () => {
@@ -457,6 +552,85 @@ spring-boot = { id = "org.springframework.boot", version.ref = "spring" }
   assert.equal(result.findings.length, 1);
   assert.equal(result.findings[0].detection_rule, "hallucinated_package_maven");
   assert.match(result.findings[0].suggestion ?? "", /spring-boot-starter-security/);
+});
+
+test("parses only exact external Java class imports for Maven verification", () => {
+  const references = parsePackageReferences(
+    "Controller.java",
+    `import java.util.List;
+import javax.crypto.Cipher;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.xml.sax.SAXException;
+import static org.mockito.Mockito.when;
+import com.example.widgets.*;
+import org.springframework.web.bind.annotation.RestController;
+import com.example.widgets.RemoteWidget;
+import javax.servlet.http.HttpServletRequest;
+import javax.xml.bind.JAXBContext;
+`,
+    "java"
+  );
+
+  assert.deepEqual(
+    references.map((reference) => [reference.registry, reference.packageName, reference.mavenLookup, reference.source]),
+    [
+      ["maven", "org.springframework.web.bind.annotation.RestController", "class", "import"],
+      ["maven", "com.example.widgets.RemoteWidget", "class", "import"],
+      ["maven", "javax.servlet.http.HttpServletRequest", "class", "import"],
+      ["maven", "javax.xml.bind.JAXBContext", "class", "import"]
+    ]
+  );
+});
+
+test("remotely verifies Java class imports without using coordinate indexes", async () => {
+  const requestedQueries: string[] = [];
+  const packageIndex = {
+    get: async () => false,
+    coverage: async () => "full" as const
+  };
+  const verifier = new PackageVerifier({
+    packageIndex,
+    fetchImpl: async (url) => {
+      const query = new URL(String(url)).searchParams.get("q") ?? "";
+      requestedQueries.push(query);
+      const exists = query.includes("KnownRemoteComponent");
+      return new Response(JSON.stringify({ response: { numFound: exists ? 1 : 0, docs: [] } }), { status: 200 });
+    }
+  });
+  const source = {
+    filePath: "ImportController.java",
+    languageId: "java",
+    text: `import com.example.KnownRemoteComponent;
+import com.example.MissingRemoteComponent;
+import java.util.List;
+import javax.crypto.Cipher;
+import org.w3c.dom.Document;
+class ImportController {}`
+  };
+
+  const first = await scanSourceFile(source, {
+    packageVerification: "remote",
+    includeSast: false,
+    packageVerifier: verifier,
+    now: 1
+  });
+  const second = await scanSourceFile(source, {
+    packageVerification: "remote",
+    includeSast: false,
+    packageVerifier: verifier,
+    now: 2
+  });
+
+  assert.deepEqual(requestedQueries.sort(), [
+    'fc:"com.example.KnownRemoteComponent"',
+    'fc:"com.example.MissingRemoteComponent"'
+  ]);
+  assert.equal(first.findings.length, 1);
+  assert.equal(first.findings[0].detection_rule, "hallucinated_package_maven");
+  assert.equal(first.findings[0].evidence, "com.example.MissingRemoteComponent");
+  assert.match(first.findings[0].suggestion ?? "", /no matching imported class/i);
+  assert.equal(second.findings.length, 1);
 });
 
 test("detects hardcoded secrets and redacts evidence", async () => {
@@ -1078,6 +1252,8 @@ test("detects direct Java request input in JDBC, process execution, and ObjectIn
     statement.executeQuery("SELECT * FROM users WHERE id = " + request.getParameter("id"));
     Runtime.getRuntime().exec(request.getParameter("command"));
     new ObjectInputStream(request.getInputStream()).readObject();
+    Files.readAllBytes(Paths.get(request.getParameter("path")));
+    Files.write(Paths.get(request.getParameter("target")), new byte[0]);
   }
 }`
       },
@@ -1092,6 +1268,7 @@ test("detects direct Java request input in JDBC, process execution, and ObjectIn
     statement.executeQuery();
     Runtime.getRuntime().exec(new String[] { "echo", "safe" });
     new ObjectInputStream(new ByteArrayInputStream(payload)).readObject();
+    Files.readAllBytes(Paths.get("/srv/app/fixed.txt"));
   }
 }`
       },
@@ -1103,7 +1280,98 @@ test("detects direct Java request input in JDBC, process execution, and ObjectIn
   assert.equal(ruleIds.has("sast_sql_user_input_execute"), true);
   assert.equal(ruleIds.has("sast_command_injection_os_system"), true);
   assert.equal(ruleIds.has("sast_insecure_deserialization_java_object_input_stream"), true);
+  assert.equal(unsafe.findings.filter((finding) => finding.detection_rule === "sast_path_traversal_java_request_input").length, 2);
   assert.equal(safe.findings.some((finding) => finding.detection_layer === "L2"), false);
+});
+
+test("detects Java request URLs passed to common outbound HTTP clients", async () => {
+  const [unsafe, safe] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "ProxyController.java",
+        languageId: "java",
+        text: `class ProxyController {
+  void fetch(HttpServletRequest request) {
+    restTemplate.getForObject(request.getParameter("url"), String.class);
+    webClient.get().uri(request.getParameter("endpoint")).retrieve();
+    HttpRequest.newBuilder(URI.create(request.getParameter("target"))).build();
+  }
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    ),
+    scanSourceFile(
+      {
+        filePath: "SafeProxyController.java",
+        languageId: "java",
+        text: `class SafeProxyController {
+  void fetch() {
+    restTemplate.getForObject("https://api.example.test/health", String.class);
+    webClient.get().uri("/status").retrieve();
+    HttpRequest.newBuilder(URI.create("https://api.example.test/status")).build();
+  }
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    )
+  ]);
+
+  assert.equal(unsafe.findings.filter((finding) => finding.detection_rule === "sast_ssrf_java_request_url").length, 3);
+  assert.equal(safe.findings.some((finding) => finding.detection_rule === "sast_ssrf_java_request_url"), false);
+});
+
+test("detects Java request redirects and exposed exception messages", async () => {
+  const [unsafe, safe] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "LoginController.java",
+        languageId: "java",
+        text: `class LoginController {
+  void complete(HttpServletRequest request, HttpServletResponse response, RuntimeException sqlException) throws Exception {
+    response.sendRedirect(request.getParameter("next"));
+    RedirectView view = new RedirectView(request.getParameter("returnTo"));
+    response.sendError(500, sqlException.getMessage());
+  }
+
+  String finish(HttpServletRequest request) {
+    return "redirect:" + request.getParameter("continue");
+  }
+
+  ResponseEntity<Object> fail(RuntimeException sqlException) {
+    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(sqlException.getMessage());
+  }
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    ),
+    scanSourceFile(
+      {
+        filePath: "SafeLoginController.java",
+        languageId: "java",
+        text: `class SafeLoginController {
+  void complete(HttpServletResponse response) throws Exception {
+    response.sendRedirect("/dashboard");
+    RedirectView view = new RedirectView("/profile");
+    response.sendError(500, "Request could not be completed.");
+  }
+
+  String finish() {
+    return "redirect:/profile";
+  }
+
+  ResponseEntity<String> fail() {
+    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Request could not be completed.");
+  }
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    )
+  ]);
+
+  assert.equal(unsafe.findings.filter((finding) => finding.detection_rule === "sast_open_redirect_java_request_input").length, 3);
+  assert.equal(unsafe.findings.filter((finding) => finding.detection_rule === "sast_information_leakage_java_error_details").length, 2);
+  assert.equal(safe.findings.some((finding) => finding.detection_rule === "sast_open_redirect_java_request_input"), false);
+  assert.equal(safe.findings.some((finding) => finding.detection_rule === "sast_information_leakage_java_error_details"), false);
 });
 
 test("detects user-controlled dangerouslySetInnerHTML through a local alias", async () => {
@@ -1459,6 +1727,108 @@ app.post("/api/admin/users", (req, res) => {
   assert.equal(ruleIds.includes("l3_missing_input_validation"), true);
 });
 
+test("uses scoped Express authentication and rate-limit middleware in local L3 checks", async () => {
+  const result = await scanSourceFile(
+    {
+      filePath: "routes.ts",
+      languageId: "typescript",
+      text: `
+app.use("/api", requireAuth);
+app.use("/api", rateLimit({ windowMs: 60_000 }));
+
+app.post("/api/admin/users", (req, res) => {
+  res.json({ email: req.body.email });
+});
+
+app.post("/public/admin/users", (req, res) => {
+  res.json({ email: req.body.email });
+});
+`
+    },
+    {
+      packageVerification: "off",
+      detectionLayers: { l1: false, l2: false, l3: true },
+      now: 1
+    }
+  );
+
+  const apiRuleIds = new Set(
+    result.findings.filter((finding) => finding.evidence.includes('"/api/admin/users"')).map((finding) => finding.detection_rule)
+  );
+  const publicRuleIds = new Set(
+    result.findings.filter((finding) => finding.evidence.includes('"/public/admin/users"')).map((finding) => finding.detection_rule)
+  );
+  assert.equal(apiRuleIds.has("l3_missing_authentication"), false);
+  assert.equal(apiRuleIds.has("l3_missing_rate_limiting"), false);
+  assert.equal(apiRuleIds.has("l3_missing_input_validation"), true);
+  assert.equal(publicRuleIds.has("l3_missing_authentication"), true);
+  assert.equal(publicRuleIds.has("l3_missing_rate_limiting"), true);
+});
+
+test("applies local L3 security-dimension checks to Spring controller endpoints", async () => {
+  const [unsafe, protectedEndpoint] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "AdminController.java",
+        languageId: "java",
+        text: `
+@RestController
+@RequestMapping("/api/admin")
+public class AdminController {
+  @PostMapping("/users")
+  public ResponseEntity<User> createUser(@RequestBody User input) {
+    return ResponseEntity.ok(repository.save(input));
+  }
+}
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    ),
+    scanSourceFile(
+      {
+        filePath: "AdminController.java",
+        languageId: "java",
+        text: `
+@RestController
+@RequestMapping("/api/admin")
+public class AdminController {
+  @PostMapping("/users")
+  @PreAuthorize("hasRole('ADMIN')")
+  @RateLimiter(name = "adminWrite")
+  public ResponseEntity<User> createUser(@Valid @RequestBody User input) {
+    try {
+      return ResponseEntity.ok(repository.save(input));
+    } catch (DataAccessException error) {
+      return ResponseEntity.status(500).build();
+    }
+  }
+}
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    )
+  ]);
+
+  const unsafeRules = new Set(unsafe.findings.map((finding) => finding.detection_rule));
+  const protectedRules = new Set(protectedEndpoint.findings.map((finding) => finding.detection_rule));
+  assert.equal(unsafeRules.has("l3_missing_authentication"), true);
+  assert.equal(unsafeRules.has("l3_missing_rate_limiting"), true);
+  assert.equal(unsafeRules.has("l3_missing_input_validation"), true);
+  assert.equal(unsafeRules.has("l3_missing_error_handling"), true);
+  assert.equal(protectedRules.has("l3_missing_authentication"), false);
+  assert.equal(protectedRules.has("l3_missing_rate_limiting"), false);
+  assert.equal(protectedRules.has("l3_missing_input_validation"), false);
+  assert.equal(protectedRules.has("l3_missing_error_handling"), false);
+});
+
 test("detects local L3 missing parameterization and error handling for request-driven IO", async () => {
   const result = await scanSourceFile(
     {
@@ -1560,6 +1930,148 @@ def get_order():
   assert.equal(unsafeRuleIds.has("l3_missing_error_handling"), true);
   assert.equal(safeRuleIds.has("l3_missing_parameterized_queries"), false);
   assert.equal(safeRuleIds.has("l3_missing_error_handling"), false);
+});
+
+test("applies local L3 checks to Django urlpatterns function views", async () => {
+  const [unsafe, protectedView] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "urls.py",
+        languageId: "python",
+        text: `
+from django.urls import path
+from django.views.decorators.http import require_POST
+
+urlpatterns = [path("api/admin/users/", create_user)]
+
+@require_POST
+def create_user(request):
+    email = request.POST["email"]
+    return JsonResponse({"email": email})
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    ),
+    scanSourceFile(
+      {
+        filePath: "urls.py",
+        languageId: "python",
+        text: `
+from django.urls import path
+from django.contrib.auth.decorators import login_required
+from django_ratelimit.decorators import ratelimit
+from django.views.decorators.http import require_POST
+
+urlpatterns = [path("api/admin/users/", create_user)]
+
+@login_required
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
+@require_POST
+def create_user(request):
+    form = UserForm(request.POST)
+    if form.is_valid():
+        return JsonResponse({"email": form.cleaned_data["email"]})
+    return JsonResponse({"error": "invalid input"}, status=400)
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    )
+  ]);
+
+  const unsafeRuleIds = new Set(unsafe.findings.map((finding) => finding.detection_rule));
+  const protectedRuleIds = new Set(protectedView.findings.map((finding) => finding.detection_rule));
+  assert.equal(unsafeRuleIds.has("l3_missing_authentication"), true);
+  assert.equal(unsafeRuleIds.has("l3_missing_rate_limiting"), true);
+  assert.equal(unsafeRuleIds.has("l3_missing_input_validation"), true);
+  assert.equal(protectedRuleIds.has("l3_missing_authentication"), false);
+  assert.equal(protectedRuleIds.has("l3_missing_rate_limiting"), false);
+  assert.equal(protectedRuleIds.has("l3_missing_input_validation"), false);
+});
+
+test("applies local L3 checks to Django views.py function views without scanning helpers", async () => {
+  const [unsafe, protectedView, helper] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "views.py",
+        languageId: "python",
+        text: `
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+@require_POST
+def create_account(request):
+    email = request.POST["email"]
+    return JsonResponse({"email": email})
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    ),
+    scanSourceFile(
+      {
+        filePath: "views.py",
+        languageId: "python",
+        text: `
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse
+from django_ratelimit.decorators import ratelimit
+from django.views.decorators.http import require_POST
+
+@login_required
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
+@require_POST
+def create_account(request):
+    form = AccountForm(request.POST)
+    if form.is_valid():
+        return JsonResponse({"email": form.cleaned_data["email"]})
+    return JsonResponse({"error": "invalid input"}, status=400)
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    ),
+    scanSourceFile(
+      {
+        filePath: "helpers.py",
+        languageId: "python",
+        text: `
+from django.utils.text import slugify
+
+def normalize_request(request):
+    return slugify(request.POST["name"])
+`
+      },
+      {
+        packageVerification: "off",
+        detectionLayers: { l1: false, l2: false, l3: true },
+        now: 1
+      }
+    )
+  ]);
+
+  const unsafeRuleIds = new Set(unsafe.findings.map((finding) => finding.detection_rule));
+  const protectedRuleIds = new Set(protectedView.findings.map((finding) => finding.detection_rule));
+  assert.equal(unsafeRuleIds.has("l3_missing_authentication"), true);
+  assert.equal(unsafeRuleIds.has("l3_missing_rate_limiting"), true);
+  assert.equal(unsafeRuleIds.has("l3_missing_input_validation"), true);
+  assert.equal(protectedRuleIds.has("l3_missing_authentication"), false);
+  assert.equal(protectedRuleIds.has("l3_missing_rate_limiting"), false);
+  assert.equal(protectedRuleIds.has("l3_missing_input_validation"), false);
+  assert.equal(helper.findings.some((finding) => finding.detection_layer === "L3"), false);
 });
 
 test("marks findings dismissed when rule and file scope match ignore-rules.yml", async () => {
@@ -1968,6 +2480,19 @@ test("parses Maven search package coordinates", () => {
   assert.equal(parsed.totalAvailable, 2);
   assert.equal(parsed.format, "maven-search");
 });
+
+function packageReference(registry: PackageReference["registry"], packageName: string): PackageReference {
+  return {
+    registry,
+    packageName,
+    rawSpecifier: packageName,
+    line: 1,
+    column: 1,
+    endLine: 1,
+    endColumn: packageName.length + 1,
+    source: "manifest"
+  };
+}
 
 function applyFirstFix(text: string, finding: Finding | undefined): string {
   const edit = finding?.fix?.edits[0];

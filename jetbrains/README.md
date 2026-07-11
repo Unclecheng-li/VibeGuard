@@ -2,7 +2,8 @@
 
 This IntelliJ Platform plugin is the JetBrains distribution described in the VibeGuard PRD. It starts the same bundled
 `vibeguard-lsp --stdio` implementation used by the VS Code extension, CLI, and other LSP clients, so diagnostics and
-safe quick fixes stay consistent across editors.
+safe quick fixes stay consistent across editors. It publishes L1 immediately while typing, debounces L2 and L3, and
+runs all enabled layers immediately on save.
 
 ## Build
 
