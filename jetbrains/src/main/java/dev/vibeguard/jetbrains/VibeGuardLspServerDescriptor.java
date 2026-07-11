@@ -15,7 +15,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.Locale;
 import java.util.Set;
 
-/** Describes the bundled Node.js VibeGuard server used by all supported project files. */
+/** Describes the default Node.js server and opt-in native Rust L1 preview. */
 final class VibeGuardLspServerDescriptor extends ProjectWideLspServerDescriptor {
   private static final String SERVER_RESOURCE = "lsp/vibeguard-lsp.js";
   private static final Set<String> SUPPORTED_EXTENSIONS = Set.of(
@@ -42,7 +42,15 @@ final class VibeGuardLspServerDescriptor extends ProjectWideLspServerDescriptor 
 
   @Override
   public @NotNull GeneralCommandLine createCommandLine() {
+    String nativePath = nativeServerPath();
+    if (!nativePath.isBlank()) {
+      return new GeneralCommandLine(nativePath, "--stdio");
+    }
     return new GeneralCommandLine(nodeExecutable(), serverPath(), "--stdio");
+  }
+
+  private static String nativeServerPath() {
+    return configuredValue("VIBEGUARD_NATIVE_LSP_PATH", "vibeguard.native.lsp.path", "");
   }
 
   private static String nodeExecutable() {

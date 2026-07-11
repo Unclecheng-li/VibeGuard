@@ -3,7 +3,11 @@
 ## 0.1.0
 
 - Initial VibeGuard MVP extension package.
-- Began the native Rust LSP migration with a testable `tower-lsp` L1 server for bundled NPM hallucination seeds, hardcoded OpenAI keys, and unsafe configuration rules; the Node LSP remains the default until feature parity is complete.
+- Began the native Rust LSP migration with a testable `tower-lsp` L1 server for bundled npm, PyPI, Cargo, Go module, and Maven hallucination seeds, provider and high-entropy secrets with conservative false-positive filtering, JWTs, private-key blocks, credential-bearing database URLs, unsafe configuration rules, and high-confidence AI error patterns; the Node LSP remains the default until feature parity is complete.
+- JetBrains can opt into that native Rust L1 preview with `VIBEGUARD_NATIVE_LSP_PATH` or `vibeguard.native.lsp.path`; its default remains the bundled full Node LSP.
+- The native Rust preview now returns standard LSP quick fixes for safe npm seed replacements and mechanical L1 configuration changes.
+- The native Rust preview now honors shared YAML ignore rules and offers line, file, global-rule, and package ignore actions that immediately refresh diagnostics.
+- The native Rust preview now reads the shared gzip/JSON package index in the background and reports only full-index-confirmed package misses without blocking initial L1 diagnostics.
 - Added a reproducible CLI demo video generated from the deliberately unsafe sample scan, covering hallucinated packages, hardcoded secrets, and DOM XSS.
 - Kotlin source and script imports now use the same conservative Maven class lookup as Java, including Kotlin aliases while excluding JVM platform, wildcard, and lower-case top-level function imports.
 - Local findings history now enforces its 100 MB on-disk budget across SQLite and WAL sidecars, compacts oldest disposable history when necessary, and preserves the current scan or audit event rather than silently dropping it.

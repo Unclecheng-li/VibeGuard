@@ -27,6 +27,20 @@ The plugin targets JetBrains commercial IDEs with LSP support, starting at the 2
 Node.js 18 or later at runtime. By default it uses `node` from `PATH`; enterprise installations can override the
 executable or server location with `VIBEGUARD_NODE_PATH` and `VIBEGUARD_LSP_PATH` respectively.
 
+For an explicit native preview, build [`../rust-lsp/`](../rust-lsp/) and set `VIBEGUARD_NATIVE_LSP_PATH` to the
+resulting executable. The equivalent Java system property is `vibeguard.native.lsp.path`. This takes precedence over
+the Node settings and starts the binary with `--stdio`, so Node is not needed for that preview. The native server
+currently covers local L1 package-seed, provider and high-entropy secrets with conservative false-positive filtering,
+unsafe-configuration, and high-confidence AI-error-pattern
+diagnostics. It provides standard LSP quick fixes for safe npm seed replacements and mechanical configuration changes,
+plus line, file, global-rule, and package ignore actions persisted to the shared `~/.vibeguard/ignore-rules.yml` file.
+Set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to use an alternate shared-rule path in a managed or test environment.
+In the background it also reads the shared JSON fallback index at `~/.vibeguard/package-index.json.gz` (or the
+`VIBEGUARD_NATIVE_PACKAGE_INDEX_PATH` override) and only flags missing packages when a registry has `full` coverage.
+It does not yet read the shared SQLite cache or perform package-cache synchronization, secret or AI-pattern fixes,
+persisted findings, or L2/L3 analysis. Leave the
+variable unset for the default full Node service.
+
 When the server starts, it refreshes the shared `~/.vibeguard` package-name cache in the background according to
 `config.json`. Workspace-root dependency manifests are prioritized, and updated indexes automatically recheck open
 package findings without interrupting L1/L2/L3 editing feedback. JetBrains clients that support standard LSP work

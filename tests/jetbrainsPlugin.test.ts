@@ -5,7 +5,7 @@ import test from "node:test";
 
 const repositoryRoot = path.resolve(__dirname, "../..");
 
-test("JetBrains plugin packages and starts the shared VibeGuard LSP server", async () => {
+test("JetBrains plugin packages the Node LSP and supports an opt-in native preview", async () => {
   const [buildFile, pluginXml, provider, descriptor] = await Promise.all([
     readJetBrainsFile("build.gradle.kts"),
     readJetBrainsFile("src/main/resources/META-INF/plugin.xml"),
@@ -22,8 +22,11 @@ test("JetBrains plugin packages and starts the shared VibeGuard LSP server", asy
   assert.match(pluginXml, /platform\.lsp\.serverSupportProvider/);
   assert.match(provider, /ensureServerStarted\(new VibeGuardLspServerDescriptor\(project\)\)/);
   assert.match(descriptor, /new GeneralCommandLine\(nodeExecutable\(\), serverPath\(\), "--stdio"\)/);
+  assert.match(descriptor, /new GeneralCommandLine\(nativePath, "--stdio"\)/);
   assert.match(descriptor, /VIBEGUARD_NODE_PATH/);
   assert.match(descriptor, /VIBEGUARD_LSP_PATH/);
+  assert.match(descriptor, /VIBEGUARD_NATIVE_LSP_PATH/);
+  assert.match(descriptor, /vibeguard\.native\.lsp\.path/);
   assert.match(descriptor, /lsp\/vibeguard-lsp\.js/);
 });
 

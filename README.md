@@ -39,7 +39,10 @@ cd jetbrains
 
 The distribution ZIP is written to `jetbrains/build/distributions/`. Node.js 18 or later is required at runtime; use
 `VIBEGUARD_NODE_PATH` or `VIBEGUARD_LSP_PATH` to override the Node executable or LSP script in managed environments.
-See [jetbrains/README.md](jetbrains/README.md) for supported file types and Windows instructions.
+To try the limited native Rust L1 preview instead, build `rust-lsp` and set `VIBEGUARD_NATIVE_LSP_PATH` to its
+executable (or set the `vibeguard.native.lsp.path` Java system property). It takes precedence over the Node settings;
+leave it unset for the default full Node service. See [jetbrains/README.md](jetbrains/README.md) for the current
+native coverage, supported file types, and Windows instructions.
 
 Watch the [14-second CLI demo](media/vibeguard-demo.mp4) for a real scan of the deliberately unsafe [demo sample](demo/unsafe-ai-sample.ts).
 
@@ -609,6 +612,6 @@ VibeGuard publishes diagnostics with quick actions. When a finding has a safe me
 
 ## Scope Notes
 
-The Rust LSP migration has started with a standalone `tower-lsp` native L1 server in [`rust-lsp/`](rust-lsp/). It keeps open documents in memory and publishes diagnostics for bundled NPM hallucination seeds, hardcoded OpenAI keys, and the current unsafe-configuration rules. Its ranges use LSP UTF-16 columns and secret diagnostic messages never include a matched key. Run it over stdio with `cargo run --manifest-path rust-lsp/Cargo.toml -- --stdio`.
+The Rust LSP migration has started with a standalone `tower-lsp` native L1 server in [`rust-lsp/`](rust-lsp/). It keeps open documents in memory and publishes diagnostics for bundled npm, PyPI, Cargo, Go module, and Maven hallucination seeds; provider signatures; contextual and standalone high-entropy secret literals with placeholder/hash/fixture filtering; JWTs, private-key blocks, credential-bearing database URLs, unsafe-configuration rules, and high-confidence AI error patterns such as default credentials, disabled TLS verification, weak token generation, and insecure session settings. It returns standard LSP quick fixes for safe npm seed replacements and mechanical configuration changes, and persists line, file, global-rule, and package ignores to the shared `~/.vibeguard/ignore-rules.yml`; set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to override that path in managed or test environments. It also reads the shared gzip/JSON package index in the background and only reports a cache miss after `full` coverage confirms it; set `VIBEGUARD_NATIVE_PACKAGE_INDEX_PATH` to override that JSON path. SQLite cache access and cache synchronization remain Node-service features. Other native findings remain diagnostic-only until their fixes can be validated with the same guarantees as the Node service. Its ranges use LSP UTF-16 columns and secret diagnostic messages never include a matched value. Run it over stdio with `cargo run --manifest-path rust-lsp/Cargo.toml -- --stdio`.
 
-The Node LSP remains the VSCode default while the Rust service reaches parity with package-index synchronization, all registry parsers, code actions, L2/L3 scheduling, ignore rules, and persisted findings. Both use the same rule IDs where native coverage exists, so the editor integration can move over without changing the user-facing finding contract.
+The Node LSP remains the VSCode default while the Rust service reaches parity with SQLite package-cache access and synchronization, all registry parsers, remaining code actions, L2/L3 scheduling, and persisted findings. JetBrains users can exercise the current native L1 preview by setting `VIBEGUARD_NATIVE_LSP_PATH` to a built `vibeguard-lsp` executable (or `vibeguard.native.lsp.path` as a Java system property); it takes precedence only when explicitly configured. Both use the same rule IDs where native coverage exists, so the editor integration can move over without changing the user-facing finding contract.
