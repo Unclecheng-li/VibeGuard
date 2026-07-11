@@ -19,8 +19,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - id: version
@@ -46,15 +46,15 @@ jobs:
     needs: verify-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
       - run: npm exec -- vsce package --out "vibeguard-${{ needs.verify-version.outputs.version }}.vsix"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: vibeguard-vscode-${{ needs.verify-version.outputs.version }}
           path: vibeguard-${{ needs.verify-version.outputs.version }}.vsix
@@ -68,20 +68,22 @@ jobs:
     needs: verify-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
           cache: gradle
       - run: npm ci
+      - run: chmod +x ./gradlew
+        working-directory: jetbrains
       - run: ./gradlew buildPlugin --no-daemon
         working-directory: jetbrains
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: vibeguard-jetbrains-${{ needs.verify-version.outputs.version }}
           path: jetbrains/build/distributions/*.zip

@@ -8,18 +8,29 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      - name: Run tests
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.log
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: vibeguard-node-test-log
+          path: test-output.log
+          if-no-files-found: error
 
   rust-lsp:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,20 +40,22 @@ jobs:
   jetbrains-plugin:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
           cache: gradle
       - run: npm ci
+      - run: chmod +x ./gradlew
+        working-directory: jetbrains
       - run: ./gradlew buildPlugin --no-daemon
         working-directory: jetbrains
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: vibeguard-jetbrains-plugin
           path: jetbrains/build/distributions/*.zip
@@ -50,7 +63,7 @@ jobs:
   docker-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker build --tag vibeguard:ci .
       - run: >-
           VIBEGUARD_DASHBOARD_TOKEN=ci-dashboard-token
@@ -62,14 +75,29 @@ jobs:
       - run: docker run --rm -v "$PWD/tests/fixtures:/workspace:ro" -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci scan /workspace --package-verification off --findings-db /data/findings.db --fail-on none
       - run: docker run --rm -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci findings compliance --db /data/findings.db --framework all --output /data/compliance.md
       - run: test -s "$RUNNER_TEMP/vibeguard-dashboard/compliance.md"
-      - run: docker run --detach --name vibeguard-dashboard -p 127.0.0.1:8787:8787 -e VIBEGUARD_DASHBOARD_TOKEN=ci-token -v "$RUNNER_TEMP/vibeguard-dashboard:/data" vibeguard:ci findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
-      - run: >-
-          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1
-          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/summary
-      - run: >-
-          curl --fail --silent --show-error
-          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/compliance?framework=soc2
-      - run: >-
-          curl --fail --silent --show-error
-          -H "Authorization: Bearer ci-token" http://127.0.0.1:8787/api/audit
-      - run: docker rm --force vibeguard-dashboard
+      - name: Verify dashboard APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name vibeguard-dashboard -p 127.0.0.1:8787:8787 \
+            -e VIBEGUARD_DASHBOARD_TOKEN=ci-token \
+            -v "$RUNNER_TEMP/vibeguard-dashboard:/data" \
+            vibeguard:ci findings serve --db /data/findings.db --host 0.0.0.0 --token-env VIBEGUARD_DASHBOARD_TOKEN
+          cleanup() {
+            local status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs vibeguard-dashboard || true
+            fi
+            docker rm --force vibeguard-dashboard >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+          request_dashboard() {
+            curl --fail --silent --show-error --output /dev/null \
+              --retry 10 --retry-all-errors --retry-delay 1 --connect-timeout 2 --max-time 10 \
+              -H "Authorization: Bearer ci-token" "http://127.0.0.1:8787$1"
+          }
+          request_dashboard /healthz
+          request_dashboard /api/summary
+          request_dashboard '/api/compliance?framework=soc2'
+          request_dashboard /api/audit

@@ -33,7 +33,7 @@ test("GitHub Action exposes findings dashboard and compliance report inputs and 
   assert.match(manifest.inputs.llm_provider.description ?? "", /vibeguard/);
   assert.equal(manifest.outputs.dashboard_path.value, "${{ steps.vibeguard.outputs.dashboard_path }}");
   assert.equal(manifest.outputs.compliance_path.value, "${{ steps.vibeguard.outputs.compliance_path }}");
-  assert.equal(nodeSetupStep?.uses, "actions/setup-node@v4");
+  assert.equal(nodeSetupStep?.uses, "actions/setup-node@v5");
   assert.equal(nodeSetupStep?.with?.["node-version"], 22);
   assert.equal(nodeSetupStep?.with?.["cache-dependency-path"], "${{ github.action_path }}/package-lock.json");
   assert.ok(runStep);

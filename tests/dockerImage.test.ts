@@ -44,3 +44,24 @@ test("development and release workflows pin Node.js 22 LTS", async () => {
   assert.match(release, /node-version:\s*22/);
   assert.match(packageJson.scripts?.test ?? "", /assert-node-lts/);
 });
+
+test("CI uses Node 24-compatible actions and leaves actionable diagnostics on failure", async () => {
+  const [ci, release] = await Promise.all([
+    fs.readFile(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8"),
+    fs.readFile(path.join(repositoryRoot, ".github", "workflows", "release.yml"), "utf8")
+  ]);
+
+  for (const workflow of [ci, release]) {
+    assert.doesNotMatch(workflow, /actions\/(?:checkout|setup-node|setup-java|upload-artifact)@v4/);
+    assert.match(workflow, /actions\/checkout@v5/);
+    assert.match(workflow, /actions\/setup-node@v5/);
+  }
+  assert.match(ci, /actions\/setup-java@v5/);
+  assert.match(release, /actions\/setup-java@v5/);
+  assert.match(ci, /chmod \+x \.\/gradlew/);
+  assert.match(release, /chmod \+x \.\/gradlew/);
+  assert.match(ci, /vibeguard-node-test-log/);
+  assert.match(ci, /request_dashboard \/healthz/);
+  assert.match(ci, /--retry-all-errors/);
+  assert.match(ci, /docker logs vibeguard-dashboard/);
+});

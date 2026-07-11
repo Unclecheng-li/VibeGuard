@@ -63,7 +63,9 @@ export function normalizeAuthorFilePath(filePath: string): string {
 }
 
 function normalizeAbsolutePath(filePath: string): string {
-  return path.resolve(filePath).replace(/\\/g, "/").toLowerCase();
+  const resolved = path.resolve(filePath).replace(/\\/g, "/");
+  // Windows paths are case-insensitive; lowercasing Unix paths makes them fall outside a mixed-case Git worktree.
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 function normalizeRelativePath(filePath: string): string {

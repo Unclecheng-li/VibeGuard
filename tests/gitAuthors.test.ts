@@ -12,7 +12,7 @@ test("parses git author output", () => {
 });
 
 test("loads git authors for files with a runner", async () => {
-  const cwd = process.cwd();
+  const cwd = path.join(process.cwd(), "VibeGuardWorkspace");
   const file = path.join(cwd, "src", "demo.ts");
   const calls: string[][] = [];
   const runner: GitAuthorRunner = {
