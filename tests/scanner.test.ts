@@ -583,6 +583,32 @@ import javax.xml.bind.JAXBContext;
   );
 });
 
+test("parses exact external Kotlin class imports for Maven verification", () => {
+  const references = parsePackageReferences(
+    "Controller.kt",
+    `import java.time.Instant
+import kotlin.collections.List
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import org.springframework.web.bind.annotation.RestController as SpringController
+import com.example.widgets.RemoteWidget
+import com.example.functions.helper
+import com.example.widgets.*
+import com.example.widgets.TopLevelKt
+`,
+    "kotlin"
+  );
+
+  assert.deepEqual(
+    references.map((reference) => [reference.registry, reference.packageName, reference.mavenLookup, reference.source]),
+    [
+      ["maven", "org.springframework.web.bind.annotation.RestController", "class", "import"],
+      ["maven", "com.example.widgets.RemoteWidget", "class", "import"],
+      ["maven", "com.example.widgets.TopLevelKt", "class", "import"]
+    ]
+  );
+});
+
 test("remotely verifies Java class imports without using coordinate indexes", async () => {
   const requestedQueries: string[] = [];
   const packageIndex = {
@@ -631,6 +657,46 @@ class ImportController {}`
   assert.equal(first.findings[0].evidence, "com.example.MissingRemoteComponent");
   assert.match(first.findings[0].suggestion ?? "", /no matching imported class/i);
   assert.equal(second.findings.length, 1);
+});
+
+test("remotely verifies Kotlin class imports through the Maven class index", async () => {
+  const requestedQueries: string[] = [];
+  const verifier = new PackageVerifier({
+    packageIndex: {
+      get: async () => false,
+      coverage: async () => "full" as const
+    },
+    fetchImpl: async (url) => {
+      const query = new URL(String(url)).searchParams.get("q") ?? "";
+      requestedQueries.push(query);
+      const exists = query.includes("KnownRemoteComponent");
+      return new Response(JSON.stringify({ response: { numFound: exists ? 1 : 0, docs: [] } }), { status: 200 });
+    }
+  });
+  const result = await scanSourceFile(
+    {
+      filePath: "ImportController.kt",
+      languageId: "kotlin",
+      text: `import com.example.KnownRemoteComponent as Known
+import com.example.MissingRemoteComponent
+import kotlin.collections.List
+class ImportController`
+    },
+    {
+      packageVerification: "remote",
+      includeSast: false,
+      packageVerifier: verifier,
+      now: 1
+    }
+  );
+
+  assert.deepEqual(requestedQueries.sort(), [
+    'fc:"com.example.KnownRemoteComponent"',
+    'fc:"com.example.MissingRemoteComponent"'
+  ]);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].detection_rule, "hallucinated_package_maven");
+  assert.equal(result.findings[0].evidence, "com.example.MissingRemoteComponent");
 });
 
 test("detects hardcoded secrets and redacts evidence", async () => {

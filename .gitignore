@@ -6,6 +6,7 @@ dist/
 .DS_Store
 npm-debug.log*
 coverage/
+rust-lsp/target/
 .vibeguard/
 jetbrains/.gradle/
 jetbrains/build/

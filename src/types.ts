@@ -121,7 +121,7 @@ export interface ScanPerformance {
 export interface PackageReference {
   registry: PackageRegistry;
   packageName: string;
-  /** Maven artifacts use coordinates; Java source imports are checked as fully qualified classes. */
+  /** Maven artifacts use coordinates; JVM source imports are checked as fully qualified classes. */
   mavenLookup?: "coordinate" | "class";
   rawSpecifier: string;
   line: number;

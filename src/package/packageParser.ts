@@ -73,11 +73,14 @@ const pythonStdlib = new Set([
 
 const rustStdlib = new Set(["alloc", "core", "crate", "self", "std", "super"]);
 
-// Maven class lookup is only meaningful for external dependencies. These Java
-// SE namespaces are supplied by the JDK even though several do not use java.*.
-const javaPlatformImportPrefixes = [
+// Maven class lookup is only meaningful for external dependencies. These JVM
+// platform namespaces are supplied by the JDK, Kotlin runtime, or Android SDK.
+const jvmPlatformImportPrefixes = [
+  "android.",
+  "androidx.",
   "java.",
   "jdk.",
+  "kotlin.",
   "sun.",
   "javax.accessibility.",
   "javax.annotation.processing.",
@@ -140,8 +143,8 @@ export function parsePackageReferences(filePath: string, text: string, languageI
   if (fileName.endsWith(".versions.toml")) {
     return parseGradleVersionCatalog(filePath, text);
   }
-  if (ext === "java" || languageId === "java") {
-    return parseJavaImports(filePath, text);
+  if (["java", "kt", "kts"].includes(ext) || ["java", "kotlin"].includes(languageId ?? "")) {
+    return parseJvmClassImports(filePath, text);
   }
   if (
     ["sh", "bash", "zsh", "ps1", "yml", "yaml"].includes(ext) ||
@@ -472,12 +475,12 @@ function parsePomXml(filePath: string, text: string): PackageReference[] {
   return dedupeReferences(references);
 }
 
-function parseJavaImports(filePath: string, text: string): PackageReference[] {
+function parseJvmClassImports(filePath: string, text: string): PackageReference[] {
   const references: PackageReference[] = [];
-  const importRegex = /^\s*import\s+(?!static\b)([A-Za-z_$][A-Za-z0-9_$.]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+)\s*;/gm;
+  const importRegex = /^[ \t]*import[ \t]+(?!static\b)([A-Za-z_$][A-Za-z0-9_$.]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+)(?:[ \t]+as[ \t]+[A-Za-z_$][A-Za-z0-9_$]*)?[ \t]*;?[ \t]*$/gm;
   for (const match of text.matchAll(importRegex)) {
     const className = match[1] ?? "";
-    if (!isExternalJavaClassImport(className)) {
+    if (!isExternalJvmClassImport(className)) {
       continue;
     }
     const reference = makeReference(filePath, text, "maven", className, className, match.index ?? 0, match[0], "import");
@@ -487,8 +490,8 @@ function parseJavaImports(filePath: string, text: string): PackageReference[] {
   return dedupeReferences(references);
 }
 
-function isExternalJavaClassImport(className: string): boolean {
-  if (javaPlatformImportPrefixes.some((prefix) => className.startsWith(prefix))) {
+function isExternalJvmClassImport(className: string): boolean {
+  if (jvmPlatformImportPrefixes.some((prefix) => className.startsWith(prefix))) {
     return false;
   }
   const lastSegment = className.split(".").at(-1) ?? "";

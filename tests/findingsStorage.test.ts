@@ -384,6 +384,9 @@ test("stores bounded dashboard audit events without authentication material", as
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-audit-"));
   const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const extraDetails = Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => [`field_${index.toString().padStart(2, "0")}`, "x".repeat(300)])
+  );
   store.recordAuditEvent({
     timestamp: 10,
     subject: "security@example.com",
@@ -396,7 +399,8 @@ test("stores bounded dashboard audit events without authentication material", as
       access_token: "must-not-be-stored",
       api_key: "must-not-be-stored",
       credential: "must-not-be-stored",
-      count: 2
+      count: 2,
+      ...extraDetails
     }
   });
   store.recordAuditEvent({
@@ -410,11 +414,49 @@ test("stores bounded dashboard audit events without authentication material", as
   const events = store.listAuditEvents();
   assert.equal(events.length, 2);
   assert.equal(events[0].action, "dashboard.audit_log_viewed");
-  assert.deepEqual(events[1].details, { path: "/api/compliance", count: 2 });
+  assert.equal(events[1].details.path, "/api/compliance");
+  assert.equal(events[1].details.count, 2);
+  assert.equal(events[1].details.authorization, undefined);
+  assert.equal(Object.keys(events[1].details).length, 16);
   assert.equal(store.listAuditEvents({ since: 15 }).length, 1);
   const prune = store.pruneBefore(15);
   assert.equal(prune.deletedAuditEvents, 1);
   assert.equal(store.listAuditEvents().length, 1);
+  store.close();
+});
+
+test("retains the current audit event when storage compaction removes older audit history", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-audit-cap-"));
+  const maxDatabaseBytes = 640_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+  const details = Object.fromEntries(
+    Array.from({ length: 16 }, (_, index) => [`field_${index.toString().padStart(2, "0")}`, "x".repeat(256)])
+  );
+  for (let index = 0; index < 20; index += 1) {
+    store.recordAuditEvent({
+      timestamp: 100 + index,
+      authentication: "token",
+      action: `older.${index}`,
+      details
+    });
+  }
+
+  store.recordAuditEvent({
+    timestamp: 1,
+    authentication: "token",
+    action: "current.low_timestamp",
+    details
+  });
+
+  const events = store.listAuditEvents({ limit: 1000 });
+  assert.ok(events.some((event) => event.action === "current.low_timestamp"));
+  assert.equal(events.some((event) => event.action === "older.0"), false);
+  assert.ok((store.stats().databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
   store.close();
 });
 

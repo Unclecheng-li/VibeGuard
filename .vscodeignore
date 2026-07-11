@@ -11,6 +11,7 @@ Dockerfile
 .dockerignore
 .nvmrc
 scripts/**
+rust-lsp/**
 .gitignore
 tsconfig.json
 *.map

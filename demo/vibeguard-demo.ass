@@ -1,0 +1,28 @@
+[Script Info]
+Title: VibeGuard CLI demo
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Title,Segoe UI Semibold,42,&H00F9FAFB,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,80,80,64,1
+Style: Subtitle,Segoe UI,22,&H00AAB7C4,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,80,80,116,1
+Style: Terminal,Consolas,20,&H00DDE6ED,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,102,102,204,1
+Style: Critical,Consolas,22,&H004F7CFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,102,102,204,1
+Style: High,Consolas,22,&H0049B9FF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,102,102,204,1
+Style: Footer,Segoe UI Semibold,24,&H00A7F3D0,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,2,80,80,50,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+Dialogue: 0,0:00:00.00,0:00:14.00,Title,,0,0,0,,VibeGuard
+Dialogue: 0,0:00:00.00,0:00:14.00,Subtitle,,0,0,0,,Guard your vibe. Catch what AI missed.
+Dialogue: 0,0:00:00.00,0:00:03.40,Terminal,,0,0,0,,$ vibeguard scan demo --package-verification seed --fail-on none\NVibeGuard scanned 1 file(s).\N3 active finding(s), 0 dismissed.
+Dialogue: 0,0:00:03.40,0:00:07.00,Critical,,0,0,0,,[CRITICAL] hallucinated_package_npm (L1)
+Dialogue: 0,0:00:03.40,0:00:07.00,Terminal,,0,0,0,,"react-virtualized-auto-sizer" does not exist in npm.\NThis may be a slopsquatting risk.\NVerified alternatives: react-virtualized, react-window
+Dialogue: 0,0:00:07.00,0:00:10.40,Critical,,0,0,0,,[CRITICAL] hardcoded_secret_openai_key (L1)
+Dialogue: 0,0:00:07.00,0:00:10.40,Terminal,,0,0,0,,OpenAI API key appears to be hardcoded.\NMove the secret to an environment variable or OS keychain.\NRotate the exposed value.
+Dialogue: 0,0:00:10.40,0:00:14.00,High,,0,0,0,,[HIGH] sast_xss_inner_html (L2)
+Dialogue: 0,0:00:10.40,0:00:14.00,Terminal,,0,0,0,,HTML is assigned directly to the DOM.\NUse textContent for plain text or sanitize trusted HTML.\N\NVS Code | JetBrains | CI
+Dialogue: 0,0:00:10.40,0:00:14.00,Footer,,0,0,0,,vibeguard.dev

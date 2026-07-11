@@ -222,6 +222,11 @@ export interface PruneResult {
   deletedTelemetryBuckets: number;
 }
 
+interface DatabaseStorageProtection {
+  scanId?: string;
+  auditEventId?: string;
+}
+
 export class SqliteFindingStore {
   private readonly database: DatabaseLike;
   private readonly maxDatabaseBytes: number;
@@ -315,7 +320,7 @@ export class SqliteFindingStore {
     }
 
     try {
-      this.enforceDatabaseSizeLimit(storedRun.scanId);
+      this.enforceDatabaseSizeLimit({ scanId: storedRun.scanId });
     } catch (error) {
       this.deleteScanRun(storedRun.scanId);
       this.compactDatabase();
@@ -390,7 +395,17 @@ export class SqliteFindingStore {
         event.outcome,
         JSON.stringify(event.details)
       );
-    this.enforceDatabaseSizeLimit();
+    try {
+      this.enforceDatabaseSizeLimit({ auditEventId: event.id });
+    } catch (error) {
+      this.database.prepare("DELETE FROM audit_event WHERE event_id = ?").run(event.id);
+      this.compactDatabase();
+      throw new Error(
+        `Current audit event could not be persisted within the ${this.maxDatabaseBytes}-byte findings storage budget: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
     return event;
   }
 
@@ -988,9 +1003,9 @@ export class SqliteFindingStore {
    * Keeps recent records and evicts scan history first, followed by audit and feedback history, only when over budget.
    * Project rules and ingest credentials are deliberately never evicted as historical scan data.
    */
-  private enforceDatabaseSizeLimit(protectedScanId?: string): void {
+  private enforceDatabaseSizeLimit(protection: DatabaseStorageProtection = {}): void {
     while (this.databaseStorageBytes() > this.maxDatabaseBytes) {
-      if (!this.deleteOldestDisposableHistory(protectedScanId)) {
+      if (!this.deleteOldestDisposableHistory(protection)) {
         this.compactDatabase();
         if (this.databaseStorageBytes() > this.maxDatabaseBytes) {
           throw new Error(
@@ -1003,7 +1018,7 @@ export class SqliteFindingStore {
     }
   }
 
-  private deleteOldestDisposableHistory(protectedScanId?: string): boolean {
+  private deleteOldestDisposableHistory(protection: DatabaseStorageProtection): boolean {
     const oldestScan = this.database
       .prepare(
         `SELECT scan_id
@@ -1012,15 +1027,21 @@ export class SqliteFindingStore {
          ORDER BY completed_at ASC, scan_id ASC
          LIMIT 1`
       )
-      .get(protectedScanId ?? null, protectedScanId ?? null);
+      .get(protection.scanId ?? null, protection.scanId ?? null);
     if (oldestScan) {
       this.deleteScanRun(String(oldestScan.scan_id));
       return true;
     }
 
     const oldestAuditEvent = this.database
-      .prepare("SELECT event_id FROM audit_event ORDER BY occurred_at ASC, event_id ASC LIMIT 1")
-      .get();
+      .prepare(
+        `SELECT event_id
+         FROM audit_event
+         WHERE (? IS NULL OR event_id <> ?)
+         ORDER BY occurred_at ASC, event_id ASC
+         LIMIT 1`
+      )
+      .get(protection.auditEventId ?? null, protection.auditEventId ?? null);
     if (oldestAuditEvent) {
       this.database.prepare("DELETE FROM audit_event WHERE event_id = ?").run(String(oldestAuditEvent.event_id));
       return true;

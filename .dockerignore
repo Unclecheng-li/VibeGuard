@@ -8,5 +8,6 @@ jetbrains/
 media/
 node_modules/
 out/
+rust-lsp/
 vibeguard-*.vsix
 *.log

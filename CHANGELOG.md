@@ -3,6 +3,10 @@
 ## 0.1.0
 
 - Initial VibeGuard MVP extension package.
+- Began the native Rust LSP migration with a testable `tower-lsp` L1 server for bundled NPM hallucination seeds, hardcoded OpenAI keys, and unsafe configuration rules; the Node LSP remains the default until feature parity is complete.
+- Added a reproducible CLI demo video generated from the deliberately unsafe sample scan, covering hallucinated packages, hardcoded secrets, and DOM XSS.
+- Kotlin source and script imports now use the same conservative Maven class lookup as Java, including Kotlin aliases while excluding JVM platform, wildcard, and lower-case top-level function imports.
+- Local findings history now enforces its 100 MB on-disk budget across SQLite and WAL sidecars, compacts oldest disposable history when necessary, and preserves the current scan or audit event rather than silently dropping it.
 - Real-time L1 findings for hallucinated npm, PyPI, Cargo, Go module, and Maven packages, hardcoded secrets, loose configuration, and common AI coding mistakes.
 - Lightweight L2 SAST diagnostics for common injection and unsafe deserialization patterns.
 - Optional local L3 semantic endpoint checks for missing authentication, rate limiting, validation, parameterized queries, IO error handling, and output encoding.
