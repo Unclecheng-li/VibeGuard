@@ -7,6 +7,7 @@ import {
   ensureConfigFile,
   loadConfig,
   resolveConfigCustomRulePaths,
+  updateLlmApiKeyStored,
   updateIgnoredFinding
 } from "./config";
 import { loadCustomRules } from "./customRules";
@@ -27,6 +28,14 @@ import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
 import { filterFindingsToAiLineRanges, filterScanFiles, type AiDetectionMode, type ScanMode } from "./gitFilter";
 import { appendIgnoreRule, defaultIgnoreRulesPath, expandHome, loadIgnoreRules, scopedIgnoreReason } from "./ignore";
 import { cliFalsePositiveTelemetryEvent, isFalsePositiveDismissalReason, reportFalsePositiveTelemetry } from "./telemetry";
+import {
+  deleteStoredLlmCredential,
+  hasEncryptedLlmCredential,
+  llmCredentialPinEnvironment,
+  readStoredLlmCredential,
+  storeLlmCredential,
+  type StoredLlmCredentialSource
+} from "./l3/credentials";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { defaultIndexPath } from "./package/cache";
 import { syncConfiguredPackageIndexes, type ConfiguredPackageSyncResult } from "./package/configSync";
@@ -147,6 +156,10 @@ async function main(): Promise<void> {
     await runSubscriptionCommand(args.slice(1));
     return;
   }
+  if (args[0] === "llm-key") {
+    await runLlmKeyCommand(args.slice(1));
+    return;
+  }
   if (args[0] === "ignore-rules") {
     await runIgnoreRulesCommand(args.slice(1));
     return;
@@ -170,7 +183,7 @@ async function main(): Promise<void> {
   const includeL3 = options.includeL3 ?? config.detection_layers.l3;
   const llmProvider = options.llmProvider ?? config.llm_provider ?? "deepseek";
   const l3Analyzer = includeL3
-    ? createCliL3Analyzer(llmProvider, options.llmModel, options.llmBaseUrl, options.llmApiKeyEnv)
+    ? await createCliL3Analyzer(llmProvider, options.llmModel, options.llmBaseUrl, options.llmApiKeyEnv)
     : undefined;
   const dedupWithExistingTools = options.dedupWithExistingTools ?? config.dedup_with_existing_tools;
   const storage = createPackageStorage({
@@ -389,6 +402,195 @@ async function runSubscriptionCommand(args: string[]): Promise<void> {
   throw new Error(`Unknown subscription subcommand: ${subcommand}`);
 }
 
+async function runLlmKeyCommand(args: string[]): Promise<void> {
+  const action = args.shift();
+  if (!action || action === "-h" || action === "--help") {
+    printLlmKeyHelp();
+    return;
+  }
+  if (action !== "set" && action !== "delete" && action !== "status") {
+    throw new Error(`Unknown llm-key subcommand: ${action}`);
+  }
+
+  let provider: LlmProvider | undefined;
+  let configPath = defaultConfigPath();
+  let source: "stdin" | "environment" | undefined;
+  let environmentName: string | undefined;
+  let pinEnvironment: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--provider") {
+      provider = parseLlmProvider(readRequiredOptionValue(args[++index], "--provider"));
+    } else if (arg.startsWith("--provider=")) {
+      provider = parseLlmProvider(readRequiredOptionValue(arg.slice("--provider=".length), "--provider"));
+    } else if (arg === "--config") {
+      configPath = path.resolve(expandHome(readRequiredOptionValue(args[++index], "--config")));
+    } else if (arg.startsWith("--config=")) {
+      configPath = path.resolve(expandHome(readRequiredOptionValue(arg.slice("--config=".length), "--config")));
+    } else if (arg === "--stdin") {
+      if (source) {
+        throw new Error("Use only one LLM key source: --stdin or --from-env.");
+      }
+      source = "stdin";
+    } else if (arg === "--from-env") {
+      if (source) {
+        throw new Error("Use only one LLM key source: --stdin or --from-env.");
+      }
+      source = "environment";
+      environmentName = readEnvironmentVariableName(args[++index], "--from-env");
+    } else if (arg.startsWith("--from-env=")) {
+      if (source) {
+        throw new Error("Use only one LLM key source: --stdin or --from-env.");
+      }
+      source = "environment";
+      environmentName = readEnvironmentVariableName(arg.slice("--from-env=".length), "--from-env");
+    } else if (arg === "--pin-env") {
+      pinEnvironment = readEnvironmentVariableName(args[++index], "--pin-env");
+    } else if (arg.startsWith("--pin-env=")) {
+      pinEnvironment = readEnvironmentVariableName(arg.slice("--pin-env=".length), "--pin-env");
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg === "-h" || arg === "--help") {
+      printLlmKeyHelp();
+      return;
+    } else {
+      if (action === "set") {
+        throw new Error("Unsupported llm-key set option. Use --stdin or --from-env ENV_VAR; plaintext key arguments are not supported.");
+      }
+      throw new Error(`Unknown llm-key ${action} option: ${arg}`);
+    }
+  }
+
+  if (action !== "set" && source) {
+    throw new Error(`--stdin and --from-env are only valid for vibeguard llm-key set.`);
+  }
+  if (action === "set" && !source) {
+    throw new Error("vibeguard llm-key set requires --stdin or --from-env NAME; plaintext command-line keys are not supported.");
+  }
+
+  const loaded = await loadConfig(configPath);
+  const selectedProvider = provider ?? loaded.config.llm_provider ?? "deepseek";
+  const pin = pinEnvironment ? process.env[pinEnvironment] : process.env[llmCredentialPinEnvironment];
+
+  if (action === "set") {
+    const apiKey =
+      source === "stdin"
+        ? await readLlmKeyFromStdin()
+        : process.env[environmentName ?? ""]?.trim();
+    if (!apiKey) {
+      throw new Error(source === "environment" ? `Environment variable ${environmentName} is empty.` : "LLM API key must not be empty.");
+    }
+    const storedSource = await storeLlmCredential(selectedProvider, apiKey, { pin });
+    const updated = await updateLlmApiKeyStored(true, configPath, selectedProvider);
+    printLlmKeyResult(
+      { provider: selectedProvider, stored: true, changed: true, configPath: updated.path, source: storedSource },
+      json
+    );
+    return;
+  }
+
+  if (action === "delete") {
+    const deleted = await deleteStoredLlmCredential(selectedProvider, { pin });
+    const updated = await updateLlmApiKeyStored(false, configPath, selectedProvider);
+    printLlmKeyResult(
+      {
+        provider: selectedProvider,
+        stored: false,
+        changed: deleted.nativeDeleted || deleted.encryptedDeleted,
+        configPath: updated.path,
+        source: deleted.encryptedDeleted ? "encrypted" : "native"
+      },
+      json
+    );
+    return;
+  }
+
+  const credential = await readStoredLlmCredential(selectedProvider, { pin });
+  const encryptedStored = !credential && (await hasEncryptedLlmCredential(selectedProvider));
+  printLlmKeyResult(
+    {
+      provider: selectedProvider,
+      stored: Boolean(credential) || encryptedStored,
+      changed: false,
+      configPath: loaded.path,
+      source: credential?.source ?? (encryptedStored ? "encrypted" : "native")
+    },
+    json
+  );
+}
+
+function printLlmKeyResult(
+  result: { provider: LlmProvider; stored: boolean; changed: boolean; configPath: string; source: StoredLlmCredentialSource },
+  json: boolean
+): void {
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(
+    `VibeGuard ${result.provider} API key: ${result.stored ? `stored securely (${result.source})` : "not stored"}.`
+  );
+  if (result.changed) {
+    console.log(`Config marker updated: ${result.configPath}`);
+  }
+}
+
+async function readLlmKeyFromStdin(): Promise<string> {
+  if (!process.stdin.isTTY) {
+    let value = "";
+    for await (const chunk of process.stdin) {
+      value += String(chunk);
+      if (value.length > 16 * 1024) {
+        throw new Error("LLM API key must not exceed 16 KiB.");
+      }
+    }
+    return value.trim();
+  }
+
+  const input = process.stdin as NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => void };
+  return new Promise<string>((resolve, reject) => {
+    let value = "";
+    const wasRaw = input.isRaw ?? false;
+    const cleanup = () => {
+      input.off("data", onData);
+      input.setRawMode?.(wasRaw);
+      input.pause();
+    };
+    const onData = (chunk: Buffer) => {
+      for (const character of chunk.toString("utf8")) {
+        if (character === "\r" || character === "\n") {
+          cleanup();
+          process.stdout.write("\n");
+          resolve(value.trim());
+          return;
+        }
+        if (character === "\u0003") {
+          cleanup();
+          process.stdout.write("\n");
+          reject(new Error("LLM API key entry cancelled."));
+          return;
+        }
+        if (character === "\b" || character === "\u007f") {
+          value = value.slice(0, -1);
+          continue;
+        }
+        value += character;
+        if (value.length > 16 * 1024) {
+          cleanup();
+          process.stdout.write("\n");
+          reject(new Error("LLM API key must not exceed 16 KiB."));
+          return;
+        }
+      }
+    };
+    process.stdout.write("Enter LLM API key: ");
+    input.setRawMode?.(true);
+    input.resume();
+    input.on("data", onData);
+  });
+}
+
 async function printSubscriptionStatus(args: string[]): Promise<void> {
   let apiKeyEnvironment: string | undefined;
   let baseUrl: string | undefined;
@@ -413,7 +615,7 @@ async function printSubscriptionStatus(args: string[]): Promise<void> {
     }
   }
   const status = await getProSubscriptionStatus({
-    apiKey: getProApiKeyFromEnv(apiKeyEnvironment),
+    apiKey: getProApiKeyFromEnv(apiKeyEnvironment) ?? (await readStoredLlmCredential("vibeguard"))?.apiKey,
     baseUrl
   });
   if (json) {
@@ -955,6 +1157,7 @@ async function printFindingsStatus(args: string[]): Promise<void> {
     console.log(`Scans: ${stats.scanCount}`);
     console.log(`Findings: ${stats.findingCount} (${stats.activeCount} active, ${stats.dismissedCount} dismissed)`);
     console.log(`Latest scan: ${stats.latestScanAt ? new Date(stats.latestScanAt).toISOString() : "none"}`);
+    console.log(`Storage: ${formatStorageBytes(stats.databaseBytes ?? 0)} / ${formatStorageBytes(stats.maxDatabaseBytes ?? 0)}`);
   } finally {
     store.close();
   }
@@ -1034,6 +1237,8 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
   let token: string | undefined;
   let ingestToken: string | undefined;
   let ingestMaxFindings: number | undefined;
+  let telemetryCollection = false;
+  let telemetryMaxEventsPerMinute: number | undefined;
   let project: string | undefined;
   let oidcIssuerEnvironment: string | undefined;
   let oidcClientIdEnvironment: string | undefined;
@@ -1078,6 +1283,18 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
       ingestMaxFindings = parsePositiveInteger(args[++index], "--ingest-max-findings");
     } else if (arg.startsWith("--ingest-max-findings=")) {
       ingestMaxFindings = parsePositiveInteger(arg.slice("--ingest-max-findings=".length), "--ingest-max-findings");
+    } else if (arg === "--telemetry-collection") {
+      telemetryCollection = true;
+    } else if (arg === "--telemetry-max-events-per-minute") {
+      telemetryMaxEventsPerMinute = parsePositiveInteger(
+        args[++index],
+        "--telemetry-max-events-per-minute"
+      );
+    } else if (arg.startsWith("--telemetry-max-events-per-minute=")) {
+      telemetryMaxEventsPerMinute = parsePositiveInteger(
+        arg.slice("--telemetry-max-events-per-minute=".length),
+        "--telemetry-max-events-per-minute"
+      );
     } else if (arg === "--project") {
       project = readProjectIdentifier(args[++index], "--project");
     } else if (arg.startsWith("--project=")) {
@@ -1145,6 +1362,8 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
     token,
     ingestToken,
     ingestMaxFindings,
+    telemetryCollection,
+    telemetryMaxEventsPerMinute,
     project,
     oidc
   });
@@ -1156,6 +1375,9 @@ async function serveFindingsDashboard(args: string[]): Promise<void> {
   }
   if (ingestToken) {
     console.log("CI findings ingestion is enabled at POST /api/ingest with its separate bearer token.");
+  }
+  if (telemetryCollection) {
+    console.log("Anonymous false-positive telemetry is enabled at POST /api/telemetry/false-positive.");
   }
   const close = async () => {
     await dashboard.close();
@@ -1351,7 +1573,7 @@ async function pruneStoredFindings(args: string[]): Promise<void> {
       return;
     }
     console.log(
-      `Deleted ${result.deletedScans} scan(s), ${result.deletedFindings} finding(s), and ${result.deletedAuditEvents} audit event(s) older than ${days} day(s).`
+      `Deleted ${result.deletedScans} scan(s), ${result.deletedFindings} finding(s), ${result.deletedAuditEvents} audit event(s), and ${result.deletedTelemetryBuckets} anonymous telemetry bucket(s) older than ${days} day(s).`
     );
   } finally {
     store.close();
@@ -1457,6 +1679,9 @@ function printHumanFindingsSummary(dbPath: string, summary: FindingStoreSummary)
   console.log(`Scans: ${summary.scanCount}`);
   console.log(`Findings: ${summary.findingCount} (${summary.activeCount} active, ${summary.dismissedCount} dismissed)`);
   console.log(`Latest scan: ${summary.latestScanAt ? new Date(summary.latestScanAt).toISOString() : "none"}`);
+  if (summary.databaseBytes !== undefined && summary.maxDatabaseBytes !== undefined) {
+    console.log(`Storage: ${formatStorageBytes(summary.databaseBytes)} / ${formatStorageBytes(summary.maxDatabaseBytes)}`);
+  }
   console.log(
     `Latest scan change: ${summary.latestScanDelta
       ? `${summary.latestScanDelta.introducedCount} introduced, ${summary.latestScanDelta.resolvedCount} resolved, ${summary.latestScanDelta.persistentCount} persistent active finding(s)`
@@ -1521,6 +1746,13 @@ function formatAuthorBuckets(authors: FindingStoreSummary["authorCounts"]): stri
       return `${label} ${author.count} (${author.activeCount} active, ${author.highRiskCount} high-risk, ${rate})`;
     })
     .join(", ");
+}
+
+function formatStorageBytes(bytes: number): string {
+  if (bytes < 1_000_000) {
+    return `${Math.ceil(bytes / 1024)} KiB`;
+  }
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
 
 function formatStoredFinding(finding: StoredFinding): string {
@@ -2010,13 +2242,13 @@ function parseLlmProvider(value: string): LlmProvider {
   throw new Error("LLM provider must be one of deepseek, claude, openai, local, vibeguard.");
 }
 
-function createCliL3Analyzer(
+async function createCliL3Analyzer(
   provider: LlmProvider,
   model?: string,
   baseUrl?: string,
   apiKeyEnv?: string
-): LlmSemanticAnalyzer | undefined {
-  const apiKey = getLlmApiKeyFromEnv(provider, apiKeyEnv);
+): Promise<LlmSemanticAnalyzer | undefined> {
+  const apiKey = getLlmApiKeyFromEnv(provider, apiKeyEnv) ?? (await readStoredLlmCredential(provider))?.apiKey;
   if (provider !== "local" && !apiKey) {
     return undefined;
   }
@@ -2118,6 +2350,7 @@ Usage:
   vibeguard config ignore-finding <finding-id> [--path path]
   vibeguard config unignore-finding <finding-id> [--path path]
   vibeguard findings <status|list|summary|dashboard|compliance|audit|serve|prune> [--db path] [--json]
+  vibeguard llm-key <set|delete|status> [--provider provider] [--config path]
   vibeguard subscription status [--api-key-env ENV_VAR] [--base-url URL] [--json]
   vibeguard ignore-rules <add-rule|add-package> ...
   vibeguard packages <import|sync|sync-config|status|check> ...
@@ -2128,6 +2361,8 @@ Examples:
   vibeguard scan src --l3
   DEEPSEEK_API_KEY=... vibeguard scan src --l3 --llm-provider deepseek
   VIBEGUARD_PRO_API_KEY=... vibeguard scan src --l3 --llm-provider vibeguard
+  vibeguard llm-key set --provider deepseek --from-env DEEPSEEK_API_KEY
+  vibeguard llm-key status --provider deepseek
   VIBEGUARD_PRO_API_KEY=... vibeguard subscription status
   vibeguard scan src --json --package-verification remote --fail-on high
   vibeguard scan . --sarif vibeguard.sarif --github-annotations
@@ -2224,6 +2459,7 @@ Usage:
   vibeguard findings serve [--db path] [--project id] [--host 127.0.0.1] [--port 8787] [--days n] [--top n]
                            [--token-env ENV_VAR]
                            [--ingest-token-env ENV_VAR] [--ingest-max-findings n]
+                           [--telemetry-collection] [--telemetry-max-events-per-minute n]
                            [--oidc-issuer-env ENV_VAR --oidc-client-id-env ENV_VAR --oidc-session-secret-env ENV_VAR]
                            [--oidc-client-secret-env ENV_VAR] [--oidc-role-claim path]
                            [--oidc-role claim-value=viewer|analyst|admin] [--oidc-default-role none|viewer|analyst|admin]
@@ -2245,6 +2481,28 @@ Usage:
 
 The Pro credential is read from VIBEGUARD_PRO_API_KEY by default. The hosted service
 enforces official L3 request allowances; BYOK and local LLM modes remain available.
+`);
+}
+
+function printLlmKeyHelp(): void {
+  console.log(`VibeGuard LLM credential storage
+
+Usage:
+  vibeguard llm-key set [--provider deepseek|claude|openai|vibeguard] (--stdin|--from-env ENV_VAR) [--pin-env PIN_ENV] [--config path] [--json]
+  vibeguard llm-key delete [--provider provider] [--pin-env PIN_ENV] [--config path] [--json]
+  vibeguard llm-key status [--provider provider] [--pin-env PIN_ENV] [--config path] [--json]
+
+The CLI never accepts a plaintext key argument. It stores credentials in Windows DPAPI,
+macOS Keychain, or the Linux Secret Service. If that service is unavailable, set
+VIBEGUARD_LLM_CREDENTIAL_PIN (or --pin-env) to allow an AES-256-GCM encrypted fallback
+bound to the machine identifier. Environment variables still take precedence for one-off
+scans and CI. Local Ollama does not require a credential.
+
+Examples:
+  vibeguard llm-key set --provider deepseek --from-env DEEPSEEK_API_KEY
+  VIBEGUARD_LLM_CREDENTIAL_PIN=... vibeguard llm-key set --provider deepseek --from-env DEEPSEEK_API_KEY
+  printf %s "$OPENAI_API_KEY" | vibeguard llm-key set --provider openai --stdin
+  vibeguard llm-key delete --provider deepseek
 `);
 }
 

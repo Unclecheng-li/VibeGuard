@@ -40,6 +40,27 @@ test("exports VibeGuard rules as Semgrep YAML", () => {
     assert.equal(parsed.rules.some((exported) => exported.id === `vibeguard.${rule.id}`), true);
   }
 
+  const configurationRules: Array<[string, string, RegExp]> = [
+    ["insecure_config_app_debug_true", "javascript", /app\\\.debug/],
+    ["insecure_config_allowed_hosts_wildcard", "python", /ALLOWED_HOSTS/],
+    ["insecure_config_acao_wildcard", "generic", /Access-Control-Allow-Origin/],
+    ["insecure_config_disable_host_check", "generic", /DANGEROUSLY_DISABLE_HOST_CHECK/],
+    ["insecure_config_spring_permit_all", "java", /permitAll/],
+    ["insecure_config_spring_security_disable", "generic", /security\\\.disable/],
+    ["insecure_config_cross_origin_wildcard", "java", /CrossOrigin/],
+    ["insecure_config_python_exec", "python", /exec/],
+    ["insecure_config_pickle_loads", "python", /pickle/]
+  ];
+  for (const [id, language, pattern] of configurationRules) {
+    const rule = parsed.rules.find((entry) => entry.id === `vibeguard.${id}`);
+    assert.equal(rule?.metadata.vibeguard.rule_id, id);
+    assert.equal(rule?.metadata.vibeguard.detection_layer, "L1");
+    assert.equal(rule?.metadata.vibeguard.finding_type, "insecure_config");
+    assert.equal(rule?.languages.includes(language), true);
+    assert.match(rule?.["pattern-regex"] ?? "", pattern);
+    assert.doesNotThrow(() => new RegExp(rule?.["pattern-regex"] ?? ""));
+  }
+
   const sqlRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_sql_template_interpolation");
   assert.equal(sqlRule?.severity, "ERROR");
   assert.deepEqual(sqlRule?.languages, ["javascript", "typescript"]);
@@ -85,6 +106,13 @@ test("exports VibeGuard rules as Semgrep YAML", () => {
   assert.equal(commandRule?.metadata.vibeguard.finding_type, "command_injection");
   assert.match(commandRule?.["pattern-regex"] ?? "", /exec/);
   assert.match(commandRule?.["pattern-regex"] ?? "", /check_output/);
+
+  const nodeShellCommandRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_command_injection_node_shell");
+  assert.equal(nodeShellCommandRule?.metadata.vibeguard.rule_id, "sast_command_injection_os_system");
+  assert.deepEqual(nodeShellCommandRule?.languages, ["javascript", "typescript"]);
+  assert.match(nodeShellCommandRule?.["pattern-regex"] ?? "", /spawn/);
+  assert.match(nodeShellCommandRule?.["pattern-regex"] ?? "", /execFile/);
+  assert.match(nodeShellCommandRule?.["pattern-regex"] ?? "", /shell/);
 
   const leakageRule = parsed.rules.find((rule) => rule.id === "vibeguard.sast_information_leakage_error_details");
   assert.equal(leakageRule?.metadata.vibeguard.finding_type, "information_leakage");

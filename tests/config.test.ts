@@ -42,6 +42,7 @@ test("parses partial config and preserves defaults", () => {
   assert.deepEqual(config.package_cache.languages, ["npm", "maven"]);
   assert.equal(config.package_cache.update_interval, "weekly");
   assert.equal(config.package_cache.lightweight_mode, true);
+  assert.equal(config.package_cache.background_full_sync, true);
 });
 
 test("parses UTF-8 BOM config files", () => {
@@ -62,6 +63,10 @@ test("rejects invalid config field types and enums", () => {
   assert.throws(
     () => parseConfig(JSON.stringify({ llm_api_key: "secret" }), "bad.json"),
     /llm_api_key must be null/
+  );
+  assert.throws(
+    () => parseConfig(JSON.stringify({ package_cache: { background_full_sync: "yes" } }), "bad.json"),
+    /package_cache\.background_full_sync must be boolean/
   );
 });
 

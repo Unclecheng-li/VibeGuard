@@ -2,8 +2,14 @@
 
 This IntelliJ Platform plugin is the JetBrains distribution described in the VibeGuard PRD. It starts the same bundled
 `vibeguard-lsp --stdio` implementation used by the VS Code extension, CLI, and other LSP clients, so diagnostics and
-safe quick fixes stay consistent across editors. It publishes L1 immediately while typing, debounces L2 and L3, and
-runs all enabled layers immediately on save.
+safe quick fixes and local ignore actions stay consistent across editors. It publishes L1 immediately while typing,
+debounces L2 and L3, and runs all enabled layers immediately on save. Unknown package imports use the local seed/index
+first and are then verified against their registry asynchronously by default, so network latency does not block typing
+feedback. Newly detected critical package findings also explain the Slopsquatting risk and open a standard LSP warning dialog,
+where users can choose any verified safe package replacement or ignore the finding on its line, in its file, globally by rule, or by package name; each ignore choice
+writes the shared `ignore-rules.yml` file. Clients with standard `showDocument` support can open that file directly from
+the dialog through `Manage Ignore Rules`. The same choices remain available in the quick-fix menu. L3 generated
+replacements always require an LSP confirmation and an evidence recheck before the server requests the edit.
 
 ## Build
 
@@ -20,6 +26,12 @@ The build runs `npm run build`, packages `dist/lspServer.js` inside the plugin, 
 The plugin targets JetBrains commercial IDEs with LSP support, starting at the 2025.2 platform release. It requires
 Node.js 18 or later at runtime. By default it uses `node` from `PATH`; enterprise installations can override the
 executable or server location with `VIBEGUARD_NODE_PATH` and `VIBEGUARD_LSP_PATH` respectively.
+
+When the server starts, it refreshes the shared `~/.vibeguard` package-name cache in the background according to
+`config.json`. Workspace-root dependency manifests are prioritized, and updated indexes automatically recheck open
+package findings without interrupting L1/L2/L3 editing feedback. JetBrains clients that support standard LSP work
+progress receive native cache-sync stages and percentages in their language-service UI. Lightweight cache mode first
+enables the quick partial index, then proceeds to the full index in Tier 2 unless `background_full_sync` is disabled.
 
 Open a supported JavaScript, TypeScript, Python, Rust, Go, Java, Kotlin, JSON, TOML, XML, or Gradle file to start the
 project-wide language server. The JetBrains Language Services widget shows its status and surfaces the same VibeGuard

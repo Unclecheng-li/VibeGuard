@@ -23,6 +23,9 @@ services:
       NODE_ENV: production
       VIBEGUARD_DASHBOARD_TOKEN: ${VIBEGUARD_DASHBOARD_TOKEN:?Set a long dashboard administrator token}
       VIBEGUARD_FINDINGS_INGEST_TOKEN: ${VIBEGUARD_FINDINGS_INGEST_TOKEN:?Set a distinct CI ingest token}
+      # Disabled by default because this exposes a public, anonymous feedback endpoint.
+      VIBEGUARD_TELEMETRY_COLLECTION: ${VIBEGUARD_TELEMETRY_COLLECTION:-false}
+      VIBEGUARD_TELEMETRY_MAX_EVENTS_PER_MINUTE: ${VIBEGUARD_TELEMETRY_MAX_EVENTS_PER_MINUTE:-60}
     ports:
       - "${VIBEGUARD_DASHBOARD_BIND:-127.0.0.1}:${VIBEGUARD_DASHBOARD_PORT:-8787}:8787"
     volumes:

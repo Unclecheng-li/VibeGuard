@@ -32,7 +32,8 @@ export function cloneDefaultConfig(): VibeGuardConfig {
     package_cache: {
       languages: [...defaultConfig.package_cache.languages],
       update_interval: defaultConfig.package_cache.update_interval,
-      lightweight_mode: defaultConfig.package_cache.lightweight_mode
+      lightweight_mode: defaultConfig.package_cache.lightweight_mode,
+      background_full_sync: defaultConfig.package_cache.background_full_sync
     },
     telemetry: defaultConfig.telemetry
   };
@@ -214,6 +215,12 @@ function normalizeConfig(value: unknown, sourceName: string): VibeGuardConfig {
         input,
         "package_cache.lightweight_mode",
         config.package_cache.lightweight_mode,
+        sourceName
+      ),
+      background_full_sync: readBoolean(
+        input,
+        "package_cache.background_full_sync",
+        config.package_cache.background_full_sync,
         sourceName
       )
     },

@@ -177,6 +177,28 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "\\bDEBUG\\s*=\\s*True\\b"
   },
   {
+    id: "insecure_config_app_debug_true",
+    vibeguardRuleId: "insecure_config_app_debug_true",
+    languages: ["javascript", "typescript", "python"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Application debug mode is enabled.",
+    suggestion: "Disable debug mode outside local development.",
+    patternRegex: "\\bapp\\.debug\\s*=\\s*(?:True|true)\\b"
+  },
+  {
+    id: "insecure_config_allowed_hosts_wildcard",
+    vibeguardRuleId: "insecure_config_allowed_hosts_wildcard",
+    languages: ["python"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Django ALLOWED_HOSTS allows every host.",
+    suggestion: "Set ALLOWED_HOSTS to the exact production hostnames.",
+    patternRegex: "\\bALLOWED_HOSTS\\s*=\\s*\\[\\s*[\\\"']\\*[\\\"']\\s*\\]"
+  },
+  {
     id: "insecure_config_cors_allow_all",
     vibeguardRuleId: "insecure_config_cors_allow_all",
     languages: ["python"],
@@ -186,6 +208,28 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     message: "CORS is configured to allow every origin.",
     suggestion: "Restrict CORS to trusted origins.",
     patternRegex: "\\b(?:CORS_ALLOW_ALL|CORS_ALLOW_ALL_ORIGINS)\\s*=\\s*True\\b"
+  },
+  {
+    id: "insecure_config_acao_wildcard",
+    vibeguardRuleId: "insecure_config_acao_wildcard",
+    languages: ["generic"],
+    severity: "medium",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Access-Control-Allow-Origin is set to '*'.",
+    suggestion: "Return a specific allowlisted origin instead of '*'.",
+    patternRegex: "Access-Control-Allow-Origin[\\\"']?\\s*[:,]\\s*[\\\"']\\*[\\\"']"
+  },
+  {
+    id: "insecure_config_disable_host_check",
+    vibeguardRuleId: "insecure_config_disable_host_check",
+    languages: ["generic"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Host header checks are disabled.",
+    suggestion: "Remove DANGEROUSLY_DISABLE_HOST_CHECK and configure trusted hosts explicitly.",
+    patternRegex: "\\bDANGEROUSLY_DISABLE_HOST_CHECK\\s*=\\s*(?:true|1)\\b"
   },
   {
     id: "insecure_config_csrf_exempt",
@@ -199,6 +243,39 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     patternRegex: "@csrf_exempt\\b|\\bcsrf_exempt\\s*\\("
   },
   {
+    id: "insecure_config_spring_permit_all",
+    vibeguardRuleId: "insecure_config_spring_permit_all",
+    languages: ["java"],
+    severity: "medium",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Spring Security permitAll() may expose an endpoint.",
+    suggestion: "Confirm this endpoint is intentionally public and add authorization where needed.",
+    patternRegex: "\\.permitAll\\s*\\("
+  },
+  {
+    id: "insecure_config_spring_security_disable",
+    vibeguardRuleId: "insecure_config_spring_security_disable",
+    languages: ["generic"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Spring security appears to be disabled.",
+    suggestion: "Enable Spring Security and use environment-specific test overrides if needed.",
+    patternRegex: "\\bsecurity\\.disable\\s*=\\s*true\\b"
+  },
+  {
+    id: "insecure_config_cross_origin_wildcard",
+    vibeguardRuleId: "insecure_config_cross_origin_wildcard",
+    languages: ["java"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "Spring @CrossOrigin allows every origin.",
+    suggestion: "Restrict @CrossOrigin to trusted domains.",
+    patternRegex: "@CrossOrigin\\s*\\([^)]*(?:origins\\s*=\\s*)?[\\\"']\\*[\\\"'][^)]*\\)"
+  },
+  {
     id: "insecure_config_eval",
     vibeguardRuleId: "insecure_config_eval",
     languages: ["javascript", "typescript", "python", "java"],
@@ -208,6 +285,28 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     message: "eval() executes arbitrary code.",
     suggestion: "Replace eval() with a structured parser or explicit dispatch table.",
     patternRegex: "\\beval\\s*\\("
+  },
+  {
+    id: "insecure_config_python_exec",
+    vibeguardRuleId: "insecure_config_python_exec",
+    languages: ["python"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "exec() executes arbitrary Python code.",
+    suggestion: "Avoid exec(); use explicit functions or safe parsers instead.",
+    patternRegex: "\\bexec\\s*\\("
+  },
+  {
+    id: "insecure_config_pickle_loads",
+    vibeguardRuleId: "insecure_config_pickle_loads",
+    languages: ["python"],
+    severity: "high",
+    detectionLayer: "L1",
+    findingType: "insecure_config",
+    message: "pickle deserialization can execute arbitrary code.",
+    suggestion: "Use JSON or a safe serialization format for untrusted data.",
+    patternRegex: "\\bpickle\\.loads?\\s*\\("
   },
   {
     id: "insecure_config_yaml_load_without_loader",
@@ -351,6 +450,17 @@ export const semgrepExportRules: SemgrepExportRule[] = [
     message: "Command execution appears to include user-controlled input.",
     suggestion: "Use argument arrays, strict allowlists, and avoid shell=True or string commands.",
     patternRegex: "\\b(?:os\\.system|subprocess\\.(?:call|run|Popen|check_call|check_output)|child_process\\.exec(?:Sync)?)\\s*\\([^\\)\\n]*(?:request|req\\.|input|body|params|\\$\\{)|\\b(?:Runtime\\s*\\.\\s*getRuntime\\s*\\(\\s*\\)\\s*\\.\\s*exec|new\\s+ProcessBuilder)\\s*\\([^\\)\\n]*request\\s*\\.\\s*(?:getParameter|getHeader|getQueryString)\\s*\\("
+  },
+  {
+    id: "sast_command_injection_node_shell",
+    vibeguardRuleId: "sast_command_injection_os_system",
+    languages: ["javascript", "typescript"],
+    severity: "high",
+    detectionLayer: "L2",
+    findingType: "command_injection",
+    message: "Shell-enabled Node process execution appears to include user-controlled input.",
+    suggestion: "Keep shell disabled, use argument arrays, and allowlist user-controlled values.",
+    patternRegex: "\\b(?:child_process\\.)?(?:spawn(?:Sync)?|execFile(?:Sync)?)\\s*\\((?=[^\\)\\n]*\\bshell\\s*:\\s*true)[^\\)\\n]*(?:request|req\\.|input|body|params|\\$\\{)"
   },
   {
     id: "sast_open_redirect_user_input",

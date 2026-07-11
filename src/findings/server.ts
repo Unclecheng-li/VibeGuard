@@ -13,6 +13,7 @@ import { formatFindingsDashboard } from "./dashboard";
 import { formatProjectIntegrationsDashboard } from "./projectIntegrations";
 import { FindingsIngestError, parseFindingsIngestPayload } from "./ingest";
 import { parseCustomRules } from "../customRules";
+import { parseFalsePositiveTelemetryEvent } from "../telemetry";
 import { SqliteFindingStore } from "./storage";
 
 export interface FindingsDashboardServerOptions {
@@ -32,6 +33,10 @@ export interface FindingsDashboardServerOptions {
   ingestToken?: string;
   /** Maximum findings accepted in one CI upload. Defaults to 10,000. */
   ingestMaxFindings?: number;
+  /** Enables the anonymous false-positive collector at /api/telemetry/false-positive. Disabled by default. */
+  telemetryCollection?: boolean;
+  /** Per-network-source anonymous telemetry events accepted each minute. Defaults to 60. */
+  telemetryMaxEventsPerMinute?: number;
 }
 
 export interface StartedFindingsDashboardServer {
@@ -49,6 +54,9 @@ export async function startFindingsDashboardServer(
   const token = options.token?.trim() || undefined;
   const ingestToken = options.ingestToken?.trim() || undefined;
   const ingestMaxFindings = validateIngestMaxFindings(options.ingestMaxFindings);
+  const telemetryRateLimiter = options.telemetryCollection === true
+    ? new TelemetryRateLimiter(validateTelemetryMaxEventsPerMinute(options.telemetryMaxEventsPerMinute))
+    : undefined;
   const project = normalizeProject(options.project);
   const since = options.days === undefined ? undefined : Date.now() - options.days * 24 * 60 * 60 * 1000;
   // Validate an external OIDC callback origin before opening the database or listening on a port.
@@ -94,6 +102,7 @@ export async function startFindingsDashboardServer(
     token,
     ingestToken,
     ingestMaxFindings,
+    telemetryRateLimiter,
     project,
     since,
     authenticator,
@@ -115,6 +124,7 @@ interface RequestOptions extends FindingsDashboardServerOptions {
   authenticator?: OidcDashboardAuthenticator;
   ingestToken?: string;
   ingestMaxFindings: number;
+  telemetryRateLimiter?: TelemetryRateLimiter;
   project?: string;
 }
 
@@ -140,6 +150,14 @@ async function handleRequest(
       return;
     }
     await handleIngest(request, response, store, options);
+    return;
+  }
+  if (url.pathname === "/api/telemetry/false-positive") {
+    if (request.method !== "POST") {
+      writeText(response, 405, "Method Not Allowed\n", "text/plain; charset=utf-8", { Allow: "POST" });
+      return;
+    }
+    await handleAnonymousFalsePositiveTelemetry(request, response, store, options);
     return;
   }
   if (url.pathname === "/api/projects") {
@@ -347,6 +365,37 @@ async function handleIngest(
       return;
     }
     writeText(response, 400, "Invalid findings ingest payload\n", "text/plain; charset=utf-8");
+  }
+}
+
+async function handleAnonymousFalsePositiveTelemetry(
+  request: IncomingMessage,
+  response: ServerResponse,
+  store: SqliteFindingStore,
+  options: RequestOptions
+): Promise<void> {
+  const limiter = options.telemetryRateLimiter;
+  if (!limiter) {
+    writeText(response, 404, "Not Found\n", "text/plain; charset=utf-8");
+    return;
+  }
+  const contentType = request.headers["content-type"];
+  if (typeof contentType !== "string" || !/^application\/json(?:;|$)/i.test(contentType.trim())) {
+    writeText(response, 415, "Expected application/json\n", "text/plain; charset=utf-8");
+    return;
+  }
+  const networkSource = request.socket.remoteAddress ?? "unknown";
+  if (!limiter.allow(networkSource)) {
+    writeText(response, 429, "Too Many Requests\n", "text/plain; charset=utf-8", { "Retry-After": "60" });
+    return;
+  }
+  try {
+    const event = parseFalsePositiveTelemetryEvent(await readJsonBody(request, 2048, "Telemetry event"));
+    store.recordAnonymousFalsePositiveTelemetry(event);
+    writeJson(response, 202, { accepted: true });
+  } catch (error) {
+    const status = error instanceof FindingsIngestError ? error.status : 400;
+    writeText(response, status, status === 413 ? "Anonymous telemetry event is too large\n" : "Invalid anonymous telemetry event\n", "text/plain; charset=utf-8");
   }
 }
 
@@ -778,25 +827,66 @@ function tokensMatch(expected: string, provided: string): boolean {
   return expectedBuffer.length === providedBuffer.length && timingSafeEqual(expectedBuffer, providedBuffer);
 }
 
-async function readJsonBody(request: IncomingMessage, maxBytes = 5 * 1024 * 1024): Promise<unknown> {
+async function readJsonBody(request: IncomingMessage, maxBytes = 5 * 1024 * 1024, label = "Findings ingest payload"): Promise<unknown> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += buffer.length;
     if (bytes > maxBytes) {
-      throw new FindingsIngestError("Findings ingest payload exceeds the 5 MiB limit.", 413);
+      throw new FindingsIngestError(`${label} exceeds the ${formatByteLimit(maxBytes)} limit.`, 413);
     }
     chunks.push(buffer);
   }
   if (bytes === 0) {
-    throw new FindingsIngestError("Findings ingest payload must not be empty.");
+    throw new FindingsIngestError(`${label} must not be empty.`);
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
   } catch {
-    throw new FindingsIngestError("Findings ingest payload must be valid JSON.");
+    throw new FindingsIngestError(`${label} must be valid JSON.`);
   }
+}
+
+class TelemetryRateLimiter {
+  private readonly entries = new Map<string, { startedAt: number; count: number }>();
+
+  constructor(private readonly maxEventsPerMinute: number) {}
+
+  allow(networkSource: string, now = Date.now()): boolean {
+    for (const [source, entry] of this.entries) {
+      if (now - entry.startedAt >= 60_000) {
+        this.entries.delete(source);
+      }
+    }
+    const existing = this.entries.get(networkSource);
+    if (existing) {
+      if (existing.count >= this.maxEventsPerMinute) {
+        return false;
+      }
+      existing.count += 1;
+      return true;
+    }
+    if (this.entries.size >= 10_000) {
+      return false;
+    }
+    this.entries.set(networkSource, { startedAt: now, count: 1 });
+    return true;
+  }
+}
+
+function validateTelemetryMaxEventsPerMinute(value: number | undefined): number {
+  if (value === undefined) {
+    return 60;
+  }
+  if (!Number.isInteger(value) || value < 1 || value > 10_000) {
+    throw new Error("telemetryMaxEventsPerMinute must be an integer between 1 and 10000.");
+  }
+  return value;
+}
+
+function formatByteLimit(value: number): string {
+  return value % 1024 === 0 ? `${value / 1024} KiB` : `${value} bytes`;
 }
 
 function validateIngestMaxFindings(value: number | undefined): number {

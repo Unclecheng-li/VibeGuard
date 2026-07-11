@@ -11,8 +11,10 @@ import {
   LIGHTWEIGHT_PACKAGE_LIMIT,
   configuredPackageSyncLimit,
   selectConfiguredPackageSyncRegistries,
+  shouldUpgradePackageCacheInBackground,
   shouldSyncPackageIndex,
-  syncConfiguredPackageIndexes
+  syncConfiguredPackageIndexes,
+  syncConfiguredPackageIndexesInBackground
 } from "../src/package/configSync";
 import type { ConfiguredPackageSyncProgress } from "../src/package/configSync";
 import type { PackageIndexStore, PackageStorage } from "../src/package/storage";
@@ -110,6 +112,50 @@ test("full configured package sync refreshes partial indexes before they expire"
   assert.equal(result.results[0].limit, undefined);
   assert.equal(await index.coverage("npm"), "full");
   assert.equal(await index.get("npm", "missing-package"), false);
+});
+
+test("background package sync upgrades a successful lightweight index to full coverage", async () => {
+  const now = 1_700_000_000_000;
+  const index = new MemoryPackageIndex(now);
+  const requestedUrls: string[] = [];
+  const tiers: string[] = [];
+
+  const result = await syncConfiguredPackageIndexesInBackground({
+    config: testConfig({ languages: ["npm"], update_interval: "daily", lightweight_mode: true }),
+    storage: createMemoryStorage(index),
+    now,
+    upgradeFull: true,
+    fetchImpl: async (url) => {
+      requestedUrls.push(String(url));
+      if (String(url).includes("/_all_docs")) {
+        return response(JSON.stringify({ total_rows: 1, rows: [{ id: "react" }] }));
+      }
+      return response(JSON.stringify({ update_seq: "1-g" }));
+    },
+    onTierStart: (tier) => tiers.push(tier)
+  });
+
+  assert.deepEqual(tiers, ["lightweight", "full"]);
+  assert.deepEqual(result.tiers.map((entry) => entry.tier), ["lightweight", "full"]);
+  assert.equal(result.tiers[0]?.result.results[0]?.coverage, "partial");
+  assert.equal(result.tiers[1]?.result.results[0]?.coverage, "full");
+  assert.equal(await index.coverage("npm"), "full");
+  assert.equal(requestedUrls.some((url) => /_all_docs\?limit=100000/.test(url)), true);
+  assert.equal(requestedUrls.some((url) => /_all_docs\/?$/.test(url)), true);
+});
+
+test("background full upgrades remain opt-out for lightweight package caches", () => {
+  const enabled = testConfig({ languages: ["npm"], update_interval: "daily", lightweight_mode: true });
+  const disabled = testConfig({
+    languages: ["npm"],
+    update_interval: "daily",
+    lightweight_mode: true,
+    background_full_sync: false
+  });
+
+  assert.equal(shouldUpgradePackageCacheInBackground(enabled), true);
+  assert.equal(shouldUpgradePackageCacheInBackground(disabled), false);
+  assert.equal(shouldUpgradePackageCacheInBackground(testConfig({ languages: ["npm"], update_interval: "daily", lightweight_mode: false })), false);
 });
 
 test("package sync decisions respect intervals, force, and lightweight limits", () => {
@@ -443,10 +489,17 @@ test("prioritizes detected package registries while retaining configured backgro
   assert.deepEqual(selectConfiguredPackageSyncRegistries([], ["npm"]), []);
 });
 
-function testConfig(packageCache: VibeGuardConfig["package_cache"]): VibeGuardConfig {
+function testConfig(
+  packageCache: Omit<VibeGuardConfig["package_cache"], "background_full_sync"> &
+    Partial<Pick<VibeGuardConfig["package_cache"], "background_full_sync">>
+): VibeGuardConfig {
+  const defaults = cloneDefaultConfig();
   return {
-    ...cloneDefaultConfig(),
-    package_cache: packageCache
+    ...defaults,
+    package_cache: {
+      ...defaults.package_cache,
+      ...packageCache
+    }
   };
 }
 

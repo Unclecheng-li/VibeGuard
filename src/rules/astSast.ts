@@ -163,10 +163,7 @@ function analyzeJavaScriptNode(
   ) {
     add("sast_path_traversal_fs_user_input", node);
   }
-  if (
-    /^\s*(?:child_process\.)?exec(?:Sync)?\s*\(/i.test(text) &&
-    (hasJavaScriptUserInput(text, node, bindings) || /\$\{/.test(text))
-  ) {
+  if (isJavaScriptCommandExecution(text) && (hasJavaScriptUserInput(text, node, bindings) || /\$\{/.test(text))) {
     add("sast_command_injection_os_system", node);
   }
   if (/^\s*(?:res|response)\.redirect\s*\(/i.test(text) && hasJavaScriptUserInput(text, node, bindings)) {
@@ -274,6 +271,16 @@ function isPythonSqlExecution(text: string): boolean {
 function isJavaScriptHttpRequest(text: string): boolean {
   return /^\s*(?:fetch|axios(?:\.(?:get|post|put|patch|delete|head|request))?|got(?:\.(?:get|post|put|patch|delete|head))?|undici\.request|(?:http|https)\.(?:get|request))\s*\(/i.test(
     text
+  );
+}
+
+function isJavaScriptCommandExecution(text: string): boolean {
+  if (/^\s*(?:child_process\.)?exec(?:Sync)?\s*\(/i.test(text)) {
+    return true;
+  }
+  return (
+    /^\s*(?:child_process\.)?(?:spawn(?:Sync)?|execFile(?:Sync)?)\s*\(/i.test(text) &&
+    /\bshell\s*:\s*true\b/i.test(text)
   );
 }
 

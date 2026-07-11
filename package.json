@@ -38,6 +38,7 @@
     "onCommand:vibeguard.showLlmStatus",
     "onCommand:vibeguard.showSubscriptionStatus",
     "onCommand:vibeguard.applyFix",
+    "onCommand:vibeguard.applyFindingFix",
     "onCommand:vibeguard.applyAllSafeFixes",
     "onCommand:vibeguard.applyAllProFixes",
     "onView:vibeguardFindings"
@@ -109,6 +110,10 @@
         "title": "VibeGuard: Apply Fix"
       },
       {
+        "command": "vibeguard.applyFindingFix",
+        "title": "VibeGuard: Apply Finding Fix"
+      },
+      {
         "command": "vibeguard.applyAllSafeFixes",
         "title": "VibeGuard: Apply All Safe Fixes in Current File"
       },
@@ -120,23 +125,28 @@
     "menus": {
       "view/item/context": [
         {
+          "command": "vibeguard.applyFindingFix",
+          "when": "view == vibeguardFindings && viewItem == vibeguardFindingFixable",
+          "group": "inline@1"
+        },
+        {
           "command": "vibeguard.ignoreFinding",
-          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "when": "view == vibeguardFindings && (viewItem == vibeguardFinding || viewItem == vibeguardFindingFixable)",
           "group": "inline"
         },
         {
           "command": "vibeguard.ignoreRuleInFile",
-          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "when": "view == vibeguardFindings && (viewItem == vibeguardFinding || viewItem == vibeguardFindingFixable)",
           "group": "navigation"
         },
         {
           "command": "vibeguard.ignoreRuleGlobally",
-          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "when": "view == vibeguardFindings && (viewItem == vibeguardFinding || viewItem == vibeguardFindingFixable)",
           "group": "navigation"
         },
         {
           "command": "vibeguard.ignorePackage",
-          "when": "view == vibeguardFindings && viewItem == vibeguardFinding",
+          "when": "view == vibeguardFindings && (viewItem == vibeguardFinding || viewItem == vibeguardFindingFixable)",
           "group": "navigation"
         }
       ]
@@ -166,8 +176,8 @@
             "remote",
             "off"
           ],
-          "default": "seed",
-          "description": "How VibeGuard verifies package names. Seed mode is instant and offline; remote mode also checks npm, PyPI, Cargo, Go modules, and Maven Central."
+          "default": "remote",
+          "description": "How VSCode verifies package names. Remote mode keeps edit-time diagnostics non-blocking by checking the local seed/index first, then verifies unknown packages against npm, PyPI, Cargo, Go modules, and Maven Central."
         },
         "vibeguard.configPath": {
           "type": "string",
@@ -210,6 +220,11 @@
           "type": "boolean",
           "default": true,
           "description": "Use lightweight partial package-name indexes for faster cold starts."
+        },
+        "vibeguard.packageCacheBackgroundFullSync": {
+          "type": "boolean",
+          "default": true,
+          "description": "After the quick package-name index is ready, continue refreshing a full index in the background. Disable to keep lightweight partial indexes only."
         },
         "vibeguard.enableL2": {
           "type": "boolean",

@@ -1,4 +1,5 @@
 import type {
+  CodeFix,
   DetectionLayer,
   Finding,
   PackageReference,
@@ -200,26 +201,42 @@ async function detectHallucinatedPackages(source: SourceFile, options: ScanOptio
       dismissed: false
     };
 
-    const firstSuggestion = resolution.similarPackages?.[0];
-    if (firstSuggestion && reference.rawSpecifier === reference.packageName) {
-      finding.fix = {
-        description: `Replace with ${firstSuggestion}`,
-        edits: [
-          {
-            startLine: reference.line,
-            startColumn: reference.column,
-            endLine: reference.endLine,
-            endColumn: reference.endColumn,
-            newText: firstSuggestion
-          }
-        ]
-      };
+    if (reference.rawSpecifier === reference.packageName) {
+      const fixes = packageReplacementFixes(reference, resolution.similarPackages ?? []);
+      if (fixes.length > 0) {
+        finding.fix = fixes[0];
+        if (fixes.length > 1) {
+          finding.alternativeFixes = fixes.slice(1);
+        }
+      }
     }
     finding.id = packageFindingId(finding.file, finding.detection_rule, finding.line, finding.column, reference.packageName);
     findings.push(finding);
   }
 
   return findings;
+}
+
+function packageReplacementFixes(reference: PackageReference, candidates: string[]): CodeFix[] {
+  const replacements = [...new Set(candidates.map((candidate) => candidate.trim()))].filter(
+    (candidate) => candidate !== reference.packageName && isSafePackageReplacement(candidate)
+  );
+  return replacements.map((replacement) => ({
+    description: `Replace with ${replacement}`,
+    edits: [
+      {
+        startLine: reference.line,
+        startColumn: reference.column,
+        endLine: reference.endLine,
+        endColumn: reference.endColumn,
+        newText: replacement
+      }
+    ]
+  }));
+}
+
+function isSafePackageReplacement(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && /^[A-Za-z0-9@._/+:-]+$/.test(value);
 }
 
 function createUnverifiedPackageFinding(

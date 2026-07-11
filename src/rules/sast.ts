@@ -131,7 +131,7 @@ const sastRules: SastRule[] = [
   {
     id: "sast_command_injection_os_system",
     type: "command_injection",
-    regex: /\b(?:os\.system|subprocess\.(?:call|run|Popen|check_call|check_output)|child_process\.exec(?:Sync)?)\s*\([^)\n]*(?:request|req\.|input|body|params|\$\{)|\b(?:Runtime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec|new\s+ProcessBuilder)\s*\([^)\n]*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(/gi,
+    regex: /\b(?:os\.system|subprocess\.(?:call|run|Popen|check_call|check_output)|child_process\.exec(?:Sync)?)\s*\([^)\n]*(?:request|req\.|input|body|params|\$\{)|\b(?:child_process\.)?(?:spawn(?:Sync)?|execFile(?:Sync)?)\s*\((?=[^)\n]*\bshell\s*:\s*true)[^)\n]*(?:request|req\.|input|body|params|\$\{)|\b(?:Runtime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec|new\s+ProcessBuilder)\s*\([^)\n]*request\s*\.\s*(?:getParameter|getHeader|getQueryString)\s*\(/gi,
     severity: "high",
     message: "Command execution appears to include user-controlled input.",
     suggestion: "Use argument arrays, strict allowlists, and avoid shell=True or string commands."

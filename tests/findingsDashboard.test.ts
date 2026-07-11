@@ -76,6 +76,20 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
         falsePositiveRate: 1 / 3
       }
     ],
+    anonymousFalsePositiveTelemetry: [
+      {
+        ruleFingerprint: "c21925edc1cf5c90d55fe58d",
+        matchedRule: "insecure_config_debug_true",
+        eventCount: 7,
+        sources: ["cli", "vscode"],
+        scopes: ["file", "global"],
+        findingType: "insecure_config",
+        detectionLayer: "L1",
+        severity: "medium",
+        firstReceivedAt: Date.UTC(2026, 0, 1),
+        lastReceivedAt: Date.UTC(2026, 0, 2)
+      }
+    ],
     trend: [
       { date: "2026-01-01", scanCount: 1, findingCount: 1, activeCount: 1, dismissedCount: 0 },
       { date: "2026-01-02", scanCount: 1, findingCount: 3, activeCount: 2, dismissedCount: 1 }
@@ -95,6 +109,9 @@ test("formats a standalone findings dashboard with embedded summary data", () =>
   assert.match(html, /Persistent/);
   assert.match(html, /Top Detection Rules/);
   assert.match(html, /Rule Feedback/);
+  assert.match(html, /Anonymous Feedback Signals/);
+  assert.match(html, /c21925edc1cf5c90d55fe58d/);
+  assert.match(html, /insecure_config_debug_true/);
   assert.match(html, /FP Rate/);
   assert.match(html, /Dismissal Reasons/);
   assert.match(html, /Developer Risk/);

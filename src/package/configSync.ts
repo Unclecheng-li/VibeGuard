@@ -72,6 +72,26 @@ export interface ConfiguredPackageSyncResult {
   results: ConfiguredPackageSyncOutcome[];
 }
 
+export type PackageCacheSyncTier = "lightweight" | "full";
+
+export interface BackgroundPackageCacheSyncOptions extends Omit<ConfiguredPackageSyncOptions, "onProgress"> {
+  /** Run a complete index refresh after the responsive lightweight tier has made package checks available. */
+  upgradeFull?: boolean;
+  onTierStart?: (tier: PackageCacheSyncTier) => void;
+  onProgress?: (tier: PackageCacheSyncTier, progress: ConfiguredPackageSyncProgress) => void;
+  onTierComplete?: (
+    tier: PackageCacheSyncTier,
+    result: ConfiguredPackageSyncResult
+  ) => void | Promise<void>;
+}
+
+export interface BackgroundPackageCacheSyncResult {
+  tiers: Array<{
+    tier: PackageCacheSyncTier;
+    result: ConfiguredPackageSyncResult;
+  }>;
+}
+
 export async function syncConfiguredPackageIndexes(
   options: ConfiguredPackageSyncOptions
 ): Promise<ConfiguredPackageSyncResult> {
@@ -242,6 +262,43 @@ export async function syncConfiguredPackageIndexes(
   };
 }
 
+export async function syncConfiguredPackageIndexesInBackground(
+  options: BackgroundPackageCacheSyncOptions
+): Promise<BackgroundPackageCacheSyncResult> {
+  const initialTier: PackageCacheSyncTier = options.config.package_cache.lightweight_mode ? "lightweight" : "full";
+  const tiers: BackgroundPackageCacheSyncResult["tiers"] = [];
+  const initial = await syncPackageCacheTier(options, initialTier, options.config);
+  tiers.push({ tier: initialTier, result: initial });
+
+  const canUpgrade =
+    options.upgradeFull === true &&
+    !options.force &&
+    shouldUpgradePackageCacheInBackground(options.config) &&
+    initial.results.some((entry) => entry.status !== "failed");
+  if (canUpgrade) {
+    const full = await syncPackageCacheTier(options, "full", withFullPackageCacheCoverage(options.config));
+    tiers.push({ tier: "full", result: full });
+  }
+
+  return { tiers };
+}
+
+async function syncPackageCacheTier(
+  options: BackgroundPackageCacheSyncOptions,
+  tier: PackageCacheSyncTier,
+  config: VibeGuardConfig
+): Promise<ConfiguredPackageSyncResult> {
+  options.onTierStart?.(tier);
+  const result = await syncConfiguredPackageIndexes({
+    ...options,
+    config,
+    force: tier === "full" ? false : options.force,
+    onProgress: (progress) => options.onProgress?.(tier, progress)
+  });
+  await options.onTierComplete?.(tier, result);
+  return result;
+}
+
 export function shouldSyncPackageIndex(
   entry: PackageIndexEntry | undefined,
   config: VibeGuardConfig,
@@ -292,6 +349,24 @@ export function selectConfiguredPackageSyncRegistries(
   const detected = uniqueRegistries(detectedRegistries);
   const detectedConfigured = detected.filter((registry) => configured.includes(registry));
   return [...detectedConfigured, ...configured.filter((registry) => !detectedConfigured.includes(registry))];
+}
+
+export function shouldUpgradePackageCacheInBackground(config: VibeGuardConfig): boolean {
+  return config.package_cache.lightweight_mode && config.package_cache.background_full_sync;
+}
+
+export function withFullPackageCacheCoverage(config: VibeGuardConfig): VibeGuardConfig {
+  return {
+    ...config,
+    detection_layers: { ...config.detection_layers },
+    custom_rules: [...config.custom_rules],
+    ignored_findings: [...config.ignored_findings],
+    package_cache: {
+      ...config.package_cache,
+      languages: [...config.package_cache.languages],
+      lightweight_mode: false
+    }
+  };
 }
 
 function uniqueRegistries(registries: PackageRegistry[]): PackageRegistry[] {

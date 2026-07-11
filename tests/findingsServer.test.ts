@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { startFindingsDashboardServer } from "../src/findings/server";
 import { isFindingsStorageAvailable, SqliteFindingStore } from "../src/findings/storage";
+import { cliFalsePositiveTelemetryEvent } from "../src/telemetry";
 import type { Finding } from "../src/types";
 
 test("rejects an unsafe OIDC public URL before opening dashboard storage", async () => {
@@ -96,6 +97,90 @@ test("serves team dashboard HTML and token-protected summaries", async (context)
 
     const health = await fetch(new URL("healthz", dashboard.url));
     assert.equal(health.status, 200);
+  } finally {
+    await dashboard.close();
+  }
+});
+
+test("collects only bounded anonymous false-positive telemetry when explicitly enabled", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-telemetry-server-"));
+  const dbPath = path.join(directory, "findings.db");
+  const disabled = await startFindingsDashboardServer({ dbPath, port: 0, token: "team-secret" });
+  try {
+    const unavailable = await fetch(new URL("api/telemetry/false-positive", disabled.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(cliFalsePositiveTelemetryEvent("rule", "cli", "global"))
+    });
+    assert.equal(unavailable.status, 404);
+  } finally {
+    await disabled.close();
+  }
+
+  const dashboard = await startFindingsDashboardServer({
+    dbPath,
+    port: 0,
+    token: "team-secret",
+    telemetryCollection: true,
+    telemetryMaxEventsPerMinute: 3
+  });
+  const event = cliFalsePositiveTelemetryEvent("internal_rule_name", "cli", "global");
+  try {
+    const invalid = await fetch(new URL("api/telemetry/false-positive", dashboard.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...event, path: "/private/app.ts" })
+    });
+    assert.equal(invalid.status, 400);
+
+    const oversized = await fetch(new URL("api/telemetry/false-positive", dashboard.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ padding: "x".repeat(2048) })
+    });
+    assert.equal(oversized.status, 413);
+
+    const accepted = await fetch(new URL("api/telemetry/false-positive", dashboard.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(event)
+    });
+    assert.equal(accepted.status, 202);
+    assert.deepEqual(await accepted.json(), { accepted: true });
+
+    const limited = await fetch(new URL("api/telemetry/false-positive", dashboard.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(event)
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get("retry-after"), "60");
+
+    const summary = await fetch(new URL("api/summary", dashboard.url), {
+      headers: { authorization: "Bearer team-secret" }
+    });
+    assert.equal(summary.status, 200);
+    const feedback = (await summary.json() as {
+      anonymousFalsePositiveTelemetry?: Array<{
+        ruleFingerprint: string;
+        eventCount: number;
+        sources: string[];
+        scopes: string[];
+        firstReceivedAt: number;
+        lastReceivedAt: number;
+      }>;
+    }).anonymousFalsePositiveTelemetry;
+    assert.equal(feedback?.length, 1);
+    assert.equal(feedback?.[0]?.ruleFingerprint, event.ruleFingerprint);
+    assert.equal(feedback?.[0]?.eventCount, 1);
+    assert.deepEqual(feedback?.[0]?.sources, ["cli"]);
+    assert.deepEqual(feedback?.[0]?.scopes, ["global"]);
+    assert.ok((feedback?.[0]?.lastReceivedAt ?? 0) >= (feedback?.[0]?.firstReceivedAt ?? 0));
+    assert.equal(JSON.stringify(feedback).includes("internal_rule_name"), false);
   } finally {
     await dashboard.close();
   }

@@ -4,6 +4,7 @@ import {
   cliFalsePositiveTelemetryEvent,
   falsePositiveTelemetryEvent,
   isFalsePositiveDismissalReason,
+  parseFalsePositiveTelemetryEvent,
   reportFalsePositiveTelemetry
 } from "../src/telemetry";
 import type { Finding } from "../src/types";
@@ -32,6 +33,16 @@ test("recognizes only standardized false-positive dismissal reasons", () => {
   assert.equal(isFalsePositiveDismissalReason("false_positive: reviewed"), true);
   assert.equal(isFalsePositiveDismissalReason("Not an issue"), false);
   assert.equal(isFalsePositiveDismissalReason("False positive-ish"), false);
+});
+
+test("accepts only the privacy-minimized telemetry collector schema", () => {
+  const event = cliFalsePositiveTelemetryEvent("rule", "cli", "global");
+  assert.deepEqual(parseFalsePositiveTelemetryEvent(event), event);
+  assert.throws(
+    () => parseFalsePositiveTelemetryEvent({ ...event, file: "/private/workspace/app.ts" }),
+    /unsupported fields/
+  );
+  assert.throws(() => parseFalsePositiveTelemetryEvent({ ...event, ruleFingerprint: "not-a-fingerprint" }), /fingerprint/);
 });
 
 test("does not make a request when telemetry is disabled", async () => {

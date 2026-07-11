@@ -10,7 +10,9 @@ import {
   updateLlmApiKeyStored,
   type LoadedVibeGuardConfig
 } from "./config";
+import { criticalAlertMessage } from "./criticalAlert";
 import { loadCustomRules } from "./customRules";
+import { redactedSecretFixStillMatchesSource } from "./fixValidation";
 import { formatFindingsDashboard } from "./findings/dashboard";
 import { defaultFindingsDbPath, SqliteFindingStore, type FindingAuthor } from "./findings/storage";
 import { gitAuthorsForFiles, normalizeAuthorFilePath } from "./gitAuthors";
@@ -27,16 +29,17 @@ import { falsePositiveTelemetryEvent, isFalsePositiveDismissalReason, reportFals
 import { PackageVerifier } from "./package/packageVerifier";
 import {
   selectConfiguredPackageSyncRegistries,
-  syncConfiguredPackageIndexes,
+  syncConfiguredPackageIndexesInBackground,
   type ConfiguredPackageSyncProgress,
-  type ConfiguredPackageSyncResult
+  type ConfiguredPackageSyncResult,
+  type PackageCacheSyncTier
 } from "./package/configSync";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { mergeFindingsForExecutedLayers, type ExecutedLayers } from "./layers";
 import { createPackageStorage, type PackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
 import { getProSubscriptionStatus } from "./subscription";
-import type { Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConfig } from "./types";
+import type { CodeFix, Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConfig } from "./types";
 
 const packageRegistries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
 const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local", "vibeguard"];
@@ -72,6 +75,7 @@ let packageStorage: PackageStorage;
 let findingStore: SqliteFindingStore | undefined;
 let packageSyncInFlight = false;
 let packageSyncProgress: ConfiguredPackageSyncProgress | undefined;
+let packageSyncTier: PackageCacheSyncTier | undefined;
 let extensionContext: vscode.ExtensionContext;
 const l1Timers = new Map<string, NodeJS.Timeout>();
 const l2Timers = new Map<string, NodeJS.Timeout>();
@@ -152,6 +156,9 @@ export function activate(context: vscode.ExtensionContext): void {
       ignorePackage(resolveFindingArgument(nodeOrFinding))
     ),
     vscode.commands.registerCommand("vibeguard.applyFix", (finding: Finding) => applyFindingFix(finding)),
+    vscode.commands.registerCommand("vibeguard.applyFindingFix", (nodeOrFinding: TreeNode | Finding) =>
+      applyFindingFixFromSidebar(resolveFindingArgument(nodeOrFinding))
+    ),
     vscode.commands.registerCommand("vibeguard.applyAllSafeFixes", () => applyAllSafeFixes()),
     vscode.commands.registerCommand("vibeguard.applyAllProFixes", () => applyAllProFixes()),
     vscode.languages.registerCodeActionsProvider(codeActionSelector, new VibeGuardCodeActionProvider(), {
@@ -760,10 +767,18 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
   }
   popupSeen.add(critical.id);
   const replace = critical.detection_layer === "L3" ? undefined : critical.fix?.description;
-  const actions = replace ? [replace, "Ignore", "Learn More", "Manage Ignore Rules"] : ["Ignore", "Learn More", "Manage Ignore Rules"];
-  void vscode.window.showWarningMessage(`VibeGuard: ${critical.message}`, ...actions).then(async (choice) => {
+  const chooseReplacement =
+    critical.type === "hallucinated_package" && allEditorFixesForFinding(critical).length > 1
+      ? "Choose replacement"
+      : undefined;
+  const actions = [replace, chooseReplacement, "Ignore", "Learn More", "Manage Ignore Rules"].filter(
+    (action): action is string => action !== undefined
+  );
+  void vscode.window.showWarningMessage(criticalAlertMessage(critical), ...actions).then(async (choice) => {
     if (choice === replace && critical.fix) {
       await applyFindingFix(critical);
+    } else if (choice === chooseReplacement) {
+      await pickPackageReplacement(critical);
     } else if (choice === "Ignore") {
       await ignoreFinding(critical, "line");
       await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
@@ -779,6 +794,50 @@ async function applyFindingFix(finding: Finding | undefined): Promise<void> {
   if (!finding?.fix) {
     return;
   }
+  await applyFindingCodeFix(finding, finding.fix);
+}
+
+async function applyFindingFixFromSidebar(finding: Finding | undefined): Promise<void> {
+  if (!finding?.fix || finding.dismissed) {
+    return;
+  }
+  if (finding.type === "hallucinated_package" && allEditorFixesForFinding(finding).length > 1) {
+    await pickPackageReplacement(finding);
+    return;
+  }
+  await applyFindingFix(finding);
+}
+
+async function pickPackageReplacement(finding: Finding): Promise<void> {
+  const fixes = allEditorFixesForFinding(finding);
+  if (fixes.length < 2) {
+    await applyFindingFix(finding);
+    return;
+  }
+  const selected = await vscode.window.showQuickPick(
+    fixes.map((fix, index) => ({
+      label: fix.description,
+      detail: `Replace with: ${truncateInline(fix.edits[0]?.newText ?? "", 180)}`,
+      picked: index === 0,
+      fix
+    })),
+    {
+      title: "Choose VibeGuard package replacement",
+      placeHolder: "Select a verified package replacement"
+    }
+  );
+  if (selected) {
+    await applyFindingCodeFix(finding, selected.fix);
+  }
+}
+
+async function applyFindingCodeFix(finding: Finding, fix: CodeFix): Promise<void> {
+  const uri = vscode.Uri.file(finding.file);
+  const document = await vscode.workspace.openTextDocument(uri);
+  if (!findingFixStillMatchesDocument(document, finding, fix)) {
+    void vscode.window.showWarningMessage("VibeGuard did not apply this fix because the code changed after it was scanned.");
+    return;
+  }
   if (finding.detection_layer === "L3") {
     const choice = await vscode.window.showWarningMessage(
       "VibeGuard received this replacement from an LLM. Review the change before applying it.",
@@ -788,10 +847,13 @@ async function applyFindingFix(finding: Finding | undefined): Promise<void> {
       return;
     }
   }
-  const uri = vscode.Uri.file(finding.file);
-  await vscode.workspace.applyEdit(workspaceEditForFix(uri, finding));
-  const document = await vscode.workspace.openTextDocument(uri);
-  await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+  const applied = await vscode.workspace.applyEdit(workspaceEditForEdits(uri, fix.edits));
+  if (!applied) {
+    void vscode.window.showErrorMessage("VibeGuard could not apply this fix.");
+    return;
+  }
+  const updatedDocument = await vscode.workspace.openTextDocument(uri);
+  await scanDocument(updatedDocument, { includeL2: true, includeL3: true, replaceAll: true });
 }
 
 async function applyAllSafeFixes(): Promise<void> {
@@ -926,10 +988,11 @@ function updatePackageSyncStatus(): void {
   const total = progress?.total ?? 0;
   const percent = total === 0 ? 0 : Math.round((completed / total) * 100);
   const registry = progress?.registry ? ` (${progress.registry})` : "";
-  statusBar.text = `$(sync~spin) VibeGuard: package sync ${percent}%`;
+  const tier = packageSyncTier === "full" ? "Tier 2 full index" : "Tier 1 quick index";
+  statusBar.text = `$(sync~spin) VibeGuard: package sync ${percent}% (${tier})`;
   statusBar.tooltip = total === 0
-    ? "VibeGuard package name cache is preparing to sync"
-    : `VibeGuard package name cache: ${completed}/${total} registries complete${registry}`;
+    ? `VibeGuard package name cache is preparing ${tier}`
+    : `VibeGuard package name cache (${tier}): ${completed}/${total} registries complete${registry}`;
 }
 
 function allCurrentFindings(): Finding[] {
@@ -1029,8 +1092,21 @@ function findMatchingFinding(document: vscode.TextDocument, diagnostic: vscode.D
   });
 }
 
-function workspaceEditForFix(uri: vscode.Uri, finding: Finding): vscode.WorkspaceEdit {
-  return workspaceEditForFindings(uri, [finding]);
+function workspaceEditForEdits(uri: vscode.Uri, textEdits: CodeFix["edits"]): vscode.WorkspaceEdit {
+  const edit = new vscode.WorkspaceEdit();
+  for (const textEdit of textEdits) {
+    edit.replace(
+      uri,
+      new vscode.Range(
+        textEdit.startLine - 1,
+        textEdit.startColumn - 1,
+        textEdit.endLine - 1,
+        textEdit.endColumn - 1
+      ),
+      textEdit.newText
+    );
+  }
+  return edit;
 }
 
 function workspaceEditForFindings(uri: vscode.Uri, findings: Finding[]): vscode.WorkspaceEdit {
@@ -1060,6 +1136,20 @@ function l3FixStillMatchesDocument(document: vscode.TextDocument, finding: Findi
   try {
     const range = new vscode.Range(edit.startLine - 1, edit.startColumn - 1, edit.endLine - 1, edit.endColumn - 1);
     return document.getText(range) === finding.evidence;
+  } catch {
+    return false;
+  }
+}
+
+function findingFixStillMatchesDocument(document: vscode.TextDocument, finding: Finding, fix: CodeFix): boolean {
+  if (finding.type === "hardcoded_secret") {
+    return redactedSecretFixStillMatchesSource(finding, fix, document.getText());
+  }
+  if (finding.detection_layer === "L3") {
+    return finding.fix === fix && l3FixStillMatchesDocument(document, finding);
+  }
+  try {
+    return document.getText(findingRange(finding)) === finding.evidence;
   } catch {
     return false;
   }
@@ -1199,6 +1289,7 @@ async function syncPackageCache(manual: boolean): Promise<void> {
 
   packageSyncInFlight = true;
   packageSyncProgress = undefined;
+  packageSyncTier = undefined;
   updatePackageSyncStatus();
   try {
     const loadedConfig = await loadConfiguredVibeGuardConfigForWorkspace();
@@ -1209,25 +1300,35 @@ async function syncPackageCache(manual: boolean): Promise<void> {
       detectedRegistries
     );
     const syncConfig = withPackageCacheLanguages(configured, selectedRegistries);
-    const result = await syncConfiguredPackageIndexes({
+    const staged = await syncConfiguredPackageIndexesInBackground({
       config: syncConfig,
       storage: packageStorage,
       force: manual,
+      upgradeFull: !manual,
       continueOnError: true,
-      onProgress: (progress) => {
+      onTierStart: (tier) => {
+        packageSyncTier = tier;
+        packageSyncProgress = undefined;
+        updatePackageSyncStatus();
+      },
+      onProgress: (_tier, progress) => {
         packageSyncProgress = progress;
         updatePackageSyncStatus();
+      },
+      onTierComplete: async (tier, result) => {
+        output.appendLine(`Package cache ${tier === "full" ? "Tier 2 full" : "Tier 1 quick"} sync completed.`);
+        logPackageSyncResult(result, loadedConfig.path, loadedConfig.exists, detectedRegistries);
+        if (result.results.some((entry) => entry.status === "synced")) {
+          await refreshOpenDocuments();
+        }
       }
     });
 
-    logPackageSyncResult(result, loadedConfig.path, loadedConfig.exists, detectedRegistries);
-    const syncedCount = result.results.filter((entry) => entry.status === "synced").length;
-    const failedCount = result.results.filter((entry) => entry.status === "failed").length;
-    if (syncedCount > 0) {
-      await refreshOpenDocuments();
-    }
+    const outcomes = staged.tiers.flatMap((entry) => entry.result.results);
+    const syncedCount = outcomes.filter((entry) => entry.status === "synced").length;
+    const failedCount = outcomes.filter((entry) => entry.status === "failed").length;
     if (manual) {
-      const skippedCount = result.results.filter((entry) => entry.status === "skipped").length;
+      const skippedCount = outcomes.filter((entry) => entry.status === "skipped").length;
       void vscode.window.showInformationMessage(
         `VibeGuard package cache sync finished: ${syncedCount} synced, ${skippedCount} skipped, ${failedCount} failed.`
       );
@@ -1245,6 +1346,7 @@ async function syncPackageCache(manual: boolean): Promise<void> {
   } finally {
     packageSyncInFlight = false;
     packageSyncProgress = undefined;
+    packageSyncTier = undefined;
     updateStatus();
   }
 }
@@ -1477,7 +1579,11 @@ function applyPackageCacheSettings(config: VibeGuardConfig): VibeGuardConfig {
     package_cache: {
       languages,
       update_interval: configuredPackageCacheUpdateInterval(config.package_cache.update_interval),
-      lightweight_mode: configuredSettingOr("packageCacheLightweightMode", config.package_cache.lightweight_mode)
+      lightweight_mode: configuredSettingOr("packageCacheLightweightMode", config.package_cache.lightweight_mode),
+      background_full_sync: configuredSettingOr(
+        "packageCacheBackgroundFullSync",
+        config.package_cache.background_full_sync
+      )
     }
   };
 }
@@ -1643,7 +1749,7 @@ class FindingsProvider implements vscode.TreeDataProvider<TreeNode> {
       title: "Open Finding",
       arguments: [element.finding]
     };
-    item.contextValue = "vibeguardFinding";
+    item.contextValue = element.finding.fix && !element.finding.dismissed ? "vibeguardFindingFixable" : "vibeguardFinding";
     item.iconPath = element.finding.dismissed ? new vscode.ThemeIcon("pass") : severityIcon(element.finding.severity);
     return item;
   }
@@ -1709,10 +1815,10 @@ class VibeGuardCodeActionProvider implements vscode.CodeActionProvider {
         continue;
       }
 
-      if (finding.fix) {
-        const action = new vscode.CodeAction(`Apply VibeGuard fix: ${finding.fix.description}`, vscode.CodeActionKind.QuickFix);
+      for (const [index, fix] of allEditorFixesForFinding(finding).entries()) {
+        const action = new vscode.CodeAction(`Apply VibeGuard fix: ${fix.description}`, vscode.CodeActionKind.QuickFix);
         action.diagnostics = [diagnostic];
-        action.isPreferred = finding.detection_layer !== "L3";
+        action.isPreferred = index === 0 && finding.detection_layer !== "L3";
         if (finding.detection_layer === "L3") {
           action.command = {
             command: "vibeguard.applyFix",
@@ -1720,7 +1826,7 @@ class VibeGuardCodeActionProvider implements vscode.CodeActionProvider {
             arguments: [finding]
           };
         } else {
-          action.edit = workspaceEditForFix(document.uri, finding);
+          action.edit = workspaceEditForEdits(document.uri, fix.edits);
         }
         actions.push(action);
       }
@@ -1734,6 +1840,14 @@ class VibeGuardCodeActionProvider implements vscode.CodeActionProvider {
     }
     return actions;
   }
+}
+
+function allEditorFixesForFinding(finding: Finding): CodeFix[] {
+  if (!finding.fix) {
+    return [];
+  }
+  // L3 replacements need explicit confirmation and therefore never receive alternatives here.
+  return finding.detection_layer === "L3" ? [finding.fix] : [finding.fix, ...(finding.alternativeFixes ?? [])];
 }
 
 function commandAction(title: string, command: string, finding: Finding, diagnostic: vscode.Diagnostic): vscode.CodeAction {

@@ -18,6 +18,8 @@ RUN apt-get update \
 
 WORKDIR /workspace
 COPY --from=build /opt/vibeguard/dist /opt/vibeguard/dist
+COPY scripts/docker-entrypoint.sh /usr/local/bin/vibeguard-entrypoint
+RUN chmod 755 /usr/local/bin/vibeguard-entrypoint
 
-ENTRYPOINT ["node", "/opt/vibeguard/dist/cli.js"]
+ENTRYPOINT ["/usr/local/bin/vibeguard-entrypoint"]
 CMD ["scan", ".", "--package-verification", "seed", "--fail-on", "critical"]

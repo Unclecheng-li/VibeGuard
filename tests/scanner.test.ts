@@ -778,6 +778,41 @@ test("detects unsafe config and common AI password patterns", async () => {
   assert.equal(result.findings.some((finding) => finding.detection_rule === "ai_pattern_default_password"), true);
 });
 
+test("offers each verified similar package as a safe hallucinated-package replacement", async () => {
+  const result = await scanSourceFile(
+    {
+      filePath: "app.ts",
+      languageId: "typescript",
+      text: 'import Widget from "invented-ui-widget";'
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1,
+      packageVerifier: {
+        async verify(reference) {
+          return {
+            registry: reference.registry,
+            packageName: reference.packageName,
+            exists: false,
+            source: "index",
+            lastVerified: 1,
+            similarPackages: ["react-window", "react-virtualized", "react-window", "not a package"]
+          };
+        }
+      }
+    }
+  );
+  const finding = result.findings.find((item) => item.detection_rule === "hallucinated_package_npm");
+
+  assert.equal(finding?.fix?.description, "Replace with react-window");
+  assert.deepEqual(finding?.fix?.edits[0]?.newText, "react-window");
+  assert.deepEqual(
+    finding?.alternativeFixes?.map((fix) => [fix.description, fix.edits[0]?.newText]),
+    [["Replace with react-virtualized", "react-virtualized"]]
+  );
+});
+
 test("detects expanded JavaScript AI security anti-patterns", async () => {
   const result = await scanSourceFile(
     {
@@ -1238,6 +1273,43 @@ subprocess.check_call(command, shell=True)
   const rule = "sast_command_injection_os_system";
   assert.equal(unsafeJavaScript.findings.some((finding) => finding.detection_rule === rule), true);
   assert.equal(unsafePython.findings.filter((finding) => finding.detection_rule === rule).length, 2);
+  assert.equal(safe.findings.some((finding) => finding.detection_rule === rule), false);
+});
+
+test("detects user-controlled Node spawn and execFile calls only in shell mode", async () => {
+  const [unsafe, safe] = await Promise.all([
+    scanSourceFile(
+      {
+        filePath: "deploy.ts",
+        languageId: "typescript",
+        text: `
+function deploy(req: Request) {
+  const target = req.query.target;
+  child_process.spawn("deploy", ["--target", target], { shell: true });
+  child_process.spawnSync(req.body.command, [], { shell: true });
+  child_process.execFile("deploy", ["--target", target], { shell: true });
+  child_process.execFileSync(req.body.command, [], { shell: true });
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    ),
+    scanSourceFile(
+      {
+        filePath: "safe-deploy.ts",
+        languageId: "typescript",
+        text: `
+function deploy(req: Request) {
+  const target = req.query.target;
+  child_process.spawn("deploy", ["--target", target]);
+  child_process.execFile("deploy", ["--target", target]);
+}`
+      },
+      { packageVerification: "off", includeSast: true, now: 1 }
+    )
+  ]);
+
+  const rule = "sast_command_injection_os_system";
+  assert.equal(unsafe.findings.filter((finding) => finding.detection_rule === rule).length, 4);
   assert.equal(safe.findings.some((finding) => finding.detection_rule === rule), false);
 });
 

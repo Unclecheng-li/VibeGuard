@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SqliteFindingStore, isFindingsStorageAvailable } from "../src/findings/storage";
+import { cliFalsePositiveTelemetryEvent } from "../src/telemetry";
 import type { Finding } from "../src/types";
 
 test("stores scan runs and findings in SQLite", async (context) => {
@@ -205,6 +206,71 @@ test("summarizes findings history for trend dashboards", async (context) => {
   store.close();
 });
 
+test("aggregates opt-in anonymous false-positive telemetry by UTC day without raw finding data", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-anonymous-telemetry-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const timestamp = Date.UTC(2026, 0, 3, 12);
+  const global = cliFalsePositiveTelemetryEvent("internal_rule_name", "cli", "global");
+  const file = cliFalsePositiveTelemetryEvent("internal_rule_name", "cli", "file");
+
+  store.recordAnonymousFalsePositiveTelemetry(global, timestamp);
+  store.recordAnonymousFalsePositiveTelemetry(global, timestamp + 1);
+  store.recordAnonymousFalsePositiveTelemetry(file, timestamp + 2);
+
+  const feedback = store.summary({ since: timestamp - 1 }).anonymousFalsePositiveTelemetry;
+  assert.deepEqual(feedback, [
+    {
+      ruleFingerprint: global.ruleFingerprint,
+      eventCount: 3,
+      sources: ["cli"],
+      scopes: ["file", "global"],
+      firstReceivedAt: timestamp,
+      lastReceivedAt: timestamp + 2
+    }
+  ]);
+  assert.equal(JSON.stringify(feedback).includes("internal_rule_name"), false);
+  assert.deepEqual(store.summary({ project: "acme/payments-api" }).anonymousFalsePositiveTelemetry, []);
+
+  const pruned = store.pruneBefore(timestamp + 10);
+  assert.equal(pruned.deletedTelemetryBuckets, 2);
+  assert.deepEqual(store.summary().anonymousFalsePositiveTelemetry, []);
+  store.close();
+});
+
+test("matches anonymous feedback fingerprints to rules only when the local scan history knows the rule", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-anonymous-telemetry-rule-match-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const timestamp = Date.UTC(2026, 0, 4, 12);
+  const rule = "custom.company_no_example";
+  const event = cliFalsePositiveTelemetryEvent(rule, "cli", "global");
+  store.recordScanRun({
+    scanId: "known-rule",
+    startedAt: timestamp - 10,
+    completedAt: timestamp - 1,
+    cwd: tempDir,
+    targetPaths: ["app.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "known-rule-finding", detection_rule: rule })]
+  });
+  store.recordAnonymousFalsePositiveTelemetry(event, timestamp);
+
+  const feedback = store.summary().anonymousFalsePositiveTelemetry;
+  assert.equal(JSON.stringify(event).includes(rule), false);
+  assert.equal(feedback?.[0]?.ruleFingerprint, event.ruleFingerprint);
+  assert.equal(feedback?.[0]?.matchedRule, rule);
+  store.close();
+});
+
 test("prunes stored scans and findings before a cutoff", async (context) => {
   if (!isFindingsStorageAvailable()) {
     context.skip("node:sqlite is not available in this runtime");
@@ -240,6 +306,73 @@ test("prunes stored scans and findings before a cutoff", async (context) => {
   assert.equal(result.deletedFindings, 1);
   assert.deepEqual(findings.map((item) => item.id), ["new_finding"]);
   assert.equal(stats.scanCount, 1);
+  store.close();
+});
+
+test("compacts oldest scan history when the findings database exceeds its storage budget", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-cap-"));
+  const maxDatabaseBytes = 1_200_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+  const evidence = "x".repeat(600_000);
+  store.recordScanRun({
+    scanId: "old",
+    startedAt: 1,
+    completedAt: 10,
+    cwd: tempDir,
+    targetPaths: ["old.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "old_finding", evidence })]
+  });
+  store.recordScanRun({
+    scanId: "current",
+    startedAt: 90,
+    completedAt: 100,
+    cwd: tempDir,
+    targetPaths: ["current.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "current_finding", evidence })]
+  });
+
+  const stats = store.stats();
+  assert.equal(stats.maxDatabaseBytes, maxDatabaseBytes);
+  assert.ok((stats.databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
+  assert.deepEqual(store.listScanRuns().map((run) => run.scanId), ["current"]);
+  assert.deepEqual(store.listFindings({ includeDismissed: true }).map((item) => item.id), ["current_finding"]);
+  store.close();
+});
+
+test("rejects a single scan that cannot fit within the findings storage budget", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-cap-single-"));
+  const maxDatabaseBytes = 1_200_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+
+  assert.throws(
+    () =>
+      store.recordScanRun({
+        scanId: "oversized",
+        startedAt: 1,
+        completedAt: 10,
+        cwd: tempDir,
+        targetPaths: ["oversized.ts"],
+        fileCount: 1,
+        findings: [finding({ id: "oversized_finding", evidence: "x".repeat(1_500_000) })]
+      }),
+    /could not be persisted within the 1200000-byte findings storage budget/
+  );
+
+  const stats = store.stats();
+  assert.equal(stats.scanCount, 0);
+  assert.ok((stats.databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
   store.close();
 });
 

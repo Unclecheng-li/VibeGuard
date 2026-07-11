@@ -12,6 +12,9 @@ test("VSCode extension exposes first-run cold-start onboarding", async () => {
   assert.match(source, /Sync Now/);
   assert.match(source, /VibeGuard: package sync \$\{percent\}%/);
   assert.match(source, /packageSyncProgress/);
+  assert.match(source, /packageSyncTier/);
+  assert.match(source, /Tier 2 full index/);
+  assert.match(source, /syncConfiguredPackageIndexesInBackground/);
   assert.match(source, /workbench\.action\.openSettings/);
 });
 
@@ -21,6 +24,45 @@ test("VSCode routes L3 fixes through a confirmation command", async () => {
   assert.match(source, /finding\.detection_layer === "L3"/);
   assert.match(source, /VibeGuard received this replacement from an LLM/);
   assert.match(source, /command: "vibeguard\.applyFix"/);
+});
+
+test("VSCode offers all verified package replacement candidates as quick fixes", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /allEditorFixesForFinding/);
+  assert.match(source, /finding\.alternativeFixes/);
+  assert.match(source, /workspaceEditForEdits\(document\.uri, fix\.edits\)/);
+  assert.match(source, /index === 0 && finding\.detection_layer !== "L3"/);
+});
+
+test("VSCode critical package alerts let users choose a verified replacement", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /critical\.type === "hallucinated_package"/);
+  assert.match(source, /Choose replacement/);
+  assert.match(source, /pickPackageReplacement\(critical\)/);
+  assert.match(source, /Choose VibeGuard package replacement/);
+  assert.match(source, /applyFindingCodeFix\(finding, selected\.fix\)/);
+});
+
+test("VSCode findings sidebar exposes safe fixes without bypassing package or L3 review", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /registerCommand\("vibeguard\.applyFindingFix"/);
+  assert.match(source, /applyFindingFixFromSidebar/);
+  assert.match(source, /finding\.type === "hallucinated_package"/);
+  assert.match(source, /await pickPackageReplacement\(finding\)/);
+  assert.match(source, /vibeguardFindingFixable/);
+});
+
+test("VSCode rechecks finding evidence before a single fix edits a document", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /findingFixStillMatchesDocument\(document, finding, fix\)/);
+  assert.match(source, /document\.getText\(findingRange\(finding\)\) === finding\.evidence/);
+  assert.match(source, /redactedSecretFixStillMatchesSource\(finding, fix, document\.getText\(\)\)/);
+  assert.match(source, /code changed after it was scanned/);
+  assert.match(source, /finding\.fix === fix && l3FixStillMatchesDocument/);
 });
 
 test("VSCode reviews current L3 edits before applying a Pro file batch", async () => {

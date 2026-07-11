@@ -36,6 +36,11 @@ test("private deployment Compose files keep the dashboard local by default and r
   assert.equal(dashboard.command.includes("VIBEGUARD_FINDINGS_INGEST_TOKEN"), true);
   assert.match(dashboard.environment.VIBEGUARD_DASHBOARD_TOKEN, /:\?/);
   assert.match(dashboard.environment.VIBEGUARD_FINDINGS_INGEST_TOKEN, /:\?/);
+  assert.equal(dashboard.environment.VIBEGUARD_TELEMETRY_COLLECTION, "${VIBEGUARD_TELEMETRY_COLLECTION:-false}");
+  assert.equal(
+    dashboard.environment.VIBEGUARD_TELEMETRY_MAX_EVENTS_PER_MINUTE,
+    "${VIBEGUARD_TELEMETRY_MAX_EVENTS_PER_MINUTE:-60}"
+  );
   assert.deepEqual(dashboard.volumes, ["vibeguard-data:/data"]);
   assert.match(dashboard.healthcheck.test.join(" "), /healthz/);
   assert.equal(dashboard.restart, "unless-stopped");
@@ -47,5 +52,7 @@ test("private deployment Compose files keep the dashboard local by default and r
   assert.equal(oidc.services.dashboard.command.includes("--oidc-role"), true);
   assert.match(oidc.services.dashboard.environment.VIBEGUARD_PUBLIC_URL, /:\?/);
   assert.match(envExample, /VIBEGUARD_FINDINGS_INGEST_TOKEN=/);
+  assert.match(envExample, /VIBEGUARD_TELEMETRY_COLLECTION=false/);
+  assert.match(envExample, /VIBEGUARD_TELEMETRY_MAX_EVENTS_PER_MINUTE=60/);
   assert.match(ci, /docker compose -f deploy\/compose\.yaml config --quiet/);
 });

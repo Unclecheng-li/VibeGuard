@@ -1,9 +1,10 @@
-import { mkdirSync } from "fs";
+import { mkdirSync, statSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { createRequire } from "module";
 import os from "os";
 import path from "path";
 import { buildScanReport } from "../reporters";
+import { telemetryRuleFingerprint, type FalsePositiveTelemetryEvent, type TelemetryScope, type TelemetrySource } from "../telemetry";
 import type { DetectionLayer, Finding, FindingType, Severity } from "../types";
 
 type SqliteModule = typeof import("node:sqlite");
@@ -120,7 +121,21 @@ export interface FindingStoreStats {
   activeCount: number;
   dismissedCount: number;
   latestScanAt?: number;
+  /** Total on-disk footprint, including SQLite WAL and shared-memory sidecars. */
+  databaseBytes?: number;
+  maxDatabaseBytes?: number;
 }
+
+export interface SqliteFindingStoreOptions {
+  /**
+   * Persistent storage budget for scan history, audit records, and anonymous feedback.
+   * Oldest disposable history is compacted only after this budget is exceeded.
+   */
+  maxDatabaseBytes?: number;
+}
+
+/** PRD local-storage budget for ~/.vibeguard/findings.db. */
+export const DEFAULT_MAX_FINDINGS_DATABASE_BYTES = 100_000_000;
 
 export interface FindingSummaryBucket {
   key: string;
@@ -134,6 +149,21 @@ export interface FindingRuleSummary extends FindingSummaryBucket {
   severity: Severity;
   falsePositiveCount: number;
   falsePositiveRate: number;
+}
+
+/** Aggregate-only feedback received from opt-in clients. It intentionally has no user, project, path, or source data. */
+export interface AnonymousFalsePositiveTelemetrySummary {
+  ruleFingerprint: string;
+  /** Present only when the fingerprint matches exactly one rule in this local scan history. */
+  matchedRule?: string;
+  eventCount: number;
+  sources: TelemetrySource[];
+  scopes: TelemetryScope[];
+  findingType?: FindingType;
+  detectionLayer?: DetectionLayer;
+  severity?: Severity;
+  firstReceivedAt: number;
+  lastReceivedAt: number;
 }
 
 export interface FindingAuthorSummary extends FindingSummaryBucket {
@@ -180,6 +210,7 @@ export interface FindingStoreSummary extends FindingStoreStats {
   projectCounts: FindingProjectSummary[];
   topRules: FindingRuleSummary[];
   falsePositiveRules: FindingRuleSummary[];
+  anonymousFalsePositiveTelemetry?: AnonymousFalsePositiveTelemetrySummary[];
   trend: FindingTrendPoint[];
   latestScanDelta?: FindingScanDelta;
 }
@@ -188,13 +219,19 @@ export interface PruneResult {
   deletedScans: number;
   deletedFindings: number;
   deletedAuditEvents: number;
+  deletedTelemetryBuckets: number;
 }
 
 export class SqliteFindingStore {
   private readonly database: DatabaseLike;
+  private readonly maxDatabaseBytes: number;
   private initialized = false;
 
-  constructor(private readonly databasePath: string = defaultFindingsDbPath()) {
+  constructor(
+    private readonly databasePath: string = defaultFindingsDbPath(),
+    options: SqliteFindingStoreOptions = {}
+  ) {
+    this.maxDatabaseBytes = normalizeMaxDatabaseBytes(options.maxDatabaseBytes);
     mkdirSync(path.dirname(databasePath), { recursive: true });
     this.database = createDatabase(databasePath);
   }
@@ -277,6 +314,17 @@ export class SqliteFindingStore {
       throw error;
     }
 
+    try {
+      this.enforceDatabaseSizeLimit(storedRun.scanId);
+    } catch (error) {
+      this.deleteScanRun(storedRun.scanId);
+      this.compactDatabase();
+      throw new Error(
+        `Current scan could not be persisted within the ${this.maxDatabaseBytes}-byte findings storage budget: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
     return storedRun;
   }
 
@@ -342,6 +390,7 @@ export class SqliteFindingStore {
         event.outcome,
         JSON.stringify(event.details)
       );
+    this.enforceDatabaseSizeLimit();
     return event;
   }
 
@@ -503,6 +552,42 @@ export class SqliteFindingStore {
     return true;
   }
 
+  /** Stores only a UTC-day aggregate of a schema-validated anonymous feedback event. */
+  recordAnonymousFalsePositiveTelemetry(event: FalsePositiveTelemetryEvent, receivedAt = Date.now()): void {
+    this.initialize();
+    if (!Number.isFinite(receivedAt) || receivedAt < 0 || !/^[a-f0-9]{24}$/.test(event.ruleFingerprint)) {
+      throw new Error("Invalid anonymous false-positive telemetry event.");
+    }
+    const date = new Date(receivedAt);
+    if (Number.isNaN(date.getTime())) {
+      throw new Error("Invalid anonymous false-positive telemetry timestamp.");
+    }
+    const day = date.toISOString().slice(0, 10);
+    this.database
+      .prepare(
+        `INSERT INTO anonymous_false_positive_telemetry (
+           day, rule_fingerprint, source, scope, finding_type, detection_layer, severity,
+           event_count, first_received_at, last_received_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(day, rule_fingerprint, source, scope, finding_type, detection_layer, severity) DO UPDATE SET
+           event_count = anonymous_false_positive_telemetry.event_count + 1,
+           first_received_at = MIN(anonymous_false_positive_telemetry.first_received_at, excluded.first_received_at),
+           last_received_at = MAX(anonymous_false_positive_telemetry.last_received_at, excluded.last_received_at)`
+      )
+      .run(
+        day,
+        event.ruleFingerprint,
+        event.source,
+        event.scope,
+        event.findingType ?? "",
+        event.detectionLayer ?? "",
+        event.severity ?? "",
+        receivedAt,
+        receivedAt
+      );
+    this.enforceDatabaseSizeLimit();
+  }
+
   stats(project?: string): FindingStoreStats {
     this.initialize();
     const selectedProject = normalizeProject(project) ?? null;
@@ -524,7 +609,8 @@ export class SqliteFindingStore {
       findingCount: Number(row?.finding_count ?? 0),
       activeCount: Number(row?.active_count ?? 0),
       dismissedCount: Number(row?.dismissed_count ?? 0),
-      latestScanAt: row?.latest_scan_at === null || row?.latest_scan_at === undefined ? undefined : Number(row.latest_scan_at)
+      latestScanAt: row?.latest_scan_at === null || row?.latest_scan_at === undefined ? undefined : Number(row.latest_scan_at),
+      ...this.databaseUsage()
     };
   }
 
@@ -707,6 +793,28 @@ export class SqliteFindingStore {
          ORDER BY date ASC`
       )
       .all(since, since, project, project);
+    // Anonymous feedback deliberately carries no project identifier, so never mix it into a project-filtered view.
+    const telemetryRows = project
+      ? []
+      : this.database
+          .prepare(
+            `SELECT rule_fingerprint,
+                    SUM(event_count) AS event_count,
+                    GROUP_CONCAT(DISTINCT source) AS sources,
+                    GROUP_CONCAT(DISTINCT scope) AS scopes,
+                    MAX(NULLIF(finding_type, '')) AS finding_type,
+                    MAX(NULLIF(detection_layer, '')) AS detection_layer,
+                    MAX(NULLIF(severity, '')) AS severity,
+                    MIN(first_received_at) AS first_received_at,
+                    MAX(last_received_at) AS last_received_at
+             FROM anonymous_false_positive_telemetry
+             WHERE (? IS NULL OR last_received_at >= ?)
+             GROUP BY rule_fingerprint
+             ORDER BY event_count DESC, last_received_at DESC, rule_fingerprint ASC
+             LIMIT ?`
+          )
+          .all(since, since, topLimit);
+    const localRulesByFingerprint = telemetryRows.length > 0 ? this.localRulesByFingerprint() : new Map<string, string>();
     const latestScanDelta = this.latestScanDelta(since, project);
 
     return {
@@ -716,6 +824,7 @@ export class SqliteFindingStore {
       dismissedCount: Number(statsRow?.dismissed_count ?? 0),
       latestScanAt:
         statsRow?.latest_scan_at === null || statsRow?.latest_scan_at === undefined ? undefined : Number(statsRow.latest_scan_at),
+      ...this.databaseUsage(),
       since: options.since,
       project: project ?? undefined,
       severityCounts: severityRows.map(rowToSummaryBucket),
@@ -725,6 +834,9 @@ export class SqliteFindingStore {
       projectCounts: projectRows.map(rowToProjectSummary),
       topRules: topRuleRows.map(rowToRuleSummary),
       falsePositiveRules: falsePositiveRuleRows.map(rowToRuleSummary),
+      anonymousFalsePositiveTelemetry: telemetryRows.map((row) =>
+        rowToAnonymousFalsePositiveTelemetrySummary(row, localRulesByFingerprint)
+      ),
       trend: trendRows.map(rowToTrendPoint),
       latestScanDelta
     };
@@ -745,15 +857,27 @@ export class SqliteFindingStore {
     const deletedAuditEventsRow = this.database
       .prepare("SELECT COUNT(*) AS count FROM audit_event WHERE occurred_at < ?")
       .get(timestamp);
+    const deletedTelemetryBucketsRow = this.database
+      .prepare("SELECT COUNT(*) AS count FROM anonymous_false_positive_telemetry WHERE last_received_at < ?")
+      .get(timestamp);
     this.database
       .prepare("DELETE FROM finding_result WHERE scan_id IN (SELECT scan_id FROM scan_run WHERE completed_at < ?)")
       .run(timestamp);
     this.database.prepare("DELETE FROM scan_run WHERE completed_at < ?").run(timestamp);
     this.database.prepare("DELETE FROM audit_event WHERE occurred_at < ?").run(timestamp);
+    this.database.prepare("DELETE FROM anonymous_false_positive_telemetry WHERE last_received_at < ?").run(timestamp);
+    if (
+      Number(deletedScansRow?.count ?? 0) > 0 ||
+      Number(deletedAuditEventsRow?.count ?? 0) > 0 ||
+      Number(deletedTelemetryBucketsRow?.count ?? 0) > 0
+    ) {
+      this.compactDatabase();
+    }
     return {
       deletedScans: Number(deletedScansRow?.count ?? 0),
       deletedFindings: Number(deletedFindingsRow?.count ?? 0),
-      deletedAuditEvents: Number(deletedAuditEventsRow?.count ?? 0)
+      deletedAuditEvents: Number(deletedAuditEventsRow?.count ?? 0),
+      deletedTelemetryBuckets: Number(deletedTelemetryBucketsRow?.count ?? 0)
     };
   }
 
@@ -830,12 +954,134 @@ export class SqliteFindingStore {
         rule_count INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS anonymous_false_positive_telemetry (
+        day TEXT NOT NULL,
+        rule_fingerprint TEXT NOT NULL,
+        source TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        finding_type TEXT NOT NULL,
+        detection_layer TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        event_count INTEGER NOT NULL,
+        first_received_at INTEGER NOT NULL,
+        last_received_at INTEGER NOT NULL,
+        PRIMARY KEY (day, rule_fingerprint, source, scope, finding_type, detection_layer, severity)
+      );
+      CREATE INDEX IF NOT EXISTS idx_anonymous_false_positive_telemetry_received
+        ON anonymous_false_positive_telemetry(last_received_at DESC);
     `);
     ensureColumn(this.database, "finding_result", "author_name", "author_name TEXT");
     ensureColumn(this.database, "finding_result", "author_email", "author_email TEXT");
     ensureColumn(this.database, "scan_run", "project", "project TEXT");
     this.database.exec("CREATE INDEX IF NOT EXISTS idx_finding_result_author ON finding_result(author_email, author_name);");
     this.database.exec("CREATE INDEX IF NOT EXISTS idx_scan_run_project_completed_at ON scan_run(project, completed_at);");
+  }
+
+  private databaseUsage(): Required<Pick<FindingStoreStats, "databaseBytes" | "maxDatabaseBytes">> {
+    return {
+      databaseBytes: this.databaseStorageBytes(),
+      maxDatabaseBytes: this.maxDatabaseBytes
+    };
+  }
+
+  /**
+   * Keeps recent records and evicts scan history first, followed by audit and feedback history, only when over budget.
+   * Project rules and ingest credentials are deliberately never evicted as historical scan data.
+   */
+  private enforceDatabaseSizeLimit(protectedScanId?: string): void {
+    while (this.databaseStorageBytes() > this.maxDatabaseBytes) {
+      if (!this.deleteOldestDisposableHistory(protectedScanId)) {
+        this.compactDatabase();
+        if (this.databaseStorageBytes() > this.maxDatabaseBytes) {
+          throw new Error(
+            `Findings database remains above its ${this.maxDatabaseBytes}-byte storage budget after removing all disposable history.`
+          );
+        }
+        return;
+      }
+      this.compactDatabase();
+    }
+  }
+
+  private deleteOldestDisposableHistory(protectedScanId?: string): boolean {
+    const oldestScan = this.database
+      .prepare(
+        `SELECT scan_id
+         FROM scan_run
+         WHERE (? IS NULL OR scan_id <> ?)
+         ORDER BY completed_at ASC, scan_id ASC
+         LIMIT 1`
+      )
+      .get(protectedScanId ?? null, protectedScanId ?? null);
+    if (oldestScan) {
+      this.deleteScanRun(String(oldestScan.scan_id));
+      return true;
+    }
+
+    const oldestAuditEvent = this.database
+      .prepare("SELECT event_id FROM audit_event ORDER BY occurred_at ASC, event_id ASC LIMIT 1")
+      .get();
+    if (oldestAuditEvent) {
+      this.database.prepare("DELETE FROM audit_event WHERE event_id = ?").run(String(oldestAuditEvent.event_id));
+      return true;
+    }
+
+    const oldestTelemetry = this.database
+      .prepare(
+        `SELECT day, rule_fingerprint, source, scope, finding_type, detection_layer, severity
+         FROM anonymous_false_positive_telemetry
+         ORDER BY last_received_at ASC, day ASC, rule_fingerprint ASC
+         LIMIT 1`
+      )
+      .get();
+    if (!oldestTelemetry) {
+      return false;
+    }
+    this.database
+      .prepare(
+        `DELETE FROM anonymous_false_positive_telemetry
+         WHERE day = ? AND rule_fingerprint = ? AND source = ? AND scope = ?
+           AND finding_type = ? AND detection_layer = ? AND severity = ?`
+      )
+      .run(
+        String(oldestTelemetry.day),
+        String(oldestTelemetry.rule_fingerprint),
+        String(oldestTelemetry.source),
+        String(oldestTelemetry.scope),
+        String(oldestTelemetry.finding_type),
+        String(oldestTelemetry.detection_layer),
+        String(oldestTelemetry.severity)
+      );
+    return true;
+  }
+
+  private deleteScanRun(scanId: string): void {
+    this.database.exec("BEGIN");
+    try {
+      this.database.prepare("DELETE FROM finding_result WHERE scan_id = ?").run(scanId);
+      this.database.prepare("DELETE FROM scan_run WHERE scan_id = ?").run(scanId);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private compactDatabase(): void {
+    this.database.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+  }
+
+  private databaseStorageBytes(): number {
+    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, `${this.databasePath}-journal`].reduce(
+      (total, filePath) => {
+        try {
+          return total + statSync(filePath).size;
+        } catch {
+          return total;
+        }
+      },
+      0
+    );
   }
 
   private latestScanDelta(since: number | null, project: string | null): FindingScanDelta | undefined {
@@ -892,6 +1138,30 @@ export class SqliteFindingStore {
       resolvedCount,
       persistentCount
     };
+  }
+
+  private localRulesByFingerprint(): Map<string, string> {
+    const matches = new Map<string, string>();
+    for (const row of this.database
+      .prepare(
+        `SELECT DISTINCT detection_rule
+         FROM finding_result
+         WHERE detection_rule <> ''
+         ORDER BY detection_rule ASC
+         LIMIT 10000`
+      )
+      .all()) {
+      const rule = String(row.detection_rule);
+      const fingerprint = telemetryRuleFingerprint(rule);
+      const existing = matches.get(fingerprint);
+      if (existing === undefined) {
+        matches.set(fingerprint, rule);
+      } else if (existing !== rule) {
+        // Do not expose an ambiguous match from a truncated fingerprint.
+        matches.set(fingerprint, "");
+      }
+    }
+    return matches;
   }
 }
 
@@ -994,6 +1264,29 @@ function rowToRuleSummary(row: Record<string, unknown>): FindingRuleSummary {
   };
 }
 
+function rowToAnonymousFalsePositiveTelemetrySummary(
+  row: Record<string, unknown>,
+  localRulesByFingerprint: ReadonlyMap<string, string>
+): AnonymousFalsePositiveTelemetrySummary {
+  const findingType = isFindingType(row.finding_type) ? row.finding_type : undefined;
+  const detectionLayer = isDetectionLayer(row.detection_layer) ? row.detection_layer : undefined;
+  const severity = isSeverity(row.severity) ? row.severity : undefined;
+  const ruleFingerprint = String(row.rule_fingerprint ?? "");
+  const matchedRule = localRulesByFingerprint.get(ruleFingerprint);
+  return {
+    ruleFingerprint,
+    ...(matchedRule ? { matchedRule } : {}),
+    eventCount: Number(row.event_count ?? 0),
+    sources: splitCsv(row.sources).filter(isTelemetrySource),
+    scopes: splitCsv(row.scopes).filter(isTelemetryScope),
+    ...(findingType ? { findingType } : {}),
+    ...(detectionLayer ? { detectionLayer } : {}),
+    ...(severity ? { severity } : {}),
+    firstReceivedAt: Number(row.first_received_at ?? 0),
+    lastReceivedAt: Number(row.last_received_at ?? 0)
+  };
+}
+
 function rowToAuthorSummary(row: Record<string, unknown>): FindingAuthorSummary {
   const bucket = rowToSummaryBucket(row);
   const highRiskCount = Number(row.high_risk_count ?? 0);
@@ -1050,11 +1343,58 @@ function optionalNumber(value: unknown): number | undefined {
   return value === null || value === undefined ? undefined : Number(value);
 }
 
+function splitCsv(value: unknown): string[] {
+  return typeof value === "string" ? value.split(",").filter(Boolean).sort() : [];
+}
+
+function isTelemetrySource(value: unknown): value is TelemetrySource {
+  return value === "vscode" || value === "cli";
+}
+
+function isTelemetryScope(value: unknown): value is TelemetryScope {
+  return value === "line" || value === "file" || value === "global" || value === "package";
+}
+
+function isFindingType(value: unknown): value is FindingType {
+  return (
+    value === "hallucinated_package" ||
+    value === "hardcoded_secret" ||
+    value === "insecure_config" ||
+    value === "ai_pattern_error" ||
+    value === "sql_injection" ||
+    value === "xss" ||
+    value === "ssrf" ||
+    value === "path_traversal" ||
+    value === "insecure_deserialization" ||
+    value === "command_injection" ||
+    value === "open_redirect" ||
+    value === "information_leakage" ||
+    value === "missing_security_measure" ||
+    value === "other"
+  );
+}
+
+function isDetectionLayer(value: unknown): value is DetectionLayer {
+  return value === "L1" || value === "L2" || value === "L3";
+}
+
+function isSeverity(value: unknown): value is Severity {
+  return value === "critical" || value === "high" || value === "medium" || value === "low" || value === "info";
+}
+
 function createDatabase(databasePath: string): DatabaseLike {
   const sqlite = loadSqlite();
   return new sqlite.DatabaseSync(databasePath, {
     timeout: 5000
   }) as DatabaseLike;
+}
+
+function normalizeMaxDatabaseBytes(value: number | undefined): number {
+  const maxDatabaseBytes = value ?? DEFAULT_MAX_FINDINGS_DATABASE_BYTES;
+  if (!Number.isSafeInteger(maxDatabaseBytes) || maxDatabaseBytes < 256 * 1024) {
+    throw new Error("Findings database storage budget must be an integer of at least 256 KiB.");
+  }
+  return maxDatabaseBytes;
 }
 
 function ensureColumn(database: DatabaseLike, tableName: string, columnName: string, definition: string): void {

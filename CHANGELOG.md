@@ -10,6 +10,7 @@
 - CI reporting with JSON, SARIF, and GitHub workflow annotations for PR feedback.
 - Git-aware `ai-code-scan` mode for filtering PR scans to changed files touched by AI-looking authors, commit messages, or large generated diffs.
 - Semgrep YAML export for core VibeGuard AI/security rules.
+- Semgrep export now includes the complete core L1 loose-configuration set for debug, wildcard host/CORS, disabled security controls, Spring CORS, and Python dynamic execution risks.
 - Custom YAML rules for team-specific VibeGuard findings across CLI, VSCode, LSP, and GitHub Action.
 - Shared `~/.vibeguard/config.json` support with CLI `config init`, `--config`, `--no-config`, VSCode `vibeguard.configPath`, and GitHub Action `config` inputs.
 - Existing-tool deduplication for L2 findings with nearby SonarQube, Snyk, Semgrep, or CodeQL annotations, configurable across CLI, VSCode, LSP, GitHub Action, and config.json.
@@ -29,13 +30,32 @@
 - JSON package-name indexes now default to gzip-compressed `package-index.json.gz`; existing plain `package-index.json` indexes are read automatically and migrate on their next write.
 - Stale npm package indexes now use the same-source replication `_changes` sequence to apply additions and deletions incrementally; `packages sync npm` also saves its initial sequence, while changed mirrors, forced refreshes, and unsupported change feeds retain the full-sync fallback.
 - Added `VibeGuard: Review and Apply All Pro Fixes in Current File`, which combines deterministic L1/L2 fixes with a multi-select, evidence-validated review of non-overlapping L3 replacements when the official Pro provider is configured.
+- Expanded high-confidence Node command-injection detection to shell-enabled `spawn`, `spawnSync`, `execFile`, and `execFileSync` calls whose command or arguments are request-controlled.
 - VSCode startup background package-cache sync with workspace package-manager detection, status-bar progress, output logging, and a manual `VibeGuard: Sync Package Cache` command.
+- The shared LSP now refreshes configured package indexes in the background for JetBrains and other clients, prioritizes workspace manifests, and rechecks open L1 package findings after cache updates.
+- LSP clients that advertise standard work-progress support now receive package-cache synchronization stages and percentages, while clients without that capability retain the non-blocking console-log fallback.
+- Lightweight package-cache startup now activates a Tier 1 partial index before continuing to a configurable Tier 2 full index in VSCode and the shared LSP.
+- VSCode and the shared LSP now default to deferred remote package verification, so unknown imports are checked after immediate local diagnostics without blocking editor feedback; CLI and Action defaults remain offline seed mode.
+- Shared LSP clients, including JetBrains, now expose quick-fix actions to ignore a finding on its line, its file, globally by rule, or by package name; commands validate the active finding before saving the local ignore rule and refreshing diagnostics.
+- Shared LSP clients now receive standard, de-duplicated critical-finding warning dialogs with safe mechanical fixes and the same line, file, global-rule, and package ignore scopes as quick fixes.
+- Critical LSP dialogs now open the shared `ignore-rules.yml` directly through the standard `window/showDocument` protocol when the editor advertises support.
+- Private team dashboards can now optionally collect the existing privacy-minimized false-positive telemetry schema, enforce a small request limit and per-source rate limit, persist only UTC-day aggregates, and display anonymous feedback signals by rule fingerprint.
 - VSCode first-run onboarding now explains that L1 secret/config/AI-pattern checks are active immediately while package-cache sync prepares hallucinated-package detection.
 - L3 semantic analysis can now use DeepSeek/OpenAI-compatible, Claude, or local Ollama providers, with CLI/LSP environment-variable credentials, VSCode SecretStorage commands, structured JSON finding parsing, and local fallback.
+- CLI and shared LSP L3 credentials can now use native OS storage through `vibeguard llm-key`: Windows DPAPI current-user encryption, macOS Keychain, or Linux Secret Service, with a PIN-and-machine-identifier-derived AES-256-GCM fallback when native storage is unavailable; environment variables retain precedence for CI and one-off scans.
 - Expanded the L1 AI-pattern rule library from 6 to 31 high-confidence generated-code mistakes, including JWT, CORS, TLS, password hashing, token randomness, framework secrets, object-storage ACLs, insecure cookie flags, disabled CSRF/CSP, SSH trust bypasses, and unsafe shell execution, with automatic Semgrep export coverage.
 - PR-friendly Markdown scan reports via CLI `--format markdown` / `--markdown`, plus GitHub Action job-summary output and optional sticky PR comments.
 - Cargo and Maven package-name sync now paginates remote registry/search results for more complete local package indexes while preserving `--limit` lightweight sync behavior.
 - Full and partial local package indexes now provide fuzzy package-name suggestions, improving hallucinated-package quick fixes beyond the built-in seed catalog.
+- Hallucinated-package findings now expose every verified, safe similar-name candidate as an individual VS Code and LSP Quick Fix, while preserving the best match as the preferred replacement.
+- Critical VSCode hallucinated-package alerts now include a verified-candidate chooser when several safe replacement packages are available.
+- Shared LSP critical package alerts now expose those same verified replacement candidates for JetBrains and other LSP clients.
+- Critical package alerts now state the Slopsquatting registration risk consistently across VSCode and shared LSP clients.
+- The VSCode Findings sidebar now exposes one-click safe fixes, including the package-candidate chooser and existing L3 review confirmation.
+- VSCode now verifies that a finding's original evidence still matches the document before any single-finding fix is applied.
+- Shared LSP L3 quick fixes now require an evidence-validated confirmation before sending an LLM-generated edit to JetBrains or another client.
+- Shared LSP mechanical quick fixes now resolve their current candidate and verify its evidence server-side before requesting any workspace edit.
+- Redacted secret findings now regenerate and compare their safe fix against current source before VSCode or shared LSP applies it, preventing stale edits without exposing the secret value.
 - VSCode edit-time scans now run L1/L2 immediately and debounce L3 semantic analysis separately, with `vibeguard.l3DebounceMs` controlling the delay.
 - L1 hardcoded-secret detection now combines provider token signatures, contextual high-entropy assignment analysis, bearer-token handling, and filters for common hash/fixture/placeholder false positives, with expanded Semgrep export coverage.
 - Scanner results now include L1/L2/L3 timing breakdowns and PRD performance-budget checks, surfaced in CLI JSON/human/Markdown reports, GitHub Action summaries, VSCode status tooltips, and LSP console warnings.
@@ -61,6 +81,7 @@
 - Refined `ai-code-scan` to use zero-context diffs and git blame for line-level AI attribution, reporting only findings that overlap changed AI-attributed lines while retaining a conservative full-scan fallback.
 - Added a tag-gated Marketplace Release workflow that validates cross-editor versions, publishes VSCode and JetBrains packages only with repository secrets, and always emits reviewable release artifacts.
 - Added hardened Docker Compose manifests for persistent private dashboard deployment, optional OIDC override, and CI validation of the deployment configuration.
+- Private Compose deployments can now explicitly opt into the bounded anonymous false-positive collector through environment variables while keeping it disabled by default.
 - Added project-scoped custom-rule management to the private dashboard, with YAML validation, SQLite persistence, one-project CI credential enforcement, and optional GitHub Action rule downloads.
 - Added Gradle version-catalog (`*.versions.toml`) Maven dependency parsing for `module`, `group`/`name`, and direct-coordinate declarations.
 - Added PyPI `pip install` detection for Dockerfiles, shell and PowerShell scripts, and YAML CI commands across CLI and VSCode scans.

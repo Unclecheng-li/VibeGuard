@@ -255,6 +255,10 @@ export function formatFindingsDashboard(summary: FindingStoreSummary, options: F
           <h2 id="rule-feedback-heading">Rule Feedback</h2>
           ${renderFalsePositiveRulesTable(summary)}
         </section>
+        <section class="panel" aria-labelledby="anonymous-feedback-heading">
+          <h2 id="anonymous-feedback-heading">Anonymous Feedback Signals</h2>
+          ${renderAnonymousFalsePositiveTelemetryTable(summary)}
+        </section>
         <section class="panel" aria-labelledby="authors-heading">
           <h2 id="authors-heading">Developer Risk</h2>
           ${renderAuthorsTable(summary)}
@@ -383,6 +387,29 @@ function renderFalsePositiveRulesTable(summary: FindingStoreSummary): string {
     .join("\n");
   return `<table>
     <thead><tr><th>Rule</th><th>Severity</th><th class="num">False Positive</th><th class="num">Findings</th><th class="num">FP Rate</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderAnonymousFalsePositiveTelemetryTable(summary: FindingStoreSummary): string {
+  const events = summary.anonymousFalsePositiveTelemetry ?? [];
+  if (events.length === 0) {
+    return `<div class="empty">No opt-in anonymous feedback collected in this window.</div>`;
+  }
+  const rows = events
+    .map(
+      (event) => `<tr>
+        <td class="rule">${escapeHtml(event.matchedRule ?? event.ruleFingerprint)}</td>
+        <td class="num">${event.eventCount}</td>
+        <td>${escapeHtml(event.sources.join(", "))}</td>
+        <td>${escapeHtml(event.scopes.join(", "))}</td>
+        <td>${escapeHtml([event.findingType, event.detectionLayer, event.severity].filter(Boolean).join(" / ") || "unspecified")}</td>
+        <td>${escapeHtml(formatDateTime(event.lastReceivedAt))}</td>
+      </tr>`
+    )
+    .join("\n");
+  return `<table>
+    <thead><tr><th>Rule fingerprint</th><th class="num">Events</th><th>Sources</th><th>Scopes</th><th>Metadata</th><th>Last received</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
 }

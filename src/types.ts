@@ -46,6 +46,8 @@ export interface Finding {
   evidence: string;
   suggestion?: string;
   fix?: CodeFix;
+  /** Additional verified mechanical fixes, such as alternative package-name candidates. */
+  alternativeFixes?: CodeFix[];
   detection_layer: DetectionLayer;
   detection_rule: string;
   timestamp: number;
@@ -214,6 +216,7 @@ export interface VibeGuardConfig {
     languages: PackageRegistry[];
     update_interval: "daily" | "weekly";
     lightweight_mode: boolean;
+    background_full_sync: boolean;
   };
   telemetry: boolean;
 }
@@ -235,7 +238,8 @@ export const defaultConfig: VibeGuardConfig = {
   package_cache: {
     languages: ["npm", "pypi"],
     update_interval: "daily",
-    lightweight_mode: true
+    lightweight_mode: true,
+    background_full_sync: true
   },
   telemetry: false
 };
