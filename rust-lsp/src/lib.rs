@@ -898,6 +898,15 @@ impl NativePackageIndex {
                 .as_ref()
                 .is_none_or(|sqlite| sqlite.registries.is_empty())
     }
+
+    fn source_label(&self) -> &'static str {
+        match (self.sqlite.is_some(), self.registries.is_empty()) {
+            (true, false) => "shared SQLite package cache with JSON fallback",
+            (true, true) => "shared SQLite package cache",
+            (false, false) => "shared JSON package index",
+            (false, true) => "shared package index",
+        }
+    }
 }
 
 impl NativeSqlitePackageIndex {
@@ -958,7 +967,13 @@ impl NativeSqlitePackageIndex {
             Ok(None) => Some(coverage == NativeIndexCoverage::Full),
             // Another process may be committing an index update. Keep the editor quiet
             // until the next publish rather than treating an unavailable read as absence.
-            Err(_) => Some(false),
+            Err(error) => {
+                eprintln!(
+                    "VibeGuard Native L1 could not query the SQLite package cache for {}: {error}",
+                    registry.config_identifier()
+                );
+                Some(false)
+            }
         }
     }
 }
@@ -1903,6 +1918,7 @@ impl Backend {
                 if loaded.is_empty() {
                     return;
                 }
+                let source_label = loaded.source_label();
                 *task_package_index.write().await = loaded;
                 let open_documents = task_documents
                     .read()
@@ -1936,7 +1952,7 @@ impl Backend {
                 task_client
                     .log_message(
                         MessageType::INFO,
-                        "VibeGuard Native L1 loaded the shared package index.",
+                        format!("VibeGuard Native L1 loaded the {source_label}."),
                     )
                     .await;
             });

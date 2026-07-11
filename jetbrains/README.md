@@ -35,10 +35,11 @@ unsafe-configuration, and high-confidence AI-error-pattern
 diagnostics. It provides standard LSP quick fixes for safe npm seed replacements and mechanical configuration changes,
 plus line, file, global-rule, and package ignore actions persisted to the shared `~/.vibeguard/ignore-rules.yml` file.
 Set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to use an alternate shared-rule path in a managed or test environment.
-In the background it also reads the shared JSON fallback index at `~/.vibeguard/package-index.json.gz` (or the
-`VIBEGUARD_NATIVE_PACKAGE_INDEX_PATH` override) and only flags missing packages when a registry has `full` coverage.
-It does not yet read the shared SQLite cache or perform package-cache synchronization, secret or AI-pattern fixes,
-persisted findings, or L2/L3 analysis. Leave the
+In the background it reads the shared SQLite package cache at `~/.vibeguard/packages.db` without modifying it (or the
+`VIBEGUARD_NATIVE_PACKAGE_SQLITE_PATH` override), then falls back per registry to the gzip/JSON index at
+`~/.vibeguard/package-index.json.gz` (or the `VIBEGUARD_NATIVE_PACKAGE_INDEX_PATH` override). It only flags missing
+packages when a registry has `full` coverage. Package-cache synchronization and remote verification, secret or
+AI-pattern fixes, persisted findings, and L2/L3 analysis remain Node-service features. Leave the
 variable unset for the default full Node service.
 
 When the server starts, it refreshes the shared `~/.vibeguard` package-name cache in the background according to
