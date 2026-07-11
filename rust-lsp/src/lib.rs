@@ -11,7 +11,7 @@ use flate2::read::GzDecoder;
 use globset::GlobBuilder;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_lsp::{
@@ -327,7 +327,7 @@ static NATIVE_PACKAGES: Lazy<AhoCorasick> = Lazy::new(|| {
 
 static NPM_IMPORT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?m)(?:\bimport\s*(?:[\w*${}, ]+?\s+from\s*)?|\brequire\s*\()\s*[\"'](?P<package>[^\"']+)[\"']"#,
+        r#"(?m)(?:\bimport\s+(?:[^\"'\r\n;]+?\s+from\s+)?|\brequire\s*\()\s*[\"'](?P<package>[^\"']+)[\"']"#,
     )
     .expect("the npm import pattern must compile")
 });
@@ -891,6 +891,27 @@ impl NativePackageIndex {
         })
     }
 
+    fn suggestions(&self, registry: PackageRegistry, package: &str, limit: usize) -> Vec<String> {
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            if let Some(suggestions) = sqlite.suggestions(registry, package, limit) {
+                return suggestions;
+            }
+        }
+        let Some(index) = self.registries.get(&registry) else {
+            return Vec::new();
+        };
+        let terms = suggestion_search_terms(package);
+        let mut candidates = index
+            .packages
+            .iter()
+            .filter(|candidate| matches_suggestion_term(candidate, &terms))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.truncate(5_000);
+        package_suggestions(package, candidates, limit)
+    }
+
     fn is_empty(&self) -> bool {
         self.registries.is_empty()
             && self
@@ -976,6 +997,237 @@ impl NativeSqlitePackageIndex {
             }
         }
     }
+
+    fn suggestions(
+        &self,
+        registry: PackageRegistry,
+        package: &str,
+        limit: usize,
+    ) -> Option<Vec<String>> {
+        self.registries.get(&registry)?;
+        let terms = suggestion_search_terms(package);
+        if terms.is_empty() {
+            return Some(Vec::new());
+        }
+        let Ok(connection) = self.connection.lock() else {
+            return Some(Vec::new());
+        };
+        let where_clause = std::iter::repeat_n("package_name LIKE ? ESCAPE '\\'", terms.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let query = format!(
+            "SELECT package_name FROM package_index_package WHERE registry = ? AND ({where_clause}) ORDER BY package_name LIMIT 5000"
+        );
+        let mut parameters = vec![registry.config_identifier().to_owned()];
+        parameters.extend(terms.iter().map(|term| format!("%{}%", escape_like(term))));
+        let candidates = (|| -> rusqlite::Result<Vec<String>> {
+            let mut statement = connection.prepare(&query)?;
+            let rows = statement.query_map(params_from_iter(parameters.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect()
+        })();
+        match candidates {
+            Ok(candidates) => Some(package_suggestions(package, candidates, limit)),
+            Err(error) => {
+                eprintln!(
+                    "VibeGuard Native L1 could not search the SQLite package cache for {}: {error}",
+                    registry.config_identifier()
+                );
+                Some(Vec::new())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeSuggestionScore {
+    candidate: String,
+    score: f64,
+    distance: usize,
+}
+
+fn package_suggestions(
+    package: &str,
+    candidates: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> Vec<String> {
+    let query = normalize_suggestion_value(package);
+    if query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let query_leaf = package_leaf(&query);
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| score_package_candidate(&query, &query_leaf, candidate))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        left.score
+            .total_cmp(&right.score)
+            .then_with(|| left.distance.cmp(&right.distance))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+    scored.truncate(limit);
+    scored
+        .into_iter()
+        .map(|suggestion| suggestion.candidate)
+        .collect()
+}
+
+fn suggestion_search_terms(package: &str) -> Vec<String> {
+    let normalized = normalize_suggestion_value(package);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let leaf = package_leaf(&normalized);
+    let trimmed_leaf = trim_common_hallucination_suffixes(&leaf);
+    let mut terms = Vec::new();
+    for term in [
+        prefix_chars(&normalized, 2),
+        prefix_chars(&normalized, suggestion_prefix_length(&normalized)),
+        prefix_chars(&leaf, 2),
+        prefix_chars(&leaf, suggestion_prefix_length(&leaf)),
+        prefix_chars(&trimmed_leaf, suggestion_prefix_length(&trimmed_leaf)),
+    ] {
+        if !term.is_empty() && !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn matches_suggestion_term(candidate: &str, terms: &[String]) -> bool {
+    let normalized = normalize_suggestion_value(candidate);
+    let leaf = package_leaf(&normalized);
+    terms
+        .iter()
+        .any(|term| normalized.contains(term) || leaf.contains(term))
+}
+
+fn score_package_candidate(
+    query: &str,
+    query_leaf: &str,
+    candidate: String,
+) -> Option<NativeSuggestionScore> {
+    let normalized_candidate = normalize_suggestion_value(&candidate);
+    if normalized_candidate.is_empty() || normalized_candidate == query {
+        return None;
+    }
+    let candidate_leaf = package_leaf(&normalized_candidate);
+    let full_distance = levenshtein(query, &normalized_candidate);
+    let leaf_distance = levenshtein(query_leaf, &candidate_leaf);
+    let distance = full_distance.min(leaf_distance);
+    let max_leaf_length = query_leaf
+        .chars()
+        .count()
+        .max(candidate_leaf.chars().count());
+    let max_full_length = query
+        .chars()
+        .count()
+        .max(normalized_candidate.chars().count());
+    let substring_match = normalized_candidate.contains(query)
+        || query.contains(&normalized_candidate)
+        || candidate_leaf.contains(query_leaf)
+        || query_leaf.contains(&candidate_leaf);
+    let plausible = distance <= 2.max(max_leaf_length * 35 / 100)
+        || full_distance <= 3.max(max_full_length * 28 / 100)
+        || substring_match;
+    if !plausible {
+        return None;
+    }
+    let prefix_match = normalized_candidate.starts_with(&prefix_chars(query, 3))
+        || candidate_leaf.starts_with(&prefix_chars(query_leaf, 3));
+    let score = distance as f64 / max_leaf_length.max(1) as f64
+        + full_distance as f64 / max_full_length.max(1) as f64
+        + if substring_match { -0.35 } else { 0.0 }
+        + if prefix_match { -0.15 } else { 0.0 };
+    Some(NativeSuggestionScore {
+        candidate,
+        score,
+        distance,
+    })
+}
+
+fn normalize_suggestion_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn package_leaf(value: &str) -> String {
+    value
+        .split(['/', ':'])
+        .filter(|part| !part.is_empty())
+        .next_back()
+        .unwrap_or(value)
+        .to_owned()
+}
+
+fn trim_common_hallucination_suffixes(value: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        "security",
+        "middleware",
+        "manager",
+        "plugin",
+        "secure",
+        "client",
+        "utils",
+        "util",
+        "guard",
+        "magic",
+        "auth",
+        "plus",
+        "extra",
+        "pro",
+    ];
+    let mut trimmed = value.to_owned();
+    loop {
+        let without_separator = trimmed.trim_end_matches('-');
+        let Some(suffix) = SUFFIXES
+            .iter()
+            .find(|suffix| without_separator.ends_with(**suffix))
+        else {
+            break;
+        };
+        let end = without_separator.len() - suffix.len();
+        trimmed = without_separator[..end].trim_end_matches('-').to_owned();
+    }
+    trimmed
+}
+
+fn suggestion_prefix_length(value: &str) -> usize {
+    let length = value.chars().count();
+    if length <= 2 {
+        length
+    } else {
+        length.clamp(2, 4)
+    }
+}
+
+fn prefix_chars(value: &str, length: usize) -> String {
+    value.chars().take(length).collect()
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_character) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_character) in right.iter().enumerate() {
+            let cost = usize::from(left_character != *right_character);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn default_package_index_path() -> PathBuf {
@@ -1452,18 +1704,36 @@ fn scan_known_packages(source: &str, package_index: &NativePackageIndex) -> Vec<
             });
             findings.push(finding);
         } else if package_index.is_known_missing(candidate.registry, &normalized) {
+            let suggestions = package_index.suggestions(candidate.registry, &normalized, 3);
+            let suggestion_text = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!(" Suggested alternative: {}.", suggestions.join(", "))
+            };
             let mut finding = finding_for_range(
                 source,
                 candidate.start,
                 candidate.end,
                 candidate.registry.finding_code(),
                 &format!(
-                    "\"{}\" is absent from the full local {} package index. Verify it before installing it.",
+                    "\"{}\" is absent from the full local {} package index. Verify it before installing it.{}",
                     normalized,
-                    candidate.registry.identifier()
+                    candidate.registry.identifier(),
+                    suggestion_text,
                 ),
                 DiagnosticSeverity::ERROR,
             );
+            if candidate.registry == PackageRegistry::Npm {
+                finding.fixes = suggestions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, suggestion)| L1QuickFix {
+                        title: format!("Replace with {suggestion}"),
+                        replacement: suggestion.clone(),
+                        is_preferred: index == 0,
+                    })
+                    .collect();
+            }
             finding.package = Some(PackageEvidence {
                 registry: candidate.registry,
                 package: normalized,
@@ -2209,6 +2479,56 @@ mod tests {
     }
 
     #[test]
+    fn reports_seeded_npm_packages_from_default_imports() {
+        let findings = scan_l1("import AutoSizer from \"react-virtualized-auto-sizer\";");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "hallucinated_package_npm");
+        assert!(findings[0].message.contains("react-virtualized"));
+    }
+
+    #[test]
+    fn suggests_and_fixes_full_json_npm_index_misses() {
+        let index = NativePackageIndex {
+            registries: HashMap::from([(
+                PackageRegistry::Npm,
+                NativeIndexRegistry {
+                    coverage: NativeIndexCoverage::Full,
+                    packages: std::collections::HashSet::from([
+                        "react".to_owned(),
+                        "rxjs".to_owned(),
+                        "react-window".to_owned(),
+                    ]),
+                },
+            )]),
+            sqlite: None,
+        };
+        let source = "import rx from \"rxjss\";";
+        let findings = scan_l1_with_package_index(source, &index);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "hallucinated_package_npm");
+        assert!(findings[0].message.contains("Suggested alternative: rxjs."));
+        assert_eq!(findings[0].fixes.len(), 1);
+        assert_eq!(findings[0].fixes[0].replacement, "rxjs");
+        assert!(findings[0].fixes[0].is_preferred);
+
+        let uri = Url::parse("file:///workspace/src/app.ts").expect("the test URI should parse");
+        let actions = code_actions_for_range(
+            source,
+            &uri,
+            &Range::new(Position::new(0, 0), Position::new(0, 99)),
+            &NativeIgnoreRules::default(),
+            &index,
+        );
+        let fix = actions
+            .iter()
+            .find(|action| action.title == "Replace with rxjs")
+            .expect("the JSON index suggestion should be offered as a quick fix");
+        assert_eq!(action_replacement(fix, &uri), "rxjs");
+    }
+
+    #[test]
     fn reports_generic_sensitive_assignments_and_filters_benign_literals() {
         let high_entropy = "aB3dE4fG5hI6jK7lM8nO9pQ0rS1tU2vW3xY4z";
         let standalone = "zY8xW7vU6tS5rQ4pO3nM2lK1jI0hG9fE8dC7bA!";
@@ -2554,7 +2874,7 @@ mod tests {
                 INSERT INTO package_index_registry (registry, coverage, updated_at)
                   VALUES ('npm', 'full', 1), ('pypi', 'partial', 1);
                 INSERT INTO package_index_package (registry, package_name)
-                  VALUES ('npm', 'known-package'), ('pypi', 'known-package');
+                  VALUES ('npm', 'known-package'), ('npm', 'express'), ('pypi', 'known-package');
                 ",
             )
             .expect("the SQLite fixture schema should persist");
@@ -2578,6 +2898,15 @@ mod tests {
                 .message
                 .contains("full local npm package index")
         );
+
+        let suggested_findings = scan_l1_with_package_index("import app from \"exress\";", &index);
+        assert_eq!(suggested_findings.len(), 1);
+        assert!(
+            suggested_findings[0]
+                .message
+                .contains("Suggested alternative: express.")
+        );
+        assert_eq!(suggested_findings[0].fixes[0].replacement, "express");
 
         let partial_findings =
             scan_l1_with_package_index("from missing_package import value", &index);

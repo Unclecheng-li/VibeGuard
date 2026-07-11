@@ -32,7 +32,8 @@ resulting executable. The equivalent Java system property is `vibeguard.native.l
 the Node settings and starts the binary with `--stdio`, so Node is not needed for that preview. The native server
 currently covers local L1 package-seed, provider and high-entropy secrets with conservative false-positive filtering,
 unsafe-configuration, and high-confidence AI-error-pattern
-diagnostics. It provides standard LSP quick fixes for safe npm seed replacements and mechanical configuration changes,
+diagnostics. It provides standard LSP quick fixes for safe npm seed and full-index-confirmed similar npm replacements,
+plus mechanical configuration changes,
 plus line, file, global-rule, and package ignore actions persisted to the shared `~/.vibeguard/ignore-rules.yml` file.
 Set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to use an alternate shared-rule path in a managed or test environment.
 In the background it reads the shared SQLite package cache at `~/.vibeguard/packages.db` without modifying it (or the

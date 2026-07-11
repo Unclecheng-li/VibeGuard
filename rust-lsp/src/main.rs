@@ -169,3 +169,57 @@ where
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn reads_case_insensitive_lsp_content_length_headers() {
+        let expected = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "exit"
+        });
+        let body = serde_json::to_vec(&expected).expect("the fixture should serialize");
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(format!("content-length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .expect("the header should write");
+        writer
+            .write_all(&body)
+            .await
+            .expect("the body should write");
+        drop(writer);
+
+        let mut reader = BufReader::new(reader);
+        let actual = read_lsp_message(&mut reader)
+            .await
+            .expect("the frame should parse")
+            .expect("the frame should contain a message");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn writes_complete_lsp_frames_without_waiting_for_stream_close() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "ready": true }
+        });
+        let body = serde_json::to_vec(&message).expect("the fixture should serialize");
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        write_lsp_message(&mut writer, &message)
+            .await
+            .expect("the frame should write and flush");
+        let mut actual = vec![0_u8; header.len() + body.len()];
+        reader
+            .read_exact(&mut actual)
+            .await
+            .expect("the flushed frame should be readable before stream close");
+        assert_eq!(actual, [header.as_bytes(), body.as_slice()].concat());
+    }
+}

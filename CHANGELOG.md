@@ -8,6 +8,8 @@
 - The native Rust preview now returns standard LSP quick fixes for safe npm seed replacements and mechanical L1 configuration changes.
 - The native Rust preview now honors shared YAML ignore rules and offers line, file, global-rule, and package ignore actions that immediately refresh diagnostics.
 - The native Rust preview now reads the Node-generated SQLite package cache without writing to it, falling back per registry to the shared gzip/JSON index and reporting only full-index-confirmed package misses without blocking initial L1 diagnostics.
+- Native Rust LSP stdio now flushes every JSON-RPC frame immediately, and default npm imports such as `import package from "name"` are recognized alongside side-effect, named, wildcard, and CommonJS imports.
+- Full SQLite or JSON package indexes now provide scored similar-name suggestions for native LSP package misses, with verified npm candidates exposed as individual Quick Fixes.
 - Added a reproducible CLI demo video generated from the deliberately unsafe sample scan, covering hallucinated packages, hardcoded secrets, and DOM XSS.
 - Kotlin source and script imports now use the same conservative Maven class lookup as Java, including Kotlin aliases while excluding JVM platform, wildcard, and lower-case top-level function imports.
 - Local findings history now enforces its 100 MB on-disk budget across SQLite and WAL sidecars, compacts oldest disposable history when necessary, and preserves the current scan or audit event rather than silently dropping it.
