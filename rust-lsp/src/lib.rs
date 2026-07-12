@@ -354,24 +354,56 @@ static PYPROJECT_DEPENDENCY_KEY: Lazy<Regex> = Lazy::new(|| {
 });
 
 static PYTHON_FROM_IMPORT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^\s*from\s+(?P<package>[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z0-9_]+)*\s+import\b")
+    Regex::new(r"(?m)^[ \t]*from[ \t]+(?P<package>[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z0-9_]+)*[ \t]+import\b")
         .expect("the Python from-import pattern must compile")
 });
 
 static PYTHON_IMPORT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?m)^\s*import\s+(?P<packages>[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)",
+        r"(?m)^[ \t]*import[ \t]+(?P<packages>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:[ \t]+as[ \t]+[A-Za-z_][A-Za-z0-9_]*)?(?:[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:[ \t]+as[ \t]+[A-Za-z_][A-Za-z0-9_]*)?)*)",
     )
     .expect("the Python import pattern must compile")
 });
 
-static PYTHON_MODULE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("the Python module pattern must compile")
+static PIP_STRING_COMMAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)\b(?:subprocess\.(?:run|call|check_call)|os\.system)\s*\(\s*[\"'](?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+(?P<arguments>[^\"'\r\n]+)"#,
+    )
+    .expect("the pip string-command pattern must compile")
 });
 
-static PIP_INSTALL: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?im)\b(?:python(?:3)?\s+-m\s+)?pip(?:3)?\s+install\s+(?P<package>[A-Za-z0-9][A-Za-z0-9_.-]*)")
-        .expect("the pip install pattern must compile")
+static PIP_ARRAY_COMMAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)\bsubprocess\.(?:run|call|check_call)\s*\(\s*\[\s*[\"']pip(?:3)?[\"']\s*,\s*[\"']install[\"']\s*(?:,\s*(?P<arguments>[^\]\r\n]*))?\]"#,
+    )
+    .expect("the pip array-command pattern must compile")
+});
+
+static PIP_ARRAY_ARGUMENT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"[\"'](?P<argument>[^\"'\r\n]+)[\"']"#)
+        .expect("the pip array argument pattern must compile")
+});
+
+static PIP_NOTEBOOK_COMMAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?im)^\s*!\s*(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+(?P<arguments>[^\r\n#]+)",
+    )
+    .expect("the notebook pip command pattern must compile")
+});
+
+static PIP_SCRIPT_COMMAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?im)^\s*(?:-\s+)?(?:run:\s*)?(?:RUN\s+)?(?:sudo\s+)?(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+(?P<arguments>[^\r\n#]+)",
+    )
+    .expect("the script pip command pattern must compile")
+});
+
+static PIP_ARGUMENT_TOKEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\S+").expect("the pip argument token pattern must compile"));
+
+static PIP_PACKAGE_ARGUMENT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<package>[A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[^\]]+\])?(?:[<>=!~].*)?$")
+        .expect("the pip package argument pattern must compile")
 });
 
 static CARGO_USE: Lazy<Regex> = Lazy::new(|| {
@@ -391,6 +423,11 @@ static CARGO_SECTION: Lazy<Regex> = Lazy::new(|| {
 static CARGO_PACKAGE_RENAME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"\bpackage\s*=\s*[\"'](?P<package>[A-Za-z0-9][A-Za-z0-9_-]*)[\"']"#)
         .expect("the Cargo renamed-package pattern must compile")
+});
+
+static CARGO_NON_REGISTRY_DEPENDENCY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\b(?:path|git|registry)\s*=\s*[\"']"#)
+        .expect("the Cargo non-registry dependency pattern must compile")
 });
 
 static GO_IMPORT: Lazy<Regex> = Lazy::new(|| {
@@ -1814,32 +1851,15 @@ fn package_candidates(source: &str, file_path: Option<&str>) -> Vec<PackageCandi
             candidate.end,
         ))
     });
+    candidates.sort_by_key(|candidate| candidate.start);
     candidates
 }
 
 fn push_all_package_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
-    push_capture_candidates(
-        candidates,
-        source,
-        &NPM_IMPORT,
-        "package",
-        PackageRegistry::Npm,
-    );
-    push_capture_candidates(
-        candidates,
-        source,
-        &PYTHON_FROM_IMPORT,
-        "package",
-        PackageRegistry::Pypi,
-    );
+    push_javascript_import_candidates(candidates, source);
+    push_python_from_import_candidates(candidates, source);
     push_python_import_candidates(candidates, source);
-    push_capture_candidates(
-        candidates,
-        source,
-        &PIP_INSTALL,
-        "package",
-        PackageRegistry::Pypi,
-    );
+    push_pip_install_candidates(candidates, source, false);
     push_capture_candidates(
         candidates,
         source,
@@ -1890,9 +1910,13 @@ fn push_document_package_candidates(
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    if is_requirements_file(file_path, &file_name) {
+        push_requirements_candidates(candidates, source);
+        return;
+    }
+
     match file_name.as_str() {
         "package.json" => push_npm_manifest_candidates(candidates, source),
-        "requirements.txt" => push_requirements_candidates(candidates, source),
         "pyproject.toml" => push_pyproject_candidates(candidates, source),
         "cargo.toml" => push_cargo_manifest_candidates(candidates, source),
         "go.mod" => push_capture_candidates(
@@ -1913,29 +1937,13 @@ fn push_document_package_candidates(
         _ if file_name.ends_with(".versions.toml") => {
             push_gradle_version_catalog_candidates(candidates, source)
         }
-        _ if is_npm_source_file(&file_name) => push_capture_candidates(
-            candidates,
-            source,
-            &NPM_IMPORT,
-            "package",
-            PackageRegistry::Npm,
-        ),
+        _ if is_npm_source_file(&file_name) => {
+            push_javascript_import_candidates(candidates, source)
+        }
         _ if is_python_source_file(&file_name) => {
-            push_capture_candidates(
-                candidates,
-                source,
-                &PYTHON_FROM_IMPORT,
-                "package",
-                PackageRegistry::Pypi,
-            );
+            push_python_from_import_candidates(candidates, source);
             push_python_import_candidates(candidates, source);
-            push_capture_candidates(
-                candidates,
-                source,
-                &PIP_INSTALL,
-                "package",
-                PackageRegistry::Pypi,
-            );
+            push_pip_install_candidates(candidates, source, true);
         }
         _ if is_rust_source_file(&file_name) => push_capture_candidates(
             candidates,
@@ -1951,15 +1959,32 @@ fn push_document_package_candidates(
             "package",
             PackageRegistry::GoMod,
         ),
-        _ if is_pip_command_file(&file_name) => push_capture_candidates(
-            candidates,
-            source,
-            &PIP_INSTALL,
-            "package",
-            PackageRegistry::Pypi,
-        ),
+        _ if is_pip_command_file(&file_name) => {
+            push_pip_install_candidates(candidates, source, false)
+        }
         _ => {}
     }
+}
+
+fn is_requirements_file(file_path: &str, file_name: &str) -> bool {
+    let named_requirements_file = file_name.strip_suffix(".txt").is_some_and(|stem| {
+        stem == "requirements"
+            || stem.strip_prefix("requirements").is_some_and(|suffix| {
+                suffix
+                    .chars()
+                    .next()
+                    .is_some_and(|separator| matches!(separator, '-' | '_' | '.'))
+                    && suffix.len() > 1
+            })
+    });
+    if named_requirements_file {
+        return true;
+    }
+
+    let normalized_path = file_path.replace('\\', "/").to_ascii_lowercase();
+    let mut segments = normalized_path.rsplit('/');
+    let _ = segments.next();
+    segments.next() == Some("requirements") && file_name.ends_with(".txt")
 }
 
 fn is_npm_source_file(file_name: &str) -> bool {
@@ -1987,6 +2012,165 @@ fn is_pip_command_file(file_name: &str) -> bool {
             file_name.rsplit('.').next(),
             Some("sh" | "bash" | "zsh" | "ps1" | "yml" | "yaml")
         )
+}
+
+fn push_javascript_import_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    for captures in NPM_IMPORT.captures_iter(source) {
+        let Some(command) = captures.get(0) else {
+            continue;
+        };
+        if is_javascript_non_code_at(source, command.start()) {
+            continue;
+        }
+        let Some(package) = captures.name("package") else {
+            continue;
+        };
+        candidates.push(PackageCandidate {
+            registry: PackageRegistry::Npm,
+            package: package.as_str().to_owned(),
+            start: package.start(),
+            end: package.end(),
+        });
+    }
+}
+
+fn is_javascript_non_code_at(source: &str, byte_offset: usize) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexState {
+        Code,
+        LineComment,
+        BlockComment,
+        SingleQuote,
+        DoubleQuote,
+        Template,
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut state = LexState::Code;
+    while index < byte_offset {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            LexState::Code if byte == b'/' && next == Some(b'/') => {
+                state = LexState::LineComment;
+                index += 2;
+            }
+            LexState::Code if byte == b'/' && next == Some(b'*') => {
+                state = LexState::BlockComment;
+                index += 2;
+            }
+            LexState::Code if byte == b'\'' => {
+                state = LexState::SingleQuote;
+                index += 1;
+            }
+            LexState::Code if byte == b'\"' => {
+                state = LexState::DoubleQuote;
+                index += 1;
+            }
+            LexState::Code if byte == b'`' => {
+                state = LexState::Template;
+                index += 1;
+            }
+            LexState::LineComment if byte == b'\n' || byte == b'\r' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            LexState::BlockComment if byte == b'*' && next == Some(b'/') => {
+                state = LexState::Code;
+                index += 2;
+            }
+            LexState::SingleQuote | LexState::DoubleQuote | LexState::Template if byte == b'\\' => {
+                index += 2;
+            }
+            LexState::SingleQuote if byte == b'\'' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            LexState::DoubleQuote if byte == b'\"' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            LexState::Template if byte == b'`' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    state != LexState::Code
+}
+
+fn is_python_non_code_at(source: &str, byte_offset: usize) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexState {
+        Code,
+        LineComment,
+        SingleQuote,
+        DoubleQuote,
+        TripleSingleQuote,
+        TripleDoubleQuote,
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    let mut state = LexState::Code;
+    while index < byte_offset {
+        let byte = bytes[index];
+        let triple_single = bytes
+            .get(index..index + 3)
+            .is_some_and(|value| value == b"'''");
+        let triple_double = bytes
+            .get(index..index + 3)
+            .is_some_and(|value| value == b"\"\"\"");
+        match state {
+            LexState::Code if byte == b'#' => {
+                state = LexState::LineComment;
+                index += 1;
+            }
+            LexState::Code if triple_single => {
+                state = LexState::TripleSingleQuote;
+                index += 3;
+            }
+            LexState::Code if triple_double => {
+                state = LexState::TripleDoubleQuote;
+                index += 3;
+            }
+            LexState::Code if byte == b'\'' => {
+                state = LexState::SingleQuote;
+                index += 1;
+            }
+            LexState::Code if byte == b'\"' => {
+                state = LexState::DoubleQuote;
+                index += 1;
+            }
+            LexState::LineComment if byte == b'\n' || byte == b'\r' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            LexState::TripleSingleQuote if triple_single => {
+                state = LexState::Code;
+                index += 3;
+            }
+            LexState::TripleDoubleQuote if triple_double => {
+                state = LexState::Code;
+                index += 3;
+            }
+            LexState::SingleQuote | LexState::DoubleQuote if byte == b'\\' => {
+                index += 2;
+            }
+            LexState::SingleQuote if byte == b'\'' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            LexState::DoubleQuote if byte == b'\"' => {
+                state = LexState::Code;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    state != LexState::Code
 }
 
 fn push_npm_manifest_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
@@ -2059,10 +2243,136 @@ fn push_requirements_candidates(candidates: &mut Vec<PackageCandidate>, source: 
     }
 }
 
+fn push_pip_install_candidates(
+    candidates: &mut Vec<PackageCandidate>,
+    source: &str,
+    respect_python_code_regions: bool,
+) {
+    for pattern in [
+        &*PIP_STRING_COMMAND,
+        &*PIP_NOTEBOOK_COMMAND,
+        &*PIP_SCRIPT_COMMAND,
+    ] {
+        for captures in pattern.captures_iter(source) {
+            if captures.get(0).is_some_and(|command| {
+                (respect_python_code_regions && is_python_non_code_at(source, command.start()))
+                    || has_unquoted_line_comment_before(source, command.start())
+            }) {
+                continue;
+            }
+            let Some(arguments) = captures.name("arguments") else {
+                continue;
+            };
+            let mut skip_next = false;
+            for token in PIP_ARGUMENT_TOKEN.find_iter(arguments.as_str()) {
+                push_pip_argument_candidate(
+                    candidates,
+                    token.as_str(),
+                    arguments.start() + token.start(),
+                    &mut skip_next,
+                );
+            }
+        }
+    }
+
+    for captures in PIP_ARRAY_COMMAND.captures_iter(source) {
+        if captures.get(0).is_some_and(|command| {
+            (respect_python_code_regions && is_python_non_code_at(source, command.start()))
+                || has_unquoted_line_comment_before(source, command.start())
+        }) {
+            continue;
+        }
+        let Some(arguments) = captures.name("arguments") else {
+            continue;
+        };
+        let mut skip_next = false;
+        for argument in PIP_ARRAY_ARGUMENT.captures_iter(arguments.as_str()) {
+            let Some(value) = argument.name("argument") else {
+                continue;
+            };
+            push_pip_argument_candidate(
+                candidates,
+                value.as_str(),
+                arguments.start() + value.start(),
+                &mut skip_next,
+            );
+        }
+    }
+}
+
+fn push_pip_argument_candidate(
+    candidates: &mut Vec<PackageCandidate>,
+    token: &str,
+    start: usize,
+    skip_next: &mut bool,
+) {
+    if *skip_next {
+        *skip_next = false;
+        return;
+    }
+    if matches!(
+        token,
+        "-r" | "--requirement"
+            | "-c"
+            | "--constraint"
+            | "-f"
+            | "--find-links"
+            | "--index-url"
+            | "--extra-index-url"
+            | "--trusted-host"
+    ) {
+        *skip_next = true;
+        return;
+    }
+    if token.starts_with('-') || token.starts_with('#') {
+        return;
+    }
+    let Some(package) = PIP_PACKAGE_ARGUMENT
+        .captures(token)
+        .and_then(|captures| captures.name("package"))
+    else {
+        return;
+    };
+    candidates.push(PackageCandidate {
+        registry: PackageRegistry::Pypi,
+        package: package.as_str().to_owned(),
+        start,
+        end: start + package.as_str().len(),
+    });
+}
+
+fn has_unquoted_line_comment_before(source: &str, byte_offset: usize) -> bool {
+    let line_start = source[..byte_offset]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or_default();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    for character in source[line_start..byte_offset].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+        } else if character == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if character == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if character == '#' && !in_single_quote && !in_double_quote {
+            return true;
+        }
+    }
+    false
+}
+
 fn push_pyproject_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
     let mut offset = 0;
     let mut in_poetry_dependencies = false;
-    let mut project_dependency_arrays = false;
+    let mut in_project = false;
+    let mut in_project_optional_dependencies = false;
+    let mut in_build_system = false;
     let mut dependency_array_open = false;
 
     for raw_line in source.split_inclusive('\n') {
@@ -2076,8 +2386,9 @@ fn push_pyproject_candidates(candidates: &mut Vec<PackageCandidate>, source: &st
             in_poetry_dependencies = section == "tool.poetry.dependencies"
                 || (section.starts_with("tool.poetry.group.")
                     && section.ends_with(".dependencies"));
-            project_dependency_arrays =
-                section == "project" || section == "project.optional-dependencies";
+            in_project = section == "project";
+            in_project_optional_dependencies = section == "project.optional-dependencies";
+            in_build_system = section == "build-system";
             dependency_array_open = false;
             offset += raw_line.len();
             continue;
@@ -2100,10 +2411,12 @@ fn push_pyproject_candidates(candidates: &mut Vec<PackageCandidate>, source: &st
             }
         }
 
-        let starts_project_dependency_array = project_dependency_arrays
-            && (stripped.starts_with("dependencies")
-                || (stripped.contains('=') && stripped.contains('[')));
-        if dependency_array_open || starts_project_dependency_array {
+        let starts_dependency_array = stripped.contains('=')
+            && stripped.contains('[')
+            && ((in_project && stripped.starts_with("dependencies"))
+                || in_project_optional_dependencies
+                || (in_build_system && stripped.starts_with("requires")));
+        if dependency_array_open || starts_dependency_array {
             for captures in PYPROJECT_DEPENDENCY_LITERAL.captures_iter(line) {
                 let Some(package) = captures.name("package") else {
                     continue;
@@ -2137,6 +2450,10 @@ fn push_cargo_manifest_candidates(candidates: &mut Vec<PackageCandidate>, source
             continue;
         }
         if in_dependency_section {
+            if is_cargo_non_registry_dependency(stripped) {
+                offset += raw_line.len();
+                continue;
+            }
             let renamed = CARGO_PACKAGE_RENAME
                 .captures(stripped)
                 .and_then(|captures| captures.name("package"));
@@ -2208,6 +2525,10 @@ fn push_gradle_version_catalog_candidates(candidates: &mut Vec<PackageCandidate>
     }
 }
 
+fn is_cargo_non_registry_dependency(line: &str) -> bool {
+    CARGO_NON_REGISTRY_DEPENDENCY.is_match(line)
+}
+
 fn is_cargo_dependency_section(section: &str) -> bool {
     let section = section.trim().to_ascii_lowercase();
     matches!(
@@ -2239,18 +2560,55 @@ fn push_capture_candidates(
     }
 }
 
+fn push_python_from_import_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    for captures in PYTHON_FROM_IMPORT.captures_iter(source) {
+        let Some(command) = captures.get(0) else {
+            continue;
+        };
+        if is_python_non_code_at(source, command.start()) {
+            continue;
+        }
+        let Some(package) = captures.name("package") else {
+            continue;
+        };
+        candidates.push(PackageCandidate {
+            registry: PackageRegistry::Pypi,
+            package: package.as_str().to_owned(),
+            start: package.start(),
+            end: package.end(),
+        });
+    }
+}
+
 fn push_python_import_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
     for captures in PYTHON_IMPORT.captures_iter(source) {
+        let Some(command) = captures.get(0) else {
+            continue;
+        };
+        if is_python_non_code_at(source, command.start()) {
+            continue;
+        }
         let Some(packages) = captures.name("packages") else {
             continue;
         };
-        for module in PYTHON_MODULE.find_iter(packages.as_str()) {
+        let mut offset = 0;
+        for segment in packages.as_str().split_inclusive(',') {
+            let module_segment = segment.strip_suffix(',').unwrap_or(segment);
+            let trimmed = module_segment.trim_start();
+            let module = trimmed.split_whitespace().next().unwrap_or_default();
+            let leading_whitespace = module_segment.len() - trimmed.len();
+            let package = module.split('.').next().unwrap_or_default();
+            if package.is_empty() {
+                offset += segment.len();
+                continue;
+            }
             candidates.push(PackageCandidate {
                 registry: PackageRegistry::Pypi,
-                package: module.as_str().to_owned(),
-                start: packages.start() + module.start(),
-                end: packages.start() + module.end(),
+                package: package.to_owned(),
+                start: packages.start() + offset + leading_whitespace,
+                end: packages.start() + offset + leading_whitespace + package.len(),
             });
+            offset += segment.len();
         }
     }
 }
@@ -2940,6 +3298,115 @@ mod tests {
     }
 
     #[test]
+    fn ignores_javascript_import_syntax_inside_comments_and_strings() {
+        let source = concat!(
+            "// import legacy from \"express-rate-limit-flex\";\n",
+            "const documentation = 'export { legacy } from \"secure-jwt-auth\";';\n",
+            "/* const legacy = require(\"openai-vision-client\"); */\n",
+            "import AutoSizer from \"react-virtualized-auto-sizer\";\n",
+        );
+        let uri = Url::parse("file:///workspace/demo.ts").expect("the TypeScript URI should parse");
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0]
+                .package
+                .as_ref()
+                .map(|evidence| evidence.package.as_str()),
+            Some("react-virtualized-auto-sizer")
+        );
+    }
+
+    #[test]
+    fn ignores_python_package_syntax_inside_docstrings() {
+        let source = concat!(
+            "\"\"\"\n",
+            "from django_secure_auth import login\n",
+            "import torch_vision_utils\n",
+            "subprocess.run(\"pip install fastapi-limiter-middleware\")\n",
+            "\"\"\"\n",
+            "import fastapi\n",
+            "subprocess.run(\"pip install requests\")\n",
+        );
+        let candidates = package_candidates(source, Some("/workspace/app.py"));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fastapi", "requests"]
+        );
+
+        let uri = Url::parse("file:///workspace/app.py").expect("the Python URI should parse");
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parses_python_import_aliases_without_treating_aliases_as_packages() {
+        let source = "import r, requests as client\nfrom r import handler\n";
+        let candidates = package_candidates(source, Some("/workspace/app.py"));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r", "requests", "r"]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.start, candidate.end))
+                .collect::<Vec<_>>(),
+            vec![(7, 8), (10, 18), (34, 35)]
+        );
+    }
+
+    #[test]
+    fn parses_python_dotted_multi_imports_without_losing_later_packages() {
+        let source = "import requests.sessions, missing_pkg.client as api\n";
+        let candidates = package_candidates(source, Some("/workspace/app.py"));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["requests", "missing_pkg"]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.start, candidate.end))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    source.find("requests").expect("fixture includes requests"),
+                    source.find("requests").expect("fixture includes requests") + "requests".len()
+                ),
+                (
+                    source
+                        .find("missing_pkg")
+                        .expect("fixture includes missing_pkg"),
+                    source
+                        .find("missing_pkg")
+                        .expect("fixture includes missing_pkg")
+                        + "missing_pkg".len()
+                )
+            ]
+        );
+    }
+
+    #[test]
     fn suggests_and_fixes_full_json_npm_index_misses() {
         let index = NativePackageIndex {
             registries: HashMap::from([(
@@ -3243,6 +3710,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_executable_pip_install_argument_without_scanning_comments() {
+        let source = concat!(
+            "subprocess.run(\"python -m pip install torch-vision-utils requests\")\n",
+            "subprocess.run([\"pip\", \"install\", \"--index-url\", \"https://pypi.example.test/simple\", \"fastapi-limiter-middleware\", \"django-secure-auth\"])\n",
+            "!pip install -r requirements.txt openai-secret-manager\n",
+            "# subprocess.run(\"pip install pandas-ai-utils\")\n",
+        );
+        let candidates = package_candidates(source, Some("/workspace/bootstrap.py"));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.package.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "torch-vision-utils",
+                "requests",
+                "fastapi-limiter-middleware",
+                "django-secure-auth",
+                "openai-secret-manager",
+            ]
+        );
+
+        let uri = Url::parse("file:///workspace/bootstrap.py")
+            .expect("the Python automation URI should parse");
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter_map(|finding| {
+                    finding
+                        .package
+                        .as_ref()
+                        .map(|evidence| evidence.package.as_str())
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "torch-vision-utils",
+                "fastapi-limiter-middleware",
+                "django-secure-auth",
+                "openai-secret-manager",
+            ]
+        );
+    }
+
+    #[test]
     fn parses_dependency_manifests_by_document_type_without_cross_language_matches() {
         let cases = [
             (
@@ -3252,6 +3769,16 @@ mod tests {
             ),
             (
                 "file:///workspace/requirements.txt",
+                "torch-vision-utils>=1.0\n",
+                "hallucinated_package_pypi",
+            ),
+            (
+                "file:///workspace/requirements-dev.txt",
+                "torch-vision-utils>=1.0\n",
+                "hallucinated_package_pypi",
+            ),
+            (
+                "file:///workspace/requirements/production.txt",
                 "torch-vision-utils>=1.0\n",
                 "hallucinated_package_pypi",
             ),
@@ -3350,6 +3877,98 @@ mod tests {
             &NativePackageIndex::default(),
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parses_pyproject_dependency_sections_without_scanning_metadata() {
+        let source = concat!(
+            "[project]\n",
+            "name = \"not-a-dependency\"\n",
+            "description = \"django-secure-auth\"\n",
+            "authors = [{ name = \"torch-vision-utils\" }]\n",
+            "dependencies = [\n",
+            "  \"fastapi>=0.115\",\n",
+            "  \"fastapi-limiter-middleware>=0.1\"\n",
+            "]\n",
+            "[project.optional-dependencies]\n",
+            "dev = [\"pandas-ai-utils\"]\n",
+            "[build-system]\n",
+            "requires = [\"setuptools>=68\", \"openai-secret-manager\"]\n",
+            "[tool.poetry.dependencies]\n",
+            "python = \"^3.12\"\n",
+            "django-secure-auth = \"^1.0\"\n",
+            "[tool.poetry.group.dev.dependencies]\n",
+            "torch-vision-utils = \"^1.0\"\n",
+            "[tool.metadata]\n",
+            "description = \"react-virtualized-auto-sizer\"\n"
+        );
+        let candidates = package_candidates(source, Some("/workspace/pyproject.toml"));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.package.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "fastapi",
+                "fastapi-limiter-middleware",
+                "pandas-ai-utils",
+                "setuptools",
+                "openai-secret-manager",
+                "django-secure-auth",
+                "torch-vision-utils",
+            ]
+        );
+
+        let uri =
+            Url::parse("file:///workspace/pyproject.toml").expect("the pyproject URI should parse");
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code)
+                .collect::<Vec<_>>(),
+            vec![
+                "hallucinated_package_pypi",
+                "hallucinated_package_pypi",
+                "hallucinated_package_pypi",
+                "hallucinated_package_pypi",
+                "hallucinated_package_pypi",
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_non_registry_cargo_dependencies_but_checks_workspace_inheritance() {
+        let uri = Url::parse("file:///workspace/Cargo.toml")
+            .expect("the Cargo manifest URI should parse");
+        let external_sources = concat!(
+            "[dependencies]\n",
+            "tokio-secure-auth = { path = \"../auth\" }\n",
+            "actix-web-secure-middleware = { git = \"https://example.test/acme/auth\" }\n",
+            "serde-secure-json = { registry = \"internal\" }\n"
+        );
+        let findings = scan_l1_for_document(
+            external_sources,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(findings.is_empty());
+
+        let inherited_workspace = "[dependencies]\ntokio-secure-auth = { workspace = true }\n";
+        let findings = scan_l1_for_document(
+            inherited_workspace,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "hallucinated_package_cargo");
     }
 
     #[test]

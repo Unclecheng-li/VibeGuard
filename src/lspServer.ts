@@ -42,6 +42,7 @@ import {
   syncConfiguredPackageIndexesInBackground,
   type PackageCacheSyncTier
 } from "./package/configSync";
+import { isRequirementsManifestPath } from "./package/packageParser";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
@@ -98,7 +99,7 @@ const l2Timers = new Map<string, NodeJS.Timeout>();
 const l3Timers = new Map<string, NodeJS.Timeout>();
 const remotePackageTimers = new Map<string, NodeJS.Timeout>();
 const documentRevisions = new Map<string, number>();
-const criticalPopupSeen = new Set<string>();
+const criticalPopupSeenByUri = new Map<string, Set<string>>();
 let workspaceRoots: string[] = [];
 let packageSyncInFlight = false;
 let packageSyncQueued = false;
@@ -156,6 +157,7 @@ documents.onDidClose((event) => {
   clearDocumentTimers(event.document.uri);
   documentRevisions.delete(event.document.uri);
   findingsByUri.delete(event.document.uri);
+  criticalPopupSeenByUri.delete(event.document.uri);
   connection.sendDiagnostics({
     uri: event.document.uri,
     diagnostics: []
@@ -309,7 +311,7 @@ function scheduleLayerValidation(document: TextDocument, revision: number, layer
         return;
       }
       void validateDocument(document, revision, {
-        layers: layer === "l2" ? { l2: true } : { l2: settings.enableL2, l3: true }
+        layers: layer === "l2" ? { l2: true } : { l3: true }
       });
     }, delay)
   );
@@ -599,10 +601,8 @@ function withPackageCacheLanguages(config: VibeGuardConfig, languages: PackageRe
 async function detectWorkspacePackageRegistries(): Promise<PackageRegistry[]> {
   const manifests: Array<[PackageRegistry, string[]]> = [
     ["npm", ["package.json"]],
-    ["pypi", ["requirements.txt", "pyproject.toml"]],
     ["cargo", ["Cargo.toml"]],
-    ["gomod", ["go.mod"]],
-    ["maven", ["pom.xml", "build.gradle", "build.gradle.kts"]]
+    ["gomod", ["go.mod"]]
   ];
   const roots = workspaceRoots.length > 0 ? workspaceRoots : [process.cwd()];
   const detected = await Promise.all(
@@ -611,7 +611,65 @@ async function detectWorkspacePackageRegistries(): Promise<PackageRegistry[]> {
       return (await Promise.all(candidates.map(fileExists))).some(Boolean) ? registry : undefined;
     })
   );
-  return detected.filter(isPackageRegistry);
+  const hasPypiManifest = (await Promise.all(roots.map(workspaceRootHasPypiManifest))).some(Boolean);
+  const hasMavenManifest = (await Promise.all(roots.map(workspaceRootHasMavenManifest))).some(Boolean);
+  return [
+    ...(detected.includes("npm") ? ["npm" as const] : []),
+    ...(hasPypiManifest ? ["pypi" as const] : []),
+    ...detected.filter((registry): registry is PackageRegistry => registry !== "npm" && isPackageRegistry(registry)),
+    ...(hasMavenManifest ? ["maven" as const] : [])
+  ];
+}
+
+async function workspaceRootHasPypiManifest(root: string): Promise<boolean> {
+  if (await fileExists(path.join(root, "pyproject.toml"))) {
+    return true;
+  }
+  let entries: import("fs").Dirent[];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  if (entries.some((entry) => entry.isFile() && isRequirementsManifestPath(path.join(root, entry.name)))) {
+    return true;
+  }
+  const requirementsDirectory = entries.find((entry) => entry.isDirectory() && entry.name.toLowerCase() === "requirements");
+  if (!requirementsDirectory) {
+    return false;
+  }
+  try {
+    const requirementsEntries = await fs.readdir(path.join(root, requirementsDirectory.name), { withFileTypes: true });
+    return requirementsEntries.some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".txt"));
+  } catch {
+    return false;
+  }
+}
+
+async function workspaceRootHasMavenManifest(root: string): Promise<boolean> {
+  const directManifests = ["pom.xml", "build.gradle", "build.gradle.kts"];
+  if ((await Promise.all(directManifests.map((fileName) => fileExists(path.join(root, fileName))))).some(Boolean)) {
+    return true;
+  }
+  let entries: import("fs").Dirent[];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  if (entries.some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".versions.toml"))) {
+    return true;
+  }
+  const gradleDirectory = entries.find((entry) => entry.isDirectory() && entry.name.toLowerCase() === "gradle");
+  if (!gradleDirectory) {
+    return false;
+  }
+  try {
+    const gradleEntries = await fs.readdir(path.join(root, gradleDirectory.name), { withFileTypes: true });
+    return gradleEntries.some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".versions.toml"));
+  } catch {
+    return false;
+  }
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -816,17 +874,18 @@ async function validateDocument(document: TextDocument, revision: number, option
 }
 
 function maybeShowCriticalPopup(documentUri: string, findings: Finding[]): void {
+  const popupSeen = activeCriticalPopupIds(documentUri, findings);
   if (settings.showCriticalPopups === false) {
     return;
   }
   const critical = findings.find(
-    (finding) => finding.severity === "critical" && !finding.dismissed && !criticalPopupSeen.has(finding.id)
+    (finding) => finding.severity === "critical" && !finding.dismissed && !popupSeen.has(finding.id)
   );
   if (!critical) {
     return;
   }
 
-  criticalPopupSeen.add(critical.id);
+  popupSeen.add(critical.id);
   const actions = criticalPopupActions(critical);
   void connection.window
     .showWarningMessage(criticalAlertMessage(critical), ...actions)
@@ -1029,6 +1088,26 @@ async function createLspL3Analyzer(): Promise<LlmSemanticAnalyzer | undefined> {
     // LSP settings may come from a workspace; keep a Pro credential on its configured service origin.
     baseUrl: provider === "vibeguard" ? undefined : settings.llmBaseUrl
   });
+}
+
+function activeCriticalPopupIds(documentUri: string, findings: Finding[]): Set<string> {
+  const activeIds = new Set(
+    findings
+      .filter((finding) => finding.severity === "critical" && !finding.dismissed)
+      .map((finding) => finding.id)
+  );
+  const seen = criticalPopupSeenByUri.get(documentUri) ?? new Set<string>();
+  for (const findingId of seen) {
+    if (!activeIds.has(findingId)) {
+      seen.delete(findingId);
+    }
+  }
+  if (seen.size > 0 || activeIds.size > 0) {
+    criticalPopupSeenByUri.set(documentUri, seen);
+  } else {
+    criticalPopupSeenByUri.delete(documentUri);
+  }
+  return seen;
 }
 
 function rememberStoredLlmCredential(provider: LlmProvider): Promise<string | undefined> {

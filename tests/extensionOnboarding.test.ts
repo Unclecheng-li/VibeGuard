@@ -93,6 +93,20 @@ test("VSCode scans deployment files that can run pip install", async () => {
   assert.match(source, /\*\*\/\{Dockerfile,dockerfile\}/);
 });
 
+test("VSCode supports profiled and directory requirements manifests", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /isRequirementsManifestPath/);
+  assert.match(source, /\*\*\/requirements\*\.txt/);
+  assert.match(source, /\*\*\/requirements\/\*\*\/\*\.txt/);
+});
+
+test("VSCode recognizes Gradle version catalogs for Maven cache preparation", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /\*\*\/\*\.versions\.toml/);
+});
+
 test("VSCode defers remote package verification outside the realtime L1 path", async () => {
   const source = await fs.readFile("src/extension.ts", "utf8");
 
@@ -115,4 +129,13 @@ test("critical VSCode alerts provide local finding details before the user dismi
   assert.match(source, /Rule: \$\{finding\.detection_rule\}/);
   assert.match(source, /Evidence: \$\{finding\.evidence\}/);
   assert.match(source, /Available fix: \$\{finding\.fix\.description\}/);
+});
+
+test("critical VSCode alerts are released after the finding is resolved", async () => {
+  const source = await fs.readFile("src/extension.ts", "utf8");
+
+  assert.match(source, /popupSeenByUri = new Map<string, Set<string>>\(\)/);
+  assert.match(source, /function activeCriticalPopupIds\(documentUri: string, findings: Finding\[\]\)/);
+  assert.match(source, /popupSeenByUri\.delete\(documentUri\)/);
+  assert.match(source, /popupSeenByUri\.delete\(document\.uri\.toString\(\)\)/);
 });

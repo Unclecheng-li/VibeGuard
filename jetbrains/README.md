@@ -31,12 +31,14 @@ For an explicit native preview, build [`../rust-lsp/`](../rust-lsp/) and set `VI
 resulting executable. The equivalent Java system property is `vibeguard.native.lsp.path`. This takes precedence over
 the Node settings and starts the binary with `--stdio`, so Node is not needed for that preview. The native server
 currently covers local L1 package-seed checks across imports and `package.json`, `requirements.txt`, `pyproject.toml`,
-Cargo manifests, `go.mod`, Maven POM files, Gradle build scripts, and `*.versions.toml` catalogs; provider and high-entropy secrets with
+Cargo manifests, `go.mod`, Maven POM files, Gradle build scripts, and `*.versions.toml` catalogs. JavaScript and TypeScript import examples inside comments or string literals are ignored. Python import and `pip install` examples inside docstrings are also ignored. Python automation commands, notebook cells, Dockerfiles, shell/PowerShell scripts, and YAML CI steps check every executable `pip install` package argument while ignoring command options and comments; provider and high-entropy secrets with
 conservative false-positive filtering, unsafe-configuration, and high-confidence AI-error-pattern
 diagnostics. It provides standard LSP quick fixes for safe npm seed and full-index-confirmed similar npm replacements,
 plus mechanical configuration changes,
 plus line, file, global-rule, and package ignore actions persisted to the shared `~/.vibeguard/ignore-rules.yml` file.
 Cargo aliases declared with `package = "crate-name"` are checked as `crate-name`, not as their local alias key.
+Dependencies with explicit Cargo `path`, `git`, or custom `registry` sources are not checked against crates.io, while `workspace = true` remains eligible.
+For `pyproject.toml`, package checks are limited to PEP 621, build-system, and Poetry dependency sections rather than project metadata.
 Set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to use an alternate shared-rule path in a managed or test environment.
 In the background it reads the shared SQLite package cache at `~/.vibeguard/packages.db` without modifying it (or the
 `VIBEGUARD_NATIVE_PACKAGE_SQLITE_PATH` override), then falls back per registry to the gzip/JSON index at

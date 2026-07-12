@@ -20,6 +20,16 @@ test("replaceAll drops findings from layers that did not run", () => {
   assert.deepEqual(merged.map((item) => item.id), ["new-l1"]);
 });
 
+test("replaces deferred L3 findings without re-running or clearing L2", () => {
+  const existing = [finding("old-l1", "L1"), finding("old-l2", "L2"), finding("old-l3", "L3")];
+  const merged = mergeFindingsForExecutedLayers(existing, [finding("new-l3", "L3")], { l3: true });
+
+  assert.deepEqual(
+    merged.map((item) => item.id).sort(),
+    ["new-l3", "old-l1", "old-l2"]
+  );
+});
+
 function finding(id: string, layer: DetectionLayer): Finding {
   return {
     id,

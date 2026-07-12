@@ -13,6 +13,19 @@
 - Native Rust LSP package checks now select parsers by document type, covering `package.json`, `requirements.txt`, `pyproject.toml`, Cargo manifests (including renamed dependencies), `go.mod`, Maven POM files, Gradle build scripts, and `*.versions.toml` catalogs without applying manifest syntax to unrelated source files.
 - Package manifest parsing now skips explicit local npm protocols (`workspace:`, `file:`, `link:`, and `portal:`), preventing monorepo and path dependencies from being checked against the public npm registry in the Node service or native Rust preview.
 - Cargo manifest aliases using `alias = { package = "crate-name", ... }` now resolve and validate `crate-name` in the Node service, matching the native Rust LSP behavior.
+- Cargo dependencies with explicit `path`, `git`, or custom `registry` sources now skip crates.io checks in both services, while `workspace = true` dependencies remain eligible for the workspace's registry-backed declaration.
+- Pyproject parsing now targets PEP 621 dependencies, optional dependencies, build-system requirements, and Poetry dependency sections instead of treating project metadata strings or arrays as PyPI packages.
+- The native Rust LSP now checks every package argument in executable `pip install` commands, including Python automation, notebook commands, Dockerfiles, shell/PowerShell scripts, and YAML CI steps while ignoring options and comments.
+- JavaScript and TypeScript package extraction now ignores `import`, `export`, and `require` examples inside comments or string literals in both the Node service and native Rust LSP.
+- Python import and `pip install` extraction now ignores docstring examples and keeps `import` matching on a single physical line, avoiding false package names that span subsequent code.
+- Python multi-import extraction now preserves each package's exact location, supports `as` aliases, and avoids treating aliases as PyPI packages in both services.
+- The native Rust LSP now keeps parsing comma-separated Python imports after dotted modules and checks each import's root PyPI package.
+- Requirements parsing now keeps indented and unpinned dependencies with inline comments visible to package verification.
+- Python package verification now also recognizes profiled `requirements-*.txt` files and `.txt` manifests under a `requirements/` directory.
+- VS Code and the shared LSP now prioritize PyPI cache preparation when those profiled or directory-based requirements manifests are present.
+- VS Code and the shared LSP now also prioritize Maven cache preparation for Gradle `*.versions.toml` catalogs.
+- Deferred L3 LSP validation now preserves the latest L1/L2 findings without rerunning L2, reducing redundant SAST work after an edit.
+- Critical IDE alerts now reset after their finding is resolved, so reintroduced risks are surfaced again without retaining a permanent global alert history.
 - Added a reproducible CLI demo video generated from the deliberately unsafe sample scan, covering hallucinated packages, hardcoded secrets, and DOM XSS.
 - Kotlin source and script imports now use the same conservative Maven class lookup as Java, including Kotlin aliases while excluding JVM platform, wildcard, and lower-case top-level function imports.
 - Local findings history now enforces its 100 MB on-disk budget across SQLite and WAL sidecars, compacts oldest disposable history when necessary, and preserves the current scan or audit event rather than silently dropping it.

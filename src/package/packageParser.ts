@@ -122,7 +122,7 @@ export function parsePackageReferences(filePath: string, text: string, languageI
   if (fileName === "package.json") {
     return parsePackageJson(filePath, text);
   }
-  if (fileName === "requirements.txt") {
+  if (isRequirementsManifestPath(filePath)) {
     return parseRequirements(filePath, text);
   }
   if (fileName === "pyproject.toml") {
@@ -168,8 +168,18 @@ export function parsePackageReferences(filePath: string, text: string, languageI
   return [];
 }
 
+export function isRequirementsManifestPath(filePath: string): boolean {
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const fileName = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
+  if (/^requirements(?:[-_.][a-z0-9][a-z0-9_.-]*)?\.txt$/.test(fileName)) {
+    return true;
+  }
+  return /(?:^|\/)requirements\/[^/]+\.txt$/i.test(normalizedPath);
+}
+
 function parseJavaScriptImports(filePath: string, text: string): PackageReference[] {
   const references: PackageReference[] = [];
+  const codeMask = createJavaScriptCodeMask(text);
   const regexes = [
     /(?:import|export)\s+(?:type\s+)?(?:[^"'`]+?\s+from\s*)?["']([^"']+)["']/g,
     /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
@@ -179,16 +189,156 @@ function parseJavaScriptImports(filePath: string, text: string): PackageReferenc
   for (const regex of regexes) {
     regex.lastIndex = 0;
     for (const match of text.matchAll(regex)) {
+      const matchIndex = match.index ?? 0;
+      if (!codeMask[matchIndex]) {
+        continue;
+      }
       const specifier = match[1] ?? "";
       const packageName = normalizeNpmPackage(specifier);
       if (!packageName) {
         continue;
       }
-      references.push(makeReference(filePath, text, "npm", packageName, specifier, match.index ?? 0, match[0], "import"));
+      references.push(makeReference(filePath, text, "npm", packageName, specifier, matchIndex, match[0], "import"));
     }
   }
 
   return dedupeReferences(references);
+}
+
+function createJavaScriptCodeMask(text: string): Uint8Array {
+  const codeMask = new Uint8Array(text.length);
+  let index = 0;
+  let state: "code" | "line-comment" | "block-comment" | "single-quote" | "double-quote" | "template" = "code";
+
+  while (index < text.length) {
+    const character = text[index];
+    const next = text[index + 1];
+    if (state === "code") {
+      if (character === "/" && next === "/") {
+        state = "line-comment";
+        index += 2;
+        continue;
+      }
+      if (character === "/" && next === "*") {
+        state = "block-comment";
+        index += 2;
+        continue;
+      }
+      if (character === "'") {
+        state = "single-quote";
+        index += 1;
+        continue;
+      }
+      if (character === '"') {
+        state = "double-quote";
+        index += 1;
+        continue;
+      }
+      if (character === "`") {
+        state = "template";
+        index += 1;
+        continue;
+      }
+      codeMask[index] = 1;
+      index += 1;
+      continue;
+    }
+
+    if (state === "line-comment") {
+      if (character === "\n" || character === "\r") {
+        state = "code";
+      }
+      index += 1;
+      continue;
+    }
+    if (state === "block-comment") {
+      if (character === "*" && next === "/") {
+        state = "code";
+        index += 2;
+      } else {
+        index += 1;
+      }
+      continue;
+    }
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if ((state === "single-quote" && character === "'") || (state === "double-quote" && character === '"') || (state === "template" && character === "`")) {
+      state = "code";
+    }
+    index += 1;
+  }
+
+  return codeMask;
+}
+
+function createPythonCodeMask(text: string): Uint8Array {
+  const codeMask = new Uint8Array(text.length);
+  let index = 0;
+  let state: "code" | "line-comment" | "single-quote" | "double-quote" | "triple-single" | "triple-double" = "code";
+
+  while (index < text.length) {
+    const character = text[index];
+    const triple = text.slice(index, index + 3);
+    if (state === "code") {
+      if (character === "#") {
+        state = "line-comment";
+        index += 1;
+        continue;
+      }
+      if (triple === "'''") {
+        state = "triple-single";
+        index += 3;
+        continue;
+      }
+      if (triple === '\"\"\"') {
+        state = "triple-double";
+        index += 3;
+        continue;
+      }
+      if (character === "'") {
+        state = "single-quote";
+        index += 1;
+        continue;
+      }
+      if (character === '"') {
+        state = "double-quote";
+        index += 1;
+        continue;
+      }
+      codeMask[index] = 1;
+      index += 1;
+      continue;
+    }
+
+    if (state === "line-comment") {
+      if (character === "\n" || character === "\r") {
+        state = "code";
+      }
+      index += 1;
+      continue;
+    }
+    if ((state === "triple-single" && triple === "'''") || (state === "triple-double" && triple === '\"\"\"')) {
+      state = "code";
+      index += 3;
+      continue;
+    }
+    if (state === "triple-single" || state === "triple-double") {
+      index += 1;
+      continue;
+    }
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if ((state === "single-quote" && character === "'") || (state === "double-quote" && character === '"')) {
+      state = "code";
+    }
+    index += 1;
+  }
+
+  return codeMask;
 }
 
 function parsePackageJson(filePath: string, text: string): PackageReference[] {
@@ -230,36 +380,70 @@ function isLocalNpmSpecifier(value: unknown): boolean {
 
 function parsePythonImports(filePath: string, text: string): PackageReference[] {
   const references: PackageReference[] = [];
-  const importRegex = /^\s*import\s+([A-Za-z_][A-Za-z0-9_.,\s]*)/gm;
-  const fromRegex = /^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\b/gm;
+  const codeMask = createPythonCodeMask(text);
+  const importRegex = /^[ \t]*import[ \t]+([A-Za-z_][A-Za-z0-9_., \t]*)/gm;
+  const fromRegex = /^[ \t]*from[ \t]+([A-Za-z_][A-Za-z0-9_.]*)[ \t]+import\b/gm;
 
   for (const match of text.matchAll(importRegex)) {
-    const modules = (match[1] ?? "").split(",");
-    for (const moduleName of modules) {
-      const raw = moduleName.trim().split(/\s+as\s+/i)[0];
-      addPythonReference(references, filePath, text, raw, match.index ?? 0, match[0], "import");
+    const matchIndex = match.index ?? 0;
+    if (!codeMask[matchIndex]) {
+      continue;
+    }
+    const modules = match[1] ?? "";
+    const modulesOffset = /^[ \t]*import[ \t]+/.exec(match[0])?.[0].length ?? 0;
+    let offset = 0;
+    for (const moduleName of modules.split(",")) {
+      const trimmedModule = moduleName.trimStart();
+      const raw = trimmedModule.split(/\s+as\s+/i)[0] ?? "";
+      if (raw) {
+        addPythonReference(
+          references,
+          filePath,
+          text,
+          raw,
+          matchIndex + modulesOffset + offset + moduleName.length - trimmedModule.length,
+          raw,
+          "import"
+        );
+      }
+      offset += moduleName.length + 1;
     }
   }
 
   for (const match of text.matchAll(fromRegex)) {
-    addPythonReference(references, filePath, text, match[1] ?? "", match.index ?? 0, match[0], "import");
+    const matchIndex = match.index ?? 0;
+    if (codeMask[matchIndex]) {
+      const raw = match[1] ?? "";
+      addPythonReference(
+        references,
+        filePath,
+        text,
+        raw,
+        matchIndex + (/^[ \t]*from[ \t]+/.exec(match[0])?.[0].length ?? 0),
+        raw,
+        "import"
+      );
+    }
   }
 
-  references.push(...parsePipInstallCommands(filePath, text));
+  references.push(...parsePipInstallCommands(filePath, text, codeMask));
   return dedupeReferences(references).sort((left, right) => left.line - right.line || left.column - right.column);
 }
 
-function parsePipInstallCommands(filePath: string, text: string): PackageReference[] {
+function parsePipInstallCommands(filePath: string, text: string, codeMask?: Uint8Array): PackageReference[] {
   const references: PackageReference[] = [];
   const stringCommand = /\b(?:subprocess\.(?:run|call|check_call)|os\.system)\s*\(\s*["'](?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^"'\r\n]+)/gi;
-  const arrayCommand = /\bsubprocess\.(?:run|call|check_call)\s*\(\s*\[\s*["']pip(?:3)?["']\s*,\s*["']install["']\s*,\s*["']([^"'\r\n]+)["']/gi;
+  const arrayCommand = /\bsubprocess\.(?:run|call|check_call)\s*\(\s*\[\s*["']pip(?:3)?["']\s*,\s*["']install["']\s*,\s*([^\]\r\n]+)\]/gi;
   const notebookCommand = /^\s*!\s*(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^\r\n#]+)/gim;
   const scriptCommand = /^\s*(?:-\s+)?(?:run:\s*)?(?:RUN\s+)?(?:sudo\s+)?(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pip(?:3)?\s+install\s+([^\r\n#]+)/gim;
 
-  for (const command of [stringCommand, arrayCommand, notebookCommand, scriptCommand]) {
+  for (const command of [stringCommand, notebookCommand, scriptCommand]) {
     for (const match of text.matchAll(command)) {
       const argumentsText = match[1] ?? "";
       const matchIndex = match.index ?? 0;
+      if ((codeMask && !codeMask[matchIndex]) || hasUnquotedLineCommentBefore(text, matchIndex)) {
+        continue;
+      }
       const argumentsOffset = match[0].indexOf(argumentsText);
       addPipArgumentReferences(
         references,
@@ -269,6 +453,16 @@ function parsePipInstallCommands(filePath: string, text: string): PackageReferen
         matchIndex + Math.max(0, argumentsOffset)
       );
     }
+  }
+
+  for (const match of text.matchAll(arrayCommand)) {
+    const argumentsText = match[1] ?? "";
+    const matchIndex = match.index ?? 0;
+    if ((codeMask && !codeMask[matchIndex]) || hasUnquotedLineCommentBefore(text, matchIndex)) {
+      continue;
+    }
+    const argumentsOffset = match[0].indexOf(argumentsText);
+    addPipArrayReferences(references, filePath, text, argumentsText, matchIndex + Math.max(0, argumentsOffset));
   }
   return references;
 }
@@ -280,66 +474,213 @@ function addPipArgumentReferences(
   argumentsText: string,
   argumentsIndex: number
 ): void {
-  const flagsWithValues = new Set(["-r", "--requirement", "-c", "--constraint", "-f", "--find-links", "--index-url", "--extra-index-url", "--trusted-host"]);
   let skipNext = false;
   const tokenRegex = /[^\s]+/g;
   for (const tokenMatch of argumentsText.matchAll(tokenRegex)) {
     const token = tokenMatch[0];
-    if (skipNext) {
-      skipNext = false;
-      continue;
-    }
-    if (flagsWithValues.has(token)) {
-      skipNext = true;
-      continue;
-    }
-    if (token.startsWith("-")) {
-      continue;
-    }
-    const packageMatch = /^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?(?:[<>=!~].*)?$/.exec(token);
-    const rawPackageName = packageMatch?.[1];
-    if (!rawPackageName) {
-      continue;
-    }
-    const packageName = normalizePypiPackage(rawPackageName);
-    if (!packageName) {
-      continue;
-    }
-    const tokenIndex = tokenMatch.index ?? 0;
-    references.push(
-      makeReference(filePath, text, "pypi", packageName, rawPackageName, argumentsIndex + tokenIndex, rawPackageName, "install")
+    skipNext = addPipPackageToken(
+      references,
+      filePath,
+      text,
+      token,
+      argumentsIndex + (tokenMatch.index ?? 0),
+      skipNext
     );
   }
 }
 
+function addPipArrayReferences(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  argumentsText: string,
+  argumentsIndex: number
+): void {
+  let skipNext = false;
+  const quotedArgument = /["']([^"'\r\n]+)["']/g;
+  for (const match of argumentsText.matchAll(quotedArgument)) {
+    const token = match[1] ?? "";
+    const tokenIndex = argumentsIndex + (match.index ?? 0) + 1;
+    skipNext = addPipPackageToken(references, filePath, text, token, tokenIndex, skipNext);
+  }
+}
+
+function addPipPackageToken(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  token: string,
+  tokenIndex: number,
+  skipNext: boolean
+): boolean {
+  if (skipNext) {
+    return false;
+  }
+  const flagsWithValues = new Set(["-r", "--requirement", "-c", "--constraint", "-f", "--find-links", "--index-url", "--extra-index-url", "--trusted-host"]);
+  if (flagsWithValues.has(token)) {
+    return true;
+  }
+  if (token.startsWith("-") || token.startsWith("#")) {
+    return false;
+  }
+  const packageMatch = /^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?(?:[<>=!~].*)?$/.exec(token);
+  const rawPackageName = packageMatch?.[1];
+  if (!rawPackageName) {
+    return false;
+  }
+  const packageName = normalizePypiPackage(rawPackageName);
+  if (!packageName) {
+    return false;
+  }
+  references.push(makeReference(filePath, text, "pypi", packageName, rawPackageName, tokenIndex, rawPackageName, "install"));
+  return false;
+}
+
+function hasUnquotedLineCommentBefore(text: string, index: number): boolean {
+  const lineStart = text.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  for (let cursor = lineStart; cursor < index; cursor += 1) {
+    const character = text[cursor];
+    const escaped = text[cursor - 1] === "\\";
+    if (character === "'" && !inDoubleQuote && !escaped) {
+      inSingleQuote = !inSingleQuote;
+    } else if (character === '"' && !inSingleQuote && !escaped) {
+      inDoubleQuote = !inDoubleQuote;
+    } else if (character === "#" && !inSingleQuote && !inDoubleQuote) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function parseRequirements(filePath: string, text: string): PackageReference[] {
   const references: PackageReference[] = [];
-  const lineRegex = /^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?\s*(?:[<>=!~]=?.*)?$/gm;
+  const lineRegex = /^.*$/gm;
   for (const match of text.matchAll(lineRegex)) {
-    const fullLine = match[0].trim();
+    const line = match[0];
+    const fullLine = stripRequirementsComment(line).trim();
     if (!fullLine || fullLine.startsWith("#") || fullLine.startsWith("-")) {
       continue;
     }
-    const packageName = normalizePypiPackage(match[1] ?? "");
+    const rawPackageName = /^([A-Za-z0-9_.-]+)(?:\[[^\]]+])?\s*(?:[<>=!~]=?.*)?$/.exec(fullLine)?.[1];
+    const packageName = normalizePypiPackage(rawPackageName ?? "");
     if (!packageName) {
       continue;
     }
-    references.push(makeReference(filePath, text, "pypi", packageName, match[1] ?? "", match.index ?? 0, match[0], "manifest"));
+    const rawOffset = line.indexOf(rawPackageName ?? "");
+    if (rawOffset === -1) {
+      continue;
+    }
+    references.push(
+      makeReference(
+        filePath,
+        text,
+        "pypi",
+        packageName,
+        rawPackageName ?? "",
+        (match.index ?? 0) + rawOffset,
+        rawPackageName ?? "",
+        "manifest"
+      )
+    );
   }
   return dedupeReferences(references);
 }
 
+function stripRequirementsComment(line: string): string {
+  const commentOffset = line.search(/[ \t]#/);
+  return commentOffset === -1 ? line : line.slice(0, commentOffset);
+}
+
 function parsePyproject(filePath: string, text: string): PackageReference[] {
   const references: PackageReference[] = [];
+  let section = "";
+  let dependencyArrayOpen = false;
+  const lineRegex = /^.*$/gm;
+
+  for (const match of text.matchAll(lineRegex)) {
+    const line = match[0];
+    const lineStart = match.index ?? 0;
+    const stripped = stripTomlComment(line).trim();
+    if (!stripped) {
+      continue;
+    }
+    const sectionHeader = /^\[([^\]]+)]$/.exec(stripped)?.[1];
+    if (sectionHeader) {
+      section = sectionHeader.trim().toLowerCase();
+      dependencyArrayOpen = false;
+      continue;
+    }
+
+    if (isPoetryDependencySection(section)) {
+      const dependency = /^(?:["']?)([A-Za-z0-9_.-]+)(?:["']?)\s*=/.exec(stripped)?.[1];
+      if (dependency && dependency.toLowerCase() !== "python") {
+        addPyprojectDependencyReference(references, filePath, text, line, lineStart, dependency);
+      }
+    }
+
+    if (dependencyArrayOpen || startsPyprojectDependencyArray(section, stripped)) {
+      addPyprojectArrayReferences(references, filePath, text, line, lineStart);
+      dependencyArrayOpen = !stripped.includes("]");
+    }
+  }
+  return dedupeReferences(references);
+}
+
+function isPoetryDependencySection(section: string): boolean {
+  return section === "tool.poetry.dependencies" || (section.startsWith("tool.poetry.group.") && section.endsWith(".dependencies"));
+}
+
+function startsPyprojectDependencyArray(section: string, line: string): boolean {
+  if (!line.includes("=") || !line.includes("[")) {
+    return false;
+  }
+  if (section === "project") {
+    return /^dependencies\s*=/.test(line);
+  }
+  if (section === "build-system") {
+    return /^requires\s*=/.test(line);
+  }
+  return section === "project.optional-dependencies";
+}
+
+function addPyprojectArrayReferences(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  line: string,
+  lineStart: number
+): void {
   const dependencyRegex = /["']([A-Za-z0-9_.-]+)(?:\[[^\]]+])?(?:[<>=!~]=?[^"']*)?["']/g;
-  for (const match of text.matchAll(dependencyRegex)) {
-    const packageName = normalizePypiPackage(match[1] ?? "");
+  for (const match of line.matchAll(dependencyRegex)) {
+    const rawPackageName = match[1] ?? "";
+    const packageName = normalizePypiPackage(rawPackageName);
     if (!packageName) {
       continue;
     }
-    references.push(makeReference(filePath, text, "pypi", packageName, match[1] ?? "", match.index ?? 0, match[0], "manifest"));
+    references.push(
+      makeReference(filePath, text, "pypi", packageName, rawPackageName, lineStart + (match.index ?? 0), match[0], "manifest")
+    );
   }
-  return dedupeReferences(references);
+}
+
+function addPyprojectDependencyReference(
+  references: PackageReference[],
+  filePath: string,
+  text: string,
+  line: string,
+  lineStart: number,
+  rawPackageName: string
+): void {
+  const packageName = normalizePypiPackage(rawPackageName);
+  if (!packageName) {
+    return;
+  }
+  const index = line.indexOf(rawPackageName);
+  references.push(
+    makeReference(filePath, text, "pypi", packageName, rawPackageName, lineStart + Math.max(0, index), rawPackageName, "manifest")
+  );
 }
 
 function parseCargoToml(filePath: string, text: string): PackageReference[] {
@@ -363,6 +704,9 @@ function parseCargoToml(filePath: string, text: string): PackageReference[] {
     if (!inDependencySection) {
       continue;
     }
+    if (isCargoNonRegistryDependency(stripped)) {
+      continue;
+    }
 
     const dep = stripped.match(/^([A-Za-z0-9_-]+)\s*=/);
     const packageName = /\bpackage\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(stripped)?.[1] ?? dep?.[1];
@@ -376,6 +720,10 @@ function parseCargoToml(filePath: string, text: string): PackageReference[] {
   }
 
   return dedupeReferences(references);
+}
+
+function isCargoNonRegistryDependency(line: string): boolean {
+  return /\b(?:path|git|registry)\s*=\s*["']/.test(line);
 }
 
 function parseRustImports(filePath: string, text: string): PackageReference[] {

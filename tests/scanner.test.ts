@@ -49,6 +49,113 @@ test("detects known hallucinated npm packages from the seed catalog", async () =
   assert.equal(result.findings[0].fix?.edits[0].newText, "react-virtualized");
 });
 
+test("ignores JavaScript package syntax inside comments and string literals", async () => {
+  const text = [
+    '// import legacy from "express-rate-limit-flex";',
+    'const documentation = \'export { legacy } from "secure-jwt-auth";\';',
+    '/* const legacy = require("openai-vision-client"); */',
+    'import AutoSizer from "react-virtualized-auto-sizer";'
+  ].join("\n");
+  const references = parsePackageReferences("demo.ts", text, "typescript");
+  assert.deepEqual(references.map((reference) => reference.packageName), ["react-virtualized-auto-sizer"]);
+
+  const result = await scanSourceFile(
+    {
+      filePath: "demo.ts",
+      languageId: "typescript",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].evidence, "react-virtualized-auto-sizer");
+});
+
+test("ignores Python package syntax inside docstrings and keeps import matching on one line", async () => {
+  const text = [
+    '"""',
+    "from django_secure_auth import login",
+    "import torch_vision_utils",
+    'subprocess.run("pip install fastapi-limiter-middleware")',
+    '"""',
+    "import fastapi",
+    'subprocess.run("pip install requests")'
+  ].join("\n");
+  const references = parsePackageReferences("app.py", text, "python");
+  assert.deepEqual(references.map((reference) => reference.packageName), ["fastapi", "requests"]);
+
+  const result = await scanSourceFile(
+    {
+      filePath: "app.py",
+      languageId: "python",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.deepEqual(result.findings, []);
+});
+
+test("tracks each Python import package at its exact position across aliases", () => {
+  const text = "import r, requests as client\nfrom r import handler";
+  const references = parsePackageReferences("app.py", text, "python");
+  assert.deepEqual(
+    references.map(({ packageName, line, column, endColumn }) => ({ packageName, line, column, endColumn })),
+    [
+      { packageName: "r", line: 1, column: 8, endColumn: 9 },
+      { packageName: "requests", line: 1, column: 11, endColumn: 19 },
+      { packageName: "r", line: 2, column: 6, endColumn: 7 }
+    ]
+  );
+});
+
+test("parses indented and unpinned requirements with inline comments", async () => {
+  const text = [
+    "requests # latest supported release",
+    "  flask>=3 # web server",
+    "torch-vision-utils[speed] # package typo",
+    "-r shared-requirements.txt"
+  ].join("\n");
+  const references = parsePackageReferences("requirements.txt", text, "python");
+  assert.deepEqual(
+    references.map(({ packageName, line, column }) => ({ packageName, line, column })),
+    [
+      { packageName: "requests", line: 1, column: 1 },
+      { packageName: "flask", line: 2, column: 3 },
+      { packageName: "torch-vision-utils", line: 3, column: 1 }
+    ]
+  );
+
+  const result = await scanSourceFile(
+    {
+      filePath: "requirements.txt",
+      languageId: "python",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.deepEqual(result.findings.map((finding) => finding.evidence), ["torch-vision-utils"]);
+});
+
+test("parses named and grouped requirements manifests", () => {
+  for (const filePath of ["requirements-dev.txt", "requirements/production.txt"]) {
+    const references = parsePackageReferences(filePath, "torch-vision-utils>=1\n", "python");
+    assert.deepEqual(references.map((reference) => reference.packageName), ["torch-vision-utils"]);
+  }
+  assert.deepEqual(parsePackageReferences("notes.txt", "torch-vision-utils>=1\n", "plaintext"), []);
+});
+
 test("skips local workspace and path package manifest references", async () => {
   const text = `{
   "dependencies": {
@@ -77,12 +184,66 @@ test("skips local workspace and path package manifest references", async () => {
   assert.equal(result.findings.length, 0);
 });
 
+test("parses pyproject dependency sections without scanning project metadata", async () => {
+  const text = [
+    "[project]",
+    'name = "not-a-dependency"',
+    'description = "django-secure-auth"',
+    'authors = [{ name = "torch-vision-utils" }]',
+    "dependencies = [",
+    '  "fastapi>=0.115",',
+    '  "fastapi-limiter-middleware>=0.1"',
+    "]",
+    "[project.optional-dependencies]",
+    'dev = ["pandas-ai-utils"]',
+    "[build-system]",
+    'requires = ["setuptools>=68", "openai-secret-manager"]',
+    "[tool.poetry.dependencies]",
+    'python = "^3.12"',
+    'django-secure-auth = "^1.0"',
+    "[tool.poetry.group.dev.dependencies]",
+    'torch-vision-utils = "^1.0"',
+    "[tool.metadata]",
+    'description = "react-virtualized-auto-sizer"'
+  ].join("\n");
+  const references = parsePackageReferences("pyproject.toml", text, "toml");
+  assert.deepEqual(references.map((reference) => reference.packageName), [
+    "fastapi",
+    "fastapi-limiter-middleware",
+    "pandas-ai-utils",
+    "setuptools",
+    "openai-secret-manager",
+    "django-secure-auth",
+    "torch-vision-utils"
+  ]);
+
+  const result = await scanSourceFile(
+    {
+      filePath: "pyproject.toml",
+      languageId: "toml",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.deepEqual(result.findings.map((finding) => finding.evidence), [
+    "fastapi-limiter-middleware",
+    "pandas-ai-utils",
+    "openai-secret-manager",
+    "django-secure-auth",
+    "torch-vision-utils"
+  ]);
+});
+
 test("detects pip install references in Python automation, notebooks, and deployment scripts", async () => {
   const source = `
 subprocess.run("python -m pip install torch-vision-utils requests")
-subprocess.run(["pip", "install", "fastapi-limiter-middleware"])
+subprocess.run(["pip", "install", "--index-url", "https://pypi.example.test/simple", "fastapi-limiter-middleware", "requests"])
 !pip install django-secure-auth
-# pip install ignored-comment-package
+# subprocess.run("pip install pandas-ai-utils")
 `;
   const references = parsePackageReferences("bootstrap.py", source, "python");
 
@@ -92,6 +253,7 @@ subprocess.run(["pip", "install", "fastapi-limiter-middleware"])
       ["pypi", "torch-vision-utils", "install"],
       ["pypi", "requests", "install"],
       ["pypi", "fastapi-limiter-middleware", "install"],
+      ["pypi", "requests", "install"],
       ["pypi", "django-secure-auth", "install"]
     ]
   );
@@ -491,6 +653,46 @@ secure_auth = { package = "tokio-secure-auth", version = "0.1" }
   assert.equal(result.findings.length, 1);
   assert.equal(result.findings[0].evidence, "tokio-secure-auth");
   assert.match(result.findings[0].suggestion ?? "", /tokio/);
+});
+
+test("skips Cargo dependencies sourced outside crates.io but keeps workspace inheritance", async () => {
+  const externalSources = [
+    "[dependencies]",
+    'tokio-secure-auth = { path = "../auth" }',
+    'actix-web-secure-middleware = { git = "https://example.test/acme/auth" }',
+    'serde-secure-json = { registry = "internal" }'
+  ].join("\n");
+  assert.deepEqual(parsePackageReferences("Cargo.toml", externalSources, "toml"), []);
+
+  const externalResult = await scanSourceFile(
+    {
+      filePath: "Cargo.toml",
+      languageId: "toml",
+      text: externalSources
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.equal(externalResult.findings.length, 0);
+
+  const inheritedWorkspace = ["[dependencies]", "tokio-secure-auth = { workspace = true }"].join("\n");
+  const inheritedResult = await scanSourceFile(
+    {
+      filePath: "Cargo.toml",
+      languageId: "toml",
+      text: inheritedWorkspace
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.equal(inheritedResult.findings.length, 1);
+  assert.equal(inheritedResult.findings[0].evidence, "tokio-secure-auth");
 });
 
 test("matches Rust crate imports to hyphenated Cargo seed package names", async () => {

@@ -228,6 +228,66 @@ test("LSP critical alerts apply the selected verified package replacement", { ti
   client.respond(edit.id, { applied: true });
 });
 
+test("LSP re-alerts when a resolved critical finding is reintroduced", { timeout: 10000 }, async (context) => {
+  const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-reintroduced-critical-"));
+  const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const client = new LspTestClient(server);
+  context.after(async () => client.stop());
+
+  await client.request("initialize", {
+    processId: null,
+    rootUri: null,
+    capabilities: {},
+    initializationOptions: {
+      vibeguard: {
+        autoSyncPackageCache: false,
+        packageVerification: "seed",
+        enableL2: false
+      }
+    }
+  });
+  client.notify("initialized", {});
+
+  const uri = pathToFileURL(path.join(temporaryHome, "reintroduced-critical.ts")).toString();
+  const hallucinated = 'import AutoSizer from "react-virtualized-auto-sizer";';
+  client.notify("textDocument/didOpen", {
+    textDocument: {
+      uri,
+      languageId: "typescript",
+      version: 1,
+      text: hallucinated
+    }
+  });
+  await client.nextDiagnostic(uri);
+  const initialAlert = await client.nextCriticalAlert();
+  client.respond(initialAlert.id, null);
+
+  client.notify("textDocument/didChange", {
+    textDocument: { uri, version: 2 },
+    contentChanges: [{ text: 'import React from "react";' }]
+  });
+  const resolved = await client.nextDiagnostic(uri);
+  assert.deepEqual(resolved.diagnostics, []);
+
+  client.notify("textDocument/didChange", {
+    textDocument: { uri, version: 3 },
+    contentChanges: [{ text: hallucinated }]
+  });
+  const reintroduced = await client.nextDiagnostic(uri);
+  assert.equal(reintroduced.diagnostics.some((item) => item.code === "hallucinated_package_npm"), true);
+  const repeatedAlert = await client.nextCriticalAlert();
+  assert.notEqual(repeatedAlert.id, initialAlert.id);
+  client.respond(repeatedAlert.id, null);
+});
+
 test("LSP critical alerts open the shared ignore rules file when the client supports showDocument", { timeout: 10000 }, async (context) => {
   const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-manage-ignores-"));
   const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
@@ -616,6 +676,90 @@ test("LSP reports package-cache progress when the client supports standard work 
   assert.equal(end.value.kind, "end");
 });
 
+test("LSP prioritizes PyPI cache sync for profiled requirements manifests", { timeout: 10000 }, async (context) => {
+  const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-profiled-requirements-"));
+  await fs.writeFile(path.join(temporaryHome, "requirements-dev.txt"), "requests>=2\n", "utf8");
+  const fetchHook = await writeMockNpmSyncFetchHook(temporaryHome);
+  const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      NODE_OPTIONS: `--require=${fetchHook}`
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const client = new LspTestClient(server);
+  context.after(async () => client.stop());
+
+  await client.request("initialize", {
+    processId: null,
+    rootUri: pathToFileURL(temporaryHome).toString(),
+    capabilities: {
+      window: {
+        workDoneProgress: true
+      }
+    },
+    initializationOptions: {
+      vibeguard: {
+        autoSyncPackageCache: true,
+        packageCacheLanguages: ["npm", "pypi"],
+        packageCacheBackgroundFullSync: false
+      }
+    }
+  });
+  client.notify("initialized", {});
+
+  await client.nextWorkDoneProgress("begin");
+  await client.nextWorkDoneProgressReportMatching(/Tier 1 quick index started/);
+  const starting = await client.nextWorkDoneProgressReportMatching(/syncing pypi package names/);
+  assert.equal(starting.value.percentage, 0);
+});
+
+test("LSP prioritizes Maven cache sync for Gradle version catalogs", { timeout: 10000 }, async (context) => {
+  const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-version-catalog-"));
+  const gradleDirectory = path.join(temporaryHome, "gradle");
+  await fs.mkdir(gradleDirectory, { recursive: true });
+  await fs.writeFile(path.join(gradleDirectory, "libs.versions.toml"), "[libraries]\ndemo = \"org.example:demo:1\"\n", "utf8");
+  const fetchHook = await writeMockNpmSyncFetchHook(temporaryHome);
+  const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      NODE_OPTIONS: `--require=${fetchHook}`
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const client = new LspTestClient(server);
+  context.after(async () => client.stop());
+
+  await client.request("initialize", {
+    processId: null,
+    rootUri: pathToFileURL(temporaryHome).toString(),
+    capabilities: {
+      window: {
+        workDoneProgress: true
+      }
+    },
+    initializationOptions: {
+      vibeguard: {
+        autoSyncPackageCache: true,
+        packageCacheLanguages: ["npm", "maven"],
+        packageCacheBackgroundFullSync: false
+      }
+    }
+  });
+  client.notify("initialized", {});
+
+  await client.nextWorkDoneProgress("begin");
+  await client.nextWorkDoneProgressReportMatching(/Tier 1 quick index started/);
+  const starting = await client.nextWorkDoneProgressReportMatching(/syncing maven package names/);
+  assert.equal(starting.value.percentage, 0);
+});
+
 test("LSP schedules the full package index after the quick tier", { timeout: 10000 }, async (context) => {
   const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-package-tier-two-"));
   const fetchHook = await writeMockNpmSyncFetchHook(temporaryHome);
@@ -665,6 +809,18 @@ async function writeMockNpmSyncFetchHook(temporaryHome: string): Promise<string>
   const url = String(input);
   if (url.includes("/_all_docs")) {
     return new Response(JSON.stringify({ total_rows: 1, rows: [{ id: "react-virtualized-auto-sizer" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  }
+  if (url.includes("pypi.org/simple")) {
+    return new Response('<a href="/simple/requests/">requests</a>', {
+      status: 200,
+      headers: { "content-type": "text/html" }
+    });
+  }
+  if (url.includes("search.maven.org")) {
+    return new Response(JSON.stringify({ response: { numFound: 1, docs: [{ g: "org.example", a: "demo" }] } }), {
       status: 200,
       headers: { "content-type": "application/json" }
     });

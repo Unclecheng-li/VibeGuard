@@ -34,6 +34,7 @@ import {
   type ConfiguredPackageSyncResult,
   type PackageCacheSyncTier
 } from "./package/configSync";
+import { isRequirementsManifestPath } from "./package/packageParser";
 import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
 import { mergeFindingsForExecutedLayers, type ExecutedLayers } from "./layers";
 import { createPackageStorage, type PackageStorage } from "./package/storage";
@@ -83,7 +84,7 @@ const l3Timers = new Map<string, NodeJS.Timeout>();
 const remotePackageTimers = new Map<string, NodeJS.Timeout>();
 const findingsByUri = new Map<string, Finding[]>();
 const performanceByUri = new Map<string, ScanPerformance>();
-const popupSeen = new Set<string>();
+const popupSeenByUri = new Map<string, Set<string>>();
 const codeActionSelector: vscode.DocumentSelector = [
   { scheme: "file", language: "javascript" },
   { scheme: "file", language: "javascriptreact" },
@@ -182,6 +183,9 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       }
     }),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      popupSeenByUri.delete(document.uri.toString());
+    }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor) {
         scheduleRealtimeScan(editor.document, 0);
@@ -241,7 +245,7 @@ function clearFindings(): void {
   performanceByUri.clear();
   diagnostics.clear();
   findingsProvider.refresh();
-  popupSeen.clear();
+  popupSeenByUri.clear();
   updateStatus();
 }
 
@@ -651,6 +655,7 @@ async function scanDocument(document: vscode.TextDocument, options: DocumentScan
   if (!enabled) {
     findingsByUri.delete(document.uri.toString());
     performanceByUri.delete(document.uri.toString());
+    popupSeenByUri.delete(document.uri.toString());
     diagnostics.delete(document.uri);
     findingsProvider.refresh();
     updateStatus();
@@ -758,6 +763,7 @@ function toDiagnosticSeverity(severity: Severity): vscode.DiagnosticSeverity {
 }
 
 function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding[]): void {
+  const popupSeen = activeCriticalPopupIds(document.uri.toString(), findings);
   if (!configuration().get<boolean>("showCriticalPopups", true)) {
     return;
   }
@@ -788,6 +794,26 @@ function maybeShowCriticalPopup(document: vscode.TextDocument, findings: Finding
       await openIgnoreRules();
     }
   });
+}
+
+function activeCriticalPopupIds(documentUri: string, findings: Finding[]): Set<string> {
+  const activeIds = new Set(
+    findings
+      .filter((finding) => finding.severity === "critical" && !finding.dismissed)
+      .map((finding) => finding.id)
+  );
+  const seen = popupSeenByUri.get(documentUri) ?? new Set<string>();
+  for (const findingId of seen) {
+    if (!activeIds.has(findingId)) {
+      seen.delete(findingId);
+    }
+  }
+  if (seen.size > 0 || activeIds.size > 0) {
+    popupSeenByUri.set(documentUri, seen);
+  } else {
+    popupSeenByUri.delete(documentUri);
+  }
+  return seen;
 }
 
 async function applyFindingFix(finding: Finding | undefined): Promise<void> {
@@ -1630,20 +1656,22 @@ function configuredPackageCacheUpdateInterval(
 }
 
 async function detectWorkspacePackageRegistries(): Promise<PackageRegistry[]> {
-  const checks: Array<[PackageRegistry, string]> = [
-    ["npm", "**/package.json"],
-    ["pypi", "**/{requirements.txt,pyproject.toml}"],
-    ["cargo", "**/Cargo.toml"],
-    ["gomod", "**/go.mod"],
-    ["maven", "**/{pom.xml,build.gradle,build.gradle.kts}"]
+  const checks: Array<[PackageRegistry, string[]]> = [
+    ["npm", ["**/package.json"]],
+    ["pypi", ["**/pyproject.toml", "**/requirements*.txt", "**/requirements/**/*.txt"]],
+    ["cargo", ["**/Cargo.toml"]],
+    ["gomod", ["**/go.mod"]],
+    ["maven", ["**/{pom.xml,build.gradle,build.gradle.kts}", "**/*.versions.toml"]]
   ];
   const found = await Promise.all(
-    checks.map(async ([registry, glob]) => ({
+    checks.map(async ([registry, globs]) => ({
       registry,
-      matches: await vscode.workspace.findFiles(glob, "**/{node_modules,.git,out,dist,build,coverage,.vscode-test}/**", 1)
+      matches: await Promise.all(
+        globs.map((glob) => vscode.workspace.findFiles(glob, "**/{node_modules,.git,out,dist,build,coverage,.vscode-test}/**", 1))
+      )
     }))
   );
-  return found.filter((entry) => entry.matches.length > 0).map((entry) => entry.registry);
+  return found.filter((entry) => entry.matches.some((matches) => matches.length > 0)).map((entry) => entry.registry);
 }
 
 function logPackageSyncResult(
@@ -1699,7 +1727,10 @@ function isSupportedDocument(document: vscode.TextDocument): boolean {
   if (supportedLanguageIds.has(document.languageId)) {
     return true;
   }
-  return /(?:package\.json|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle|build\.gradle\.kts|dockerfile)$/i.test(document.fileName);
+  return (
+    isRequirementsManifestPath(document.fileName) ||
+    /(?:package\.json|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle|build\.gradle\.kts|dockerfile)$/i.test(document.fileName)
+  );
 }
 
 function configuration(): vscode.WorkspaceConfiguration {
