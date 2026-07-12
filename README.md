@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="media/VibeGuardIcon.png" width="120" height="120" alt="VibeGuard">
+
 <h1>VibeGuard</h1>
 
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
