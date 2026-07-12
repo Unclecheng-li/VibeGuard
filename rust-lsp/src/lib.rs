@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -327,9 +327,30 @@ static NATIVE_PACKAGES: Lazy<AhoCorasick> = Lazy::new(|| {
 
 static NPM_IMPORT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?m)(?:\bimport\s+(?:[^\"'\r\n;]+?\s+from\s+)?|\brequire\s*\()\s*[\"'](?P<package>[^\"']+)[\"']"#,
+        r#"(?m)(?:\b(?:import|export)\s+(?:[^\"'\r\n;]+?\s+from\s+)?|\bimport\s*\(|\brequire\s*\()\s*[\"'](?P<package>[^\"']+)[\"']"#,
     )
     .expect("the npm import pattern must compile")
+});
+
+static JSON_PROPERTY_NAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\"(?P<package>[^\"\\]+)\"\s*:"#).expect("the JSON property pattern must compile")
+});
+
+static REQUIREMENTS_DEPENDENCY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?P<package>[A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[^\]]+\])?\s*(?:[<>=!~].*)?$")
+        .expect("the requirements dependency pattern must compile")
+});
+
+static PYPROJECT_DEPENDENCY_LITERAL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"[\"'](?P<package>[A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[^\]]+\])?(?:[<>=!~][^\"']*)?[\"']"#,
+    )
+    .expect("the pyproject dependency literal pattern must compile")
+});
+
+static PYPROJECT_DEPENDENCY_KEY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"^\s*[\"']?(?P<package>[A-Za-z0-9][A-Za-z0-9_.-]*)[\"']?\s*="#)
+        .expect("the Poetry dependency key pattern must compile")
 });
 
 static PYTHON_FROM_IMPORT: Lazy<Regex> = Lazy::new(|| {
@@ -363,6 +384,15 @@ static CARGO_DEPENDENCY: Lazy<Regex> = Lazy::new(|| {
         .expect("the Cargo dependency pattern must compile")
 });
 
+static CARGO_SECTION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*\[(?P<section>[^\]]+)]\s*$").expect("the Cargo section pattern must compile")
+});
+
+static CARGO_PACKAGE_RENAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bpackage\s*=\s*[\"'](?P<package>[A-Za-z0-9][A-Za-z0-9_-]*)[\"']"#)
+        .expect("the Cargo renamed-package pattern must compile")
+});
+
 static GO_IMPORT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?m)^\s*(?:import\s+)?(?:[A-Za-z_][A-Za-z0-9_]*\s+)?[\"'](?P<package>(?:github\.com|golang\.org|gorm\.io)/[^\"']+)[\"']"#)
         .expect("the Go import pattern must compile")
@@ -376,6 +406,16 @@ static GO_REQUIRE: Lazy<Regex> = Lazy::new(|| {
 static MAVEN_GRADLE_COORDINATE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"[\"'](?P<package>[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9_.-]+)(?::[^\"']+)?[\"']"#)
         .expect("the Gradle coordinate pattern must compile")
+});
+
+static MAVEN_VERSION_CATALOG_GROUP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bgroup\s*=\s*[\"'](?P<group>[A-Za-z][A-Za-z0-9_.-]*)[\"']"#)
+        .expect("the Gradle version-catalog group pattern must compile")
+});
+
+static MAVEN_VERSION_CATALOG_NAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bname\s*=\s*[\"'](?P<name>[A-Za-z0-9_.-]+)[\"']"#)
+        .expect("the Gradle version-catalog name pattern must compile")
 });
 
 static MAVEN_POM_DEPENDENCY: Lazy<Regex> = Lazy::new(|| {
@@ -707,7 +747,15 @@ pub fn scan_l1(source: &str) -> Vec<L1Finding> {
 }
 
 fn scan_l1_with_package_index(source: &str, package_index: &NativePackageIndex) -> Vec<L1Finding> {
-    let mut findings = scan_known_packages(source, package_index);
+    scan_l1_with_package_index_for_path(source, package_index, None)
+}
+
+fn scan_l1_with_package_index_for_path(
+    source: &str,
+    package_index: &NativePackageIndex,
+    file_path: Option<&str>,
+) -> Vec<L1Finding> {
+    let mut findings = scan_known_packages(source, file_path, package_index);
     let mut reported_secret_ranges = Vec::new();
 
     for rule in SECRET_RULES.iter() {
@@ -788,7 +836,7 @@ fn scan_l1_for_document(
     package_index: &NativePackageIndex,
 ) -> Vec<L1Finding> {
     let file_path = document_path(uri);
-    scan_l1_with_package_index(source, package_index)
+    scan_l1_with_package_index_for_path(source, package_index, Some(&file_path))
         .into_iter()
         .filter(|finding| !finding_is_ignored(finding, &file_path, ignore_rules))
         .collect()
@@ -1656,9 +1704,13 @@ struct PackageCandidate {
     end: usize,
 }
 
-fn scan_known_packages(source: &str, package_index: &NativePackageIndex) -> Vec<L1Finding> {
+fn scan_known_packages(
+    source: &str,
+    file_path: Option<&str>,
+    package_index: &NativePackageIndex,
+) -> Vec<L1Finding> {
     let mut findings = Vec::new();
-    for candidate in package_candidates(source) {
+    for candidate in package_candidates(source, file_path) {
         let Some(normalized) = normalize_package_name(candidate.registry, &candidate.package)
         else {
             continue;
@@ -1744,67 +1796,427 @@ fn scan_known_packages(source: &str, package_index: &NativePackageIndex) -> Vec<
     findings
 }
 
-fn package_candidates(source: &str) -> Vec<PackageCandidate> {
+fn package_candidates(source: &str, file_path: Option<&str>) -> Vec<PackageCandidate> {
     let mut candidates = Vec::new();
+    if let Some(file_path) = file_path {
+        push_document_package_candidates(&mut candidates, source, file_path);
+    } else {
+        // Keep the public source-only scanner useful in tests and CLI snippets where
+        // no document URI is available. LSP requests always use the path-aware flow.
+        push_all_package_candidates(&mut candidates, source);
+    }
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        seen.insert((
+            candidate.registry,
+            candidate.package.clone(),
+            candidate.start,
+            candidate.end,
+        ))
+    });
+    candidates
+}
+
+fn push_all_package_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &NPM_IMPORT,
         "package",
         PackageRegistry::Npm,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &PYTHON_FROM_IMPORT,
         "package",
         PackageRegistry::Pypi,
     );
-    push_python_import_candidates(&mut candidates, source);
+    push_python_import_candidates(candidates, source);
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &PIP_INSTALL,
         "package",
         PackageRegistry::Pypi,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &CARGO_USE,
         "package",
         PackageRegistry::Cargo,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &CARGO_DEPENDENCY,
         "package",
         PackageRegistry::Cargo,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &GO_IMPORT,
         "package",
         PackageRegistry::GoMod,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &GO_REQUIRE,
         "package",
         PackageRegistry::GoMod,
     );
     push_capture_candidates(
-        &mut candidates,
+        candidates,
         source,
         &MAVEN_GRADLE_COORDINATE,
         "package",
         PackageRegistry::Maven,
     );
-    push_maven_pom_candidates(&mut candidates, source);
-    candidates
+    push_maven_pom_candidates(candidates, source);
+}
+
+fn push_document_package_candidates(
+    candidates: &mut Vec<PackageCandidate>,
+    source: &str,
+    file_path: &str,
+) {
+    let file_name = file_path
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match file_name.as_str() {
+        "package.json" => push_npm_manifest_candidates(candidates, source),
+        "requirements.txt" => push_requirements_candidates(candidates, source),
+        "pyproject.toml" => push_pyproject_candidates(candidates, source),
+        "cargo.toml" => push_cargo_manifest_candidates(candidates, source),
+        "go.mod" => push_capture_candidates(
+            candidates,
+            source,
+            &GO_REQUIRE,
+            "package",
+            PackageRegistry::GoMod,
+        ),
+        "pom.xml" => push_maven_pom_candidates(candidates, source),
+        "build.gradle" | "build.gradle.kts" => push_capture_candidates(
+            candidates,
+            source,
+            &MAVEN_GRADLE_COORDINATE,
+            "package",
+            PackageRegistry::Maven,
+        ),
+        _ if file_name.ends_with(".versions.toml") => {
+            push_gradle_version_catalog_candidates(candidates, source)
+        }
+        _ if is_npm_source_file(&file_name) => push_capture_candidates(
+            candidates,
+            source,
+            &NPM_IMPORT,
+            "package",
+            PackageRegistry::Npm,
+        ),
+        _ if is_python_source_file(&file_name) => {
+            push_capture_candidates(
+                candidates,
+                source,
+                &PYTHON_FROM_IMPORT,
+                "package",
+                PackageRegistry::Pypi,
+            );
+            push_python_import_candidates(candidates, source);
+            push_capture_candidates(
+                candidates,
+                source,
+                &PIP_INSTALL,
+                "package",
+                PackageRegistry::Pypi,
+            );
+        }
+        _ if is_rust_source_file(&file_name) => push_capture_candidates(
+            candidates,
+            source,
+            &CARGO_USE,
+            "package",
+            PackageRegistry::Cargo,
+        ),
+        _ if is_go_source_file(&file_name) => push_capture_candidates(
+            candidates,
+            source,
+            &GO_IMPORT,
+            "package",
+            PackageRegistry::GoMod,
+        ),
+        _ if is_pip_command_file(&file_name) => push_capture_candidates(
+            candidates,
+            source,
+            &PIP_INSTALL,
+            "package",
+            PackageRegistry::Pypi,
+        ),
+        _ => {}
+    }
+}
+
+fn is_npm_source_file(file_name: &str) -> bool {
+    matches!(
+        file_name.rsplit('.').next(),
+        Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+    )
+}
+
+fn is_python_source_file(file_name: &str) -> bool {
+    file_name.ends_with(".py")
+}
+
+fn is_rust_source_file(file_name: &str) -> bool {
+    file_name.ends_with(".rs")
+}
+
+fn is_go_source_file(file_name: &str) -> bool {
+    file_name.ends_with(".go")
+}
+
+fn is_pip_command_file(file_name: &str) -> bool {
+    file_name == "dockerfile"
+        || matches!(
+            file_name.rsplit('.').next(),
+            Some("sh" | "bash" | "zsh" | "ps1" | "yml" | "yaml")
+        )
+}
+
+fn push_npm_manifest_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(source) else {
+        return;
+    };
+    let Some(root) = root.as_object() else {
+        return;
+    };
+    let mut dependency_names = HashSet::new();
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(dependencies) = root.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        dependency_names.extend(
+            dependencies
+                .iter()
+                .filter(|(_, specifier)| !is_local_npm_specifier(specifier))
+                .map(|(package, _)| package.as_str()),
+        );
+    }
+    for captures in JSON_PROPERTY_NAME.captures_iter(source) {
+        let Some(package) = captures.name("package") else {
+            continue;
+        };
+        if dependency_names.contains(package.as_str()) {
+            candidates.push(PackageCandidate {
+                registry: PackageRegistry::Npm,
+                package: package.as_str().to_owned(),
+                start: package.start(),
+                end: package.end(),
+            });
+        }
+    }
+}
+
+fn is_local_npm_specifier(value: &serde_json::Value) -> bool {
+    let Some(specifier) = value.as_str() else {
+        return false;
+    };
+    let specifier = specifier.trim().to_ascii_lowercase();
+    ["workspace:", "file:", "link:", "portal:"]
+        .iter()
+        .any(|prefix| specifier.starts_with(prefix))
+}
+
+fn push_requirements_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    let mut offset = 0;
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        let stripped = line.split('#').next().unwrap_or_default().trim();
+        if let Some(captures) = REQUIREMENTS_DEPENDENCY.captures(stripped) {
+            if let Some(package) = captures.name("package") {
+                if let Some(column) = line.find(package.as_str()) {
+                    candidates.push(PackageCandidate {
+                        registry: PackageRegistry::Pypi,
+                        package: package.as_str().to_owned(),
+                        start: offset + column,
+                        end: offset + column + package.as_str().len(),
+                    });
+                }
+            }
+        }
+        offset += raw_line.len();
+    }
+}
+
+fn push_pyproject_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    let mut offset = 0;
+    let mut in_poetry_dependencies = false;
+    let mut project_dependency_arrays = false;
+    let mut dependency_array_open = false;
+
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        let stripped = line.split('#').next().unwrap_or_default().trim();
+        if let Some(captures) = CARGO_SECTION.captures(stripped) {
+            let section = captures
+                .name("section")
+                .map(|value| value.as_str().trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            in_poetry_dependencies = section == "tool.poetry.dependencies"
+                || (section.starts_with("tool.poetry.group.")
+                    && section.ends_with(".dependencies"));
+            project_dependency_arrays =
+                section == "project" || section == "project.optional-dependencies";
+            dependency_array_open = false;
+            offset += raw_line.len();
+            continue;
+        }
+
+        if in_poetry_dependencies {
+            if let Some(captures) = PYPROJECT_DEPENDENCY_KEY.captures(stripped) {
+                if let Some(package) = captures.name("package") {
+                    if !package.as_str().eq_ignore_ascii_case("python") {
+                        if let Some(column) = line.find(package.as_str()) {
+                            candidates.push(PackageCandidate {
+                                registry: PackageRegistry::Pypi,
+                                package: package.as_str().to_owned(),
+                                start: offset + column,
+                                end: offset + column + package.as_str().len(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let starts_project_dependency_array = project_dependency_arrays
+            && (stripped.starts_with("dependencies")
+                || (stripped.contains('=') && stripped.contains('[')));
+        if dependency_array_open || starts_project_dependency_array {
+            for captures in PYPROJECT_DEPENDENCY_LITERAL.captures_iter(line) {
+                let Some(package) = captures.name("package") else {
+                    continue;
+                };
+                candidates.push(PackageCandidate {
+                    registry: PackageRegistry::Pypi,
+                    package: package.as_str().to_owned(),
+                    start: offset + package.start(),
+                    end: offset + package.end(),
+                });
+            }
+            dependency_array_open = !stripped.contains(']');
+        }
+        offset += raw_line.len();
+    }
+}
+
+fn push_cargo_manifest_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    let mut offset = 0;
+    let mut in_dependency_section = false;
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        let stripped = line.split('#').next().unwrap_or_default().trim();
+        if let Some(captures) = CARGO_SECTION.captures(stripped) {
+            let section = captures
+                .name("section")
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            in_dependency_section = is_cargo_dependency_section(section);
+            offset += raw_line.len();
+            continue;
+        }
+        if in_dependency_section {
+            let renamed = CARGO_PACKAGE_RENAME
+                .captures(stripped)
+                .and_then(|captures| captures.name("package"));
+            let package = renamed.or_else(|| {
+                CARGO_DEPENDENCY
+                    .captures(stripped)
+                    .and_then(|captures| captures.name("package"))
+            });
+            if let Some(package) = package {
+                if let Some(column) = line.find(package.as_str()) {
+                    candidates.push(PackageCandidate {
+                        registry: PackageRegistry::Cargo,
+                        package: package.as_str().to_owned(),
+                        start: offset + column,
+                        end: offset + column + package.as_str().len(),
+                    });
+                }
+            }
+        }
+        offset += raw_line.len();
+    }
+}
+
+fn push_gradle_version_catalog_candidates(candidates: &mut Vec<PackageCandidate>, source: &str) {
+    let mut offset = 0;
+    let mut in_libraries = false;
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        let stripped = line.split('#').next().unwrap_or_default().trim();
+        if let Some(captures) = CARGO_SECTION.captures(stripped) {
+            in_libraries = captures
+                .name("section")
+                .is_some_and(|section| section.as_str().trim().eq_ignore_ascii_case("libraries"));
+            offset += raw_line.len();
+            continue;
+        }
+        if !in_libraries {
+            offset += raw_line.len();
+            continue;
+        }
+
+        let group = MAVEN_VERSION_CATALOG_GROUP
+            .captures(line)
+            .and_then(|captures| captures.name("group"));
+        let name = MAVEN_VERSION_CATALOG_NAME
+            .captures(line)
+            .and_then(|captures| captures.name("name"));
+        if let (Some(group), Some(name)) = (group, name) {
+            candidates.push(PackageCandidate {
+                registry: PackageRegistry::Maven,
+                package: format!("{}:{}", group.as_str(), name.as_str()),
+                start: offset + name.start(),
+                end: offset + name.end(),
+            });
+        } else {
+            for captures in MAVEN_GRADLE_COORDINATE.captures_iter(line) {
+                let Some(package) = captures.name("package") else {
+                    continue;
+                };
+                candidates.push(PackageCandidate {
+                    registry: PackageRegistry::Maven,
+                    package: package.as_str().to_owned(),
+                    start: offset + package.start(),
+                    end: offset + package.end(),
+                });
+            }
+        }
+        offset += raw_line.len();
+    }
+}
+
+fn is_cargo_dependency_section(section: &str) -> bool {
+    let section = section.trim().to_ascii_lowercase();
+    matches!(
+        section.as_str(),
+        "dependencies" | "dev-dependencies" | "build-dependencies" | "workspace.dependencies"
+    ) || (section.starts_with("target.")
+        && (section.ends_with(".dependencies")
+            || section.ends_with(".dev-dependencies")
+            || section.ends_with(".build-dependencies")))
 }
 
 fn push_capture_candidates(
@@ -2488,6 +2900,46 @@ mod tests {
     }
 
     #[test]
+    fn reports_dynamic_and_reexported_npm_package_references() {
+        let uri = Url::parse("file:///workspace/src/lazy.ts").expect("the source URI should parse");
+        let source = concat!(
+            "const autoSizer = await import(\"react-virtualized-auto-sizer\");\n",
+            "export { middleware } from \"express-rate-limit-flex\";\n"
+        );
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code)
+                .collect::<Vec<_>>(),
+            vec!["hallucinated_package_npm", "hallucinated_package_npm"]
+        );
+
+        let actions = code_actions_for_range(
+            source,
+            &uri,
+            &Range::new(Position::new(0, 0), Position::new(1, 99)),
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.title == "Replace with react-virtualized")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.title == "Replace with express-rate-limit")
+        );
+    }
+
+    #[test]
     fn suggests_and_fixes_full_json_npm_index_misses() {
         let index = NativePackageIndex {
             registries: HashMap::from([(
@@ -2788,6 +3240,176 @@ mod tests {
                 .iter()
                 .any(|finding| finding.message.contains("spring-boot-starter-security"))
         );
+    }
+
+    #[test]
+    fn parses_dependency_manifests_by_document_type_without_cross_language_matches() {
+        let cases = [
+            (
+                "file:///workspace/package.json",
+                r#"{"dependencies":{"react-virtualized-auto-sizer":"1.0.0"}}"#,
+                "hallucinated_package_npm",
+            ),
+            (
+                "file:///workspace/requirements.txt",
+                "torch-vision-utils>=1.0\n",
+                "hallucinated_package_pypi",
+            ),
+            (
+                "file:///workspace/pyproject.toml",
+                "[project]\ndependencies = [\n  \"torch-vision-utils>=1.0\"\n]\n",
+                "hallucinated_package_pypi",
+            ),
+            (
+                "file:///workspace/Cargo.toml",
+                "[dependencies]\nsecure_alias = { package = \"actix-web-secure-middleware\", version = \"1.0\" }\n",
+                "hallucinated_package_cargo",
+            ),
+            (
+                "file:///workspace/go.mod",
+                "require github.com/gin-gonic/secure-gin v1.0.0\n",
+                "hallucinated_package_gomod",
+            ),
+            (
+                "file:///workspace/build.gradle.kts",
+                "implementation(\"org.springframework.boot:spring-boot-starter-secure-api:1.0.0\")\n",
+                "hallucinated_package_maven",
+            ),
+            (
+                "file:///workspace/pom.xml",
+                "<dependency><groupId>org.postgresql</groupId><artifactId>postgresql-secure</artifactId></dependency>",
+                "hallucinated_package_maven",
+            ),
+        ];
+
+        for (uri, source, expected_code) in cases {
+            let uri = Url::parse(uri).expect("the manifest URI should parse");
+            let findings = scan_l1_for_document(
+                source,
+                &uri,
+                &NativeIgnoreRules::default(),
+                &NativePackageIndex::default(),
+            );
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|finding| finding.code)
+                    .collect::<Vec<_>>(),
+                vec![expected_code],
+                "expected {expected_code} for {}",
+                uri.path(),
+            );
+        }
+
+        let manifest_uri = Url::parse("file:///workspace/package.json")
+            .expect("the package manifest URI should parse");
+        let manifest_source = r#"{"dependencies":{"react-virtualized-auto-sizer":"1.0.0"}}"#;
+        let actions = code_actions_for_range(
+            manifest_source,
+            &manifest_uri,
+            &Range::new(Position::new(0, 0), Position::new(0, 99)),
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        let replacement = actions
+            .iter()
+            .find(|action| action.title == "Replace with react-virtualized")
+            .expect("the npm manifest dependency should retain its safe quick fix");
+        assert_eq!(
+            action_replacement(replacement, &manifest_uri),
+            "react-virtualized"
+        );
+
+        let source_uri =
+            Url::parse("file:///workspace/app.ts").expect("the source URI should parse");
+        let source_findings = scan_l1_for_document(
+            "const actix_web_secure_middleware = \"1.0\";",
+            &source_uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(source_findings.is_empty());
+    }
+
+    #[test]
+    fn skips_local_npm_manifest_specifiers() {
+        let uri = Url::parse("file:///workspace/package.json")
+            .expect("the package manifest URI should parse");
+        let source = r#"{
+          "dependencies": {
+            "react-virtualized-auto-sizer": "workspace:*",
+            "express-rate-limit-flex": "file:../rate-limit",
+            "secure-jwt-auth": "link:../auth",
+            "next-auth-middleware-secure": "portal:../middleware"
+          }
+        }"#;
+        let findings = scan_l1_for_document(
+            source,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parses_gradle_version_catalog_libraries_without_scanning_version_metadata() {
+        let cases = [
+            (
+                "[libraries]\njackson = { module = \"com.fasterxml.jackson.core:jackson-databind-secure\", version.ref = \"jackson\" }\n",
+                "hallucinated_package_maven",
+            ),
+            (
+                "[libraries]\nspring = { group = \"org.springframework.boot\", name = \"spring-boot-starter-secure-api\", version.ref = \"spring\" }\n",
+                "hallucinated_package_maven",
+            ),
+            (
+                "[libraries]\npostgres = \"org.postgresql:postgresql-secure:42.7.0\"\n",
+                "hallucinated_package_maven",
+            ),
+        ];
+        let uri = Url::parse("file:///workspace/gradle/libs.versions.toml")
+            .expect("the Gradle version catalog URI should parse");
+        for &(source, expected_code) in &cases {
+            let findings = scan_l1_for_document(
+                source,
+                &uri,
+                &NativeIgnoreRules::default(),
+                &NativePackageIndex::default(),
+            );
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|finding| finding.code)
+                    .collect::<Vec<_>>(),
+                vec![expected_code],
+            );
+        }
+
+        let group_and_name = cases[1].0;
+        let findings = scan_l1_for_document(
+            group_and_name,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        let artifact_column = group_and_name
+            .lines()
+            .nth(1)
+            .and_then(|line| line.find("spring-boot-starter-secure-api"))
+            .expect("the catalog fixture should contain its artifact")
+            as u32;
+        assert_eq!(findings[0].range.start, Position::new(1, artifact_column));
+
+        let version_metadata =
+            "[versions]\npostgres = \"org.postgresql:postgresql-secure:42.7.0\"\n";
+        let findings = scan_l1_for_document(
+            version_metadata,
+            &uri,
+            &NativeIgnoreRules::default(),
+            &NativePackageIndex::default(),
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]

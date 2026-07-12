@@ -49,6 +49,34 @@ test("detects known hallucinated npm packages from the seed catalog", async () =
   assert.equal(result.findings[0].fix?.edits[0].newText, "react-virtualized");
 });
 
+test("skips local workspace and path package manifest references", async () => {
+  const text = `{
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-virtualized-auto-sizer": "workspace:*",
+    "express-rate-limit-flex": "file:../rate-limit",
+    "secure-jwt-auth": "link:../auth",
+    "next-auth-middleware-secure": "portal:../middleware"
+  }
+}`;
+  const references = parsePackageReferences("package.json", text, "json");
+  assert.deepEqual(references.map((reference) => reference.packageName), ["react"]);
+
+  const result = await scanSourceFile(
+    {
+      filePath: "package.json",
+      languageId: "json",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.equal(result.findings.length, 0);
+});
+
 test("detects pip install references in Python automation, notebooks, and deployment scripts", async () => {
   const source = `
 subprocess.run("python -m pip install torch-vision-utils requests")
@@ -438,6 +466,30 @@ tokio-secure-auth = "0.1"
 
   assert.equal(result.findings.length, 1);
   assert.equal(result.findings[0].detection_rule, "hallucinated_package_cargo");
+  assert.match(result.findings[0].suggestion ?? "", /tokio/);
+});
+
+test("resolves renamed Cargo manifest dependencies to their registry crate", async () => {
+  const text = `[dependencies]
+secure_auth = { package = "tokio-secure-auth", version = "0.1" }
+`;
+  const references = parsePackageReferences("Cargo.toml", text, "toml");
+  assert.deepEqual(references.map((reference) => reference.packageName), ["tokio-secure-auth"]);
+
+  const result = await scanSourceFile(
+    {
+      filePath: "Cargo.toml",
+      languageId: "toml",
+      text
+    },
+    {
+      packageVerification: "seed",
+      includeSast: false,
+      now: 1
+    }
+  );
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].evidence, "tokio-secure-auth");
   assert.match(result.findings[0].suggestion ?? "", /tokio/);
 });
 

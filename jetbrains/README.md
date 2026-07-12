@@ -30,11 +30,13 @@ executable or server location with `VIBEGUARD_NODE_PATH` and `VIBEGUARD_LSP_PATH
 For an explicit native preview, build [`../rust-lsp/`](../rust-lsp/) and set `VIBEGUARD_NATIVE_LSP_PATH` to the
 resulting executable. The equivalent Java system property is `vibeguard.native.lsp.path`. This takes precedence over
 the Node settings and starts the binary with `--stdio`, so Node is not needed for that preview. The native server
-currently covers local L1 package-seed, provider and high-entropy secrets with conservative false-positive filtering,
-unsafe-configuration, and high-confidence AI-error-pattern
+currently covers local L1 package-seed checks across imports and `package.json`, `requirements.txt`, `pyproject.toml`,
+Cargo manifests, `go.mod`, Maven POM files, Gradle build scripts, and `*.versions.toml` catalogs; provider and high-entropy secrets with
+conservative false-positive filtering, unsafe-configuration, and high-confidence AI-error-pattern
 diagnostics. It provides standard LSP quick fixes for safe npm seed and full-index-confirmed similar npm replacements,
 plus mechanical configuration changes,
 plus line, file, global-rule, and package ignore actions persisted to the shared `~/.vibeguard/ignore-rules.yml` file.
+Cargo aliases declared with `package = "crate-name"` are checked as `crate-name`, not as their local alias key.
 Set `VIBEGUARD_NATIVE_IGNORE_RULES_PATH` only to use an alternate shared-rule path in a managed or test environment.
 In the background it reads the shared SQLite package cache at `~/.vibeguard/packages.db` without modifying it (or the
 `VIBEGUARD_NATIVE_PACKAGE_SQLITE_PATH` override), then falls back per registry to the gzip/JSON index at
@@ -42,6 +44,9 @@ In the background it reads the shared SQLite package cache at `~/.vibeguard/pack
 packages when a registry has `full` coverage. Package-cache synchronization and remote verification, secret or
 AI-pattern fixes, persisted findings, and L2/L3 analysis remain Node-service features. Leave the
 variable unset for the default full Node service.
+
+For npm manifests, explicit local dependency protocols (`workspace:`, `file:`, `link:`, and `portal:`) are not
+submitted to the public registry checker, so monorepo packages stay quiet without an ignore rule.
 
 When the server starts, it refreshes the shared `~/.vibeguard` package-name cache in the background according to
 `config.json`. Workspace-root dependency manifests are prioritized, and updated indexes automatically recheck open

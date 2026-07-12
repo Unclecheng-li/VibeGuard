@@ -206,7 +206,10 @@ function parsePackageJson(filePath: string, text: string): PackageReference[] {
     if (!dependencies || typeof dependencies !== "object") {
       continue;
     }
-    for (const packageName of Object.keys(dependencies as Record<string, unknown>)) {
+    for (const [packageName, specifier] of Object.entries(dependencies as Record<string, unknown>)) {
+      if (isLocalNpmSpecifier(specifier)) {
+        continue;
+      }
       const pattern = new RegExp(`"${escapeRegExp(packageName)}"\\s*:`, "g");
       const match = pattern.exec(text);
       const index = match?.index ?? text.indexOf(packageName);
@@ -215,6 +218,14 @@ function parsePackageJson(filePath: string, text: string): PackageReference[] {
   }
 
   return dedupeReferences(references);
+}
+
+function isLocalNpmSpecifier(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const specifier = value.trim().toLowerCase();
+  return ["workspace:", "file:", "link:", "portal:"].some((prefix) => specifier.startsWith(prefix));
 }
 
 function parsePythonImports(filePath: string, text: string): PackageReference[] {
@@ -354,7 +365,7 @@ function parseCargoToml(filePath: string, text: string): PackageReference[] {
     }
 
     const dep = stripped.match(/^([A-Za-z0-9_-]+)\s*=/);
-    const packageName = dep?.[1];
+    const packageName = /\bpackage\s*=\s*["']([A-Za-z0-9_-]+)["']/.exec(stripped)?.[1] ?? dep?.[1];
     if (!packageName) {
       continue;
     }
