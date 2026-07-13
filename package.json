@@ -2,7 +2,7 @@
   "name": "vibeguard-security",
   "displayName": "VibeGuard AI Security",
   "description": "AI-generated code security scanner for hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "unclecheng",
   "license": "MIT",
   "repository": {

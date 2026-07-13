@@ -18,7 +18,9 @@ tsconfig.json
 dist/**/*.map
 coverage/**
 VibeGuard-PRD.md
+doc/**
 Upgrade documentation.md
+升级文档.md
 package-lock.json
 action.yml
 *.vsix
