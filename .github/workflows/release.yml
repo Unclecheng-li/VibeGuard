@@ -58,8 +58,21 @@ jobs:
         with:
           name: vibeguard-vscode-${{ needs.verify-version.outputs.version }}
           path: vibeguard-${{ needs.verify-version.outputs.version }}.vsix
-      - name: Publish VSCode extension
+      - name: Check VSCode publishing credentials
+        id: publishing
         if: github.event_name == 'push'
+        shell: bash
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -n "$VSCE_PAT" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::VSCE_PAT is not configured; the VSIX artifact was built but Marketplace publication was skipped."
+          fi
+      - name: Publish VSCode extension
+        if: github.event_name == 'push' && steps.publishing.outputs.available == 'true'
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: npm exec -- vsce publish --packagePath "vibeguard-${{ needs.verify-version.outputs.version }}.vsix"
@@ -87,8 +100,21 @@ jobs:
         with:
           name: vibeguard-jetbrains-${{ needs.verify-version.outputs.version }}
           path: jetbrains/build/distributions/*.zip
-      - name: Publish JetBrains plugin
+      - name: Check JetBrains publishing credentials
+        id: publishing
         if: github.event_name == 'push'
+        shell: bash
+        env:
+          JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+        run: |
+          if [ -n "$JETBRAINS_MARKETPLACE_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::JETBRAINS_MARKETPLACE_TOKEN is not configured; the ZIP artifact was built but Marketplace publication was skipped."
+          fi
+      - name: Publish JetBrains plugin
+        if: github.event_name == 'push' && steps.publishing.outputs.available == 'true'
         env:
           JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
         run: ./gradlew publishPlugin --no-daemon

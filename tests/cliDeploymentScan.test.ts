@@ -8,8 +8,9 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-test("CLI scans pip install commands in Dockerfiles, shell scripts, and CI YAML", async () => {
+test("CLI scans pip install commands in Dockerfiles, shell scripts, and CI YAML", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-cli-deployment-scan-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   await Promise.all([
     fs.writeFile(path.join(directory, "Dockerfile"), "RUN pip install torch-vision-utils\n", "utf8"),
     fs.writeFile(path.join(directory, "bootstrap.sh"), "python -m pip install django-secure-auth\n", "utf8"),
@@ -24,6 +25,10 @@ test("CLI scans pip install commands in Dockerfiles, shell scripts, and CI YAML"
     "json",
     "--package-verification",
     "seed",
+    "--storage",
+    "json",
+    "--package-index",
+    path.join(directory, "package-index.json"),
     "--fail-on",
     "none",
     "--no-l2",

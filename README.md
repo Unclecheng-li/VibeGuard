@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="media/VibeGuardIcon.png" width="120" height="120" alt="VibeGuard">
+<img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/VibeGuardIcon.png" width="120" height="120" alt="VibeGuard">
 
 <h1>VibeGuard</h1>
 
@@ -36,16 +36,16 @@
 <td align="center"><b>Hover for details</b></td>
 </tr>
 <tr>
-<td><img src="media/demonstration%20png/1-Underline%20the%20error%20with%20a%20wavy%20line..png" alt="Real-time diagnostics" width="400"></td>
-<td><img src="media/demonstration%20png/2.png" alt="Hover tooltip" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/demonstration/realtime-diagnostic.png" alt="Real-time diagnostics" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/demonstration/hover-tooltip.png" alt="Hover tooltip" width="400"></td>
 </tr>
 <tr>
 <td align="center"><b>Quick Fix menu</b></td>
 <td align="center"><b>Problems panel</b></td>
 </tr>
 <tr>
-<td><img src="media/demonstration%20png/3-QuickFix.png" alt="Quick Fix menu" width="400"></td>
-<td><img src="media/demonstration%20png/4-viewproblem.png" alt="Problems panel" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/demonstration/quick-fix.png" alt="Quick Fix menu" width="400"></td>
+<td><img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/demonstration/problems-panel.png" alt="Problems panel" width="400"></td>
 </tr>
 </table>
 </div>
@@ -672,7 +672,7 @@ cargo run --manifest-path rust-lsp/Cargo.toml -- --stdio
 
 ### Marketplace Release
 
-The `Marketplace Release` workflow packages both editor extensions on manual dispatch. Pushing a version tag (`v0.1.0`) publishes to both marketplaces after version consistency checks.
+The `Marketplace Release` workflow packages both editor extensions on manual dispatch. Pushing a version tag (`v0.1.0`) publishes to each configured marketplace after version consistency checks; when a publishing credential is absent, the workflow keeps the packaged artifact and emits a warning instead of failing the release build.
 
 **Required secrets:** `VSCE_PAT` and `JETBRAINS_MARKETPLACE_TOKEN` as GitHub repository secrets.
 
