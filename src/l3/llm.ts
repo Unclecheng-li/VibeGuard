@@ -1,10 +1,10 @@
-import type { Finding, L3AnalyzerLike, Severity, SourceFile, VibeGuardConfig } from "../types";
+import type { Finding, L3AnalyzerLike, L3ReviewOutcome, LlmProvider, LlmUsageStats, Severity, SourceFile } from "../types";
 import { defaultProApiBaseUrl, getProApiKeyFromEnv } from "../subscription";
 import { detectSecrets } from "../rules/secrets";
 import { createFinding, lineStarts, lineTextAt } from "../utils";
 import { buildSecurityReviewContext, buildSecurityReviewTargets, LocalSemanticAnalyzer, type SecurityReviewTarget } from "./analyzer";
 
-export type LlmProvider = NonNullable<VibeGuardConfig["llm_provider"]>;
+export type { LlmProvider } from "../types";
 
 export interface LlmSemanticAnalyzerOptions {
   provider: LlmProvider;
@@ -13,7 +13,13 @@ export interface LlmSemanticAnalyzerOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
   fallbackAnalyzer?: L3AnalyzerLike | false;
+}
+
+interface LlmReviewResponse {
+  content: string;
+  usage?: Omit<LlmUsageStats, "provider" | "model">;
 }
 
 interface LlmFindingPayload {
@@ -47,18 +53,59 @@ export class LlmSemanticAnalyzer implements L3AnalyzerLike {
   }
 
   async analyze(source: SourceFile, timestamp: number): Promise<Finding[]> {
+    return (await this.review(source, timestamp)).findings;
+  }
+
+  async review(source: SourceFile, timestamp: number): Promise<L3ReviewOutcome> {
+    const startedAt = Date.now();
+    const model = resolveLlmModel(this.options);
     if (this.options.provider !== "local" && !this.options.apiKey) {
-      return this.fallback(source, timestamp);
+      return {
+        status: "notConfigured",
+        findings: await this.fallback(source, timestamp),
+        provider: this.options.provider,
+        model,
+        elapsedMs: Date.now() - startedAt,
+        errorCode: "notConfigured",
+        filesScanned: 1
+      };
     }
 
     try {
-      const raw = await requestLlmSecurityReview(
+      const response = await requestLlmSecurityReviewWithUsage(
         this.options,
         buildLlmSecurityReviewPrompt(source, this.options.provider !== "local")
       );
-      return parseLlmSecurityFindings(raw, source, timestamp);
-    } catch {
-      return this.fallback(source, timestamp);
+      return {
+        status: this.options.provider === "local" ? "local" : "remote",
+        findings: parseLlmSecurityFindings(response.content, source, timestamp),
+        provider: this.options.provider,
+        model,
+        elapsedMs: Date.now() - startedAt,
+        usage: response.usage ? { provider: this.options.provider, model, ...response.usage } : undefined,
+        filesScanned: 1
+      };
+    } catch (error) {
+      if (isAbortError(error) || this.options.signal?.aborted) {
+        return {
+          status: "cancelled",
+          findings: [],
+          provider: this.options.provider,
+          model,
+          elapsedMs: Date.now() - startedAt,
+          filesScanned: 0
+        };
+      }
+      const fallback = await this.fallback(source, timestamp);
+      return {
+        status: fallback.length > 0 || this.fallbackAnalyzer ? "localFallback" : "failed",
+        findings: fallback,
+        provider: this.options.provider,
+        model,
+        elapsedMs: Date.now() - startedAt,
+        errorCode: "remoteFailed",
+        filesScanned: 1
+      };
     }
   }
 
@@ -68,6 +115,13 @@ export class LlmSemanticAnalyzer implements L3AnalyzerLike {
 }
 
 export async function requestLlmSecurityReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<string> {
+  return (await requestLlmSecurityReviewWithUsage(options, prompt)).content;
+}
+
+export async function requestLlmSecurityReviewWithUsage(
+  options: LlmSemanticAnalyzerOptions,
+  prompt: string
+): Promise<LlmReviewResponse> {
   if (options.provider === "claude") {
     return requestClaudeReview(options, prompt);
   }
@@ -75,6 +129,10 @@ export async function requestLlmSecurityReview(options: LlmSemanticAnalyzerOptio
     return requestOllamaReview(options, prompt);
   }
   return requestOpenAiCompatibleReview(options, prompt);
+}
+
+export function resolveLlmModel(options: Pick<LlmSemanticAnalyzerOptions, "provider" | "model">): string {
+  return options.model ?? process.env.VIBEGUARD_LLM_MODEL ?? defaultLlmModel(options.provider);
 }
 
 export function parseLlmSecurityFindings(raw: string, source: SourceFile, timestamp: number): Finding[] {
@@ -281,9 +339,9 @@ function remoteFileLabel(filePath: string): string {
   return segment && segment !== "." && segment !== ".." ? segment : "source";
 }
 
-async function requestOpenAiCompatibleReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<string> {
+async function requestOpenAiCompatibleReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<LlmReviewResponse> {
   const body = {
-    model: options.model ?? process.env.VIBEGUARD_LLM_MODEL ?? defaultLlmModel(options.provider),
+    model: resolveLlmModel(options),
     temperature: 0,
     max_tokens: 1200,
     stream: false,
@@ -309,12 +367,15 @@ async function requestOpenAiCompatibleReview(options: LlmSemanticAnalyzerOptions
   if (!content) {
     throw new Error(`${options.provider} response did not include message content.`);
   }
-  return content;
+  return {
+    content,
+    usage: usageFromOpenAiCompatibleResponse(parsed)
+  };
 }
 
-async function requestClaudeReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<string> {
+async function requestClaudeReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<LlmReviewResponse> {
   const body = {
-    model: options.model ?? process.env.VIBEGUARD_LLM_MODEL ?? defaultLlmModel("claude"),
+    model: resolveLlmModel(options),
     max_tokens: 1200,
     temperature: 0,
     system: systemPrompt,
@@ -338,15 +399,18 @@ async function requestClaudeReview(options: LlmSemanticAnalyzerOptions, prompt: 
   if (Array.isArray(content)) {
     const text = content.map((item) => getNestedString(item, ["text"])).filter(Boolean).join("\n");
     if (text) {
-      return text;
+      return {
+        content: text,
+        usage: usageFromClaudeResponse(parsed)
+      };
     }
   }
   throw new Error("Claude response did not include text content.");
 }
 
-async function requestOllamaReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<string> {
+async function requestOllamaReview(options: LlmSemanticAnalyzerOptions, prompt: string): Promise<LlmReviewResponse> {
   const body = {
-    model: options.model ?? process.env.VIBEGUARD_LLM_MODEL ?? defaultLlmModel("local"),
+    model: resolveLlmModel(options),
     stream: false,
     format: "json",
     messages: [
@@ -372,7 +436,10 @@ async function requestOllamaReview(options: LlmSemanticAnalyzerOptions, prompt: 
   const messageContent = getNestedString(parsed, ["message", "content"]);
   const responseText = getNestedString(parsed, ["response"]);
   if (messageContent || responseText) {
-    return messageContent || responseText || "";
+    return {
+      content: messageContent || responseText || "",
+      usage: usageFromOllamaResponse(parsed)
+    };
   }
   throw new Error("Ollama response did not include message content.");
 }
@@ -382,9 +449,18 @@ async function fetchWithTimeout(
   init: RequestInit,
   options: LlmSemanticAnalyzerOptions
 ): Promise<Response> {
+  if (options.signal?.aborted) {
+    throw abortError();
+  }
   const fetchImpl = options.fetchImpl ?? fetch;
   const timeoutMs = options.timeoutMs ?? 8000;
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) {
+    abortFromCaller();
+  } else {
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, {
@@ -394,6 +470,7 @@ async function fetchWithTimeout(
     });
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -408,6 +485,45 @@ async function readJsonResponse(response: Response, provider: LlmProvider): Prom
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${provider} LLM response was not valid JSON: ${detail}`);
   }
+}
+
+function usageFromOpenAiCompatibleResponse(value: unknown): Omit<LlmUsageStats, "provider" | "model"> | undefined {
+  const usage = recordValue(recordValue(value)?.usage);
+  return usageFromValues(usage?.prompt_tokens ?? usage?.input_tokens, usage?.completion_tokens ?? usage?.output_tokens);
+}
+
+function usageFromClaudeResponse(value: unknown): Omit<LlmUsageStats, "provider" | "model"> | undefined {
+  const usage = recordValue(recordValue(value)?.usage);
+  return usageFromValues(usage?.input_tokens, usage?.output_tokens);
+}
+
+function usageFromOllamaResponse(value: unknown): Omit<LlmUsageStats, "provider" | "model"> | undefined {
+  const parsed = recordValue(value);
+  return usageFromValues(parsed?.prompt_eval_count, parsed?.eval_count);
+}
+
+function usageFromValues(input: unknown, output: unknown): Omit<LlmUsageStats, "provider" | "model"> | undefined {
+  const tokensIn = nonNegativeInteger(input);
+  const tokensOut = nonNegativeInteger(output);
+  return tokensIn === undefined && tokensOut === undefined ? undefined : { tokensIn, tokensOut };
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function abortError(): Error {
+  const error = new Error("LLM review was cancelled.");
+  error.name = "AbortError";
+  return error;
 }
 
 function normalizeLlmFinding(value: unknown, source: SourceFile, timestamp: number): Finding | undefined {

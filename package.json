@@ -32,6 +32,7 @@
     "onStartupFinished",
     "onCommand:vibeguard.scanCurrentFile",
     "onCommand:vibeguard.scanWorkspace",
+    "onCommand:vibeguard.scanWithAi",
     "onCommand:vibeguard.syncPackageCache",
     "onCommand:vibeguard.exportDashboard",
     "onCommand:vibeguard.setLlmApiKey",
@@ -42,7 +43,8 @@
     "onCommand:vibeguard.applyFindingFix",
     "onCommand:vibeguard.applyAllSafeFixes",
     "onCommand:vibeguard.applyAllProFixes",
-    "onView:vibeguardFindings"
+    "onView:vibeguardFindings",
+    "onView:vibeguardL3Panel"
   ],
   "contributes": {
     "commands": [
@@ -53,6 +55,11 @@
       {
         "command": "vibeguard.scanWorkspace",
         "title": "VibeGuard: Scan Workspace"
+      },
+      {
+        "command": "vibeguard.scanWithAi",
+        "title": "VibeGuard: Scan with AI",
+        "icon": "$(sparkle)"
       },
       {
         "command": "vibeguard.clearFindings",
@@ -330,6 +337,11 @@
         {
           "id": "vibeguardFindings",
           "name": "Findings"
+        },
+        {
+          "id": "vibeguardL3Panel",
+          "name": "AI Deep Scan",
+          "type": "webview"
         }
       ]
     }

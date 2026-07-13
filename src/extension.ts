@@ -35,12 +35,15 @@ import {
   type PackageCacheSyncTier
 } from "./package/configSync";
 import { isRequirementsManifestPath } from "./package/packageParser";
-import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
+import { defaultLlmBaseUrl, defaultLlmModel, getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
+import { runManualL3Review } from "./l3/manualReview";
 import { mergeFindingsForExecutedLayers, type ExecutedLayers } from "./layers";
+import { L3PanelProvider } from "./panel/l3PanelProvider";
+import { panelFinding, type L3PanelConfig, type L3PanelHost, type L3PanelReviewResult } from "./panel/l3PanelTypes";
 import { createPackageStorage, type PackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
 import { getProSubscriptionStatus } from "./subscription";
-import type { CodeFix, Finding, PackageRegistry, ScanPerformance, Severity, VibeGuardConfig } from "./types";
+import type { CodeFix, Finding, L3ReviewOutcome, PackageRegistry, ScanPerformance, Severity, VibeGuardConfig } from "./types";
 
 const packageRegistries: PackageRegistry[] = ["npm", "pypi", "cargo", "gomod", "maven"];
 const llmProviders: LlmProvider[] = ["deepseek", "claude", "openai", "local", "vibeguard"];
@@ -74,6 +77,7 @@ let output: vscode.OutputChannel;
 let packageVerifier: PackageVerifier;
 let packageStorage: PackageStorage;
 let findingStore: SqliteFindingStore | undefined;
+let l3Panel: L3PanelProvider;
 let packageSyncInFlight = false;
 let packageSyncProgress: ConfiguredPackageSyncProgress | undefined;
 let packageSyncTier: PackageCacheSyncTier | undefined;
@@ -110,6 +114,7 @@ export function activate(context: vscode.ExtensionContext): void {
   diagnostics = vscode.languages.createDiagnosticCollection("vibeguard");
   output = vscode.window.createOutputChannel("VibeGuard");
   findingsProvider = new FindingsProvider(findingsByUri);
+  l3Panel = new L3PanelProvider(createL3PanelHost());
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 92);
   statusBar.command = "vibeguard.openReport";
   statusBar.text = "VibeGuard";
@@ -131,9 +136,12 @@ export function activate(context: vscode.ExtensionContext): void {
     diagnostics,
     output,
     statusBar,
+    l3Panel,
     vscode.window.registerTreeDataProvider("vibeguardFindings", findingsProvider),
+    vscode.window.registerWebviewViewProvider("vibeguardL3Panel", l3Panel),
     vscode.commands.registerCommand("vibeguard.scanCurrentFile", () => scanCurrentFile()),
     vscode.commands.registerCommand("vibeguard.scanWorkspace", () => scanWorkspace()),
+    vscode.commands.registerCommand("vibeguard.scanWithAi", () => l3Panel.triggerScan()),
     vscode.commands.registerCommand("vibeguard.clearFindings", () => clearFindings()),
     vscode.commands.registerCommand("vibeguard.openReport", () => openReport()),
     vscode.commands.registerCommand("vibeguard.exportDashboard", () => exportFindingsDashboard()),
@@ -184,6 +192,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
+      l3Panel.cancelDocument(document);
       popupSeenByUri.delete(document.uri.toString());
     }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -229,11 +238,138 @@ async function scanWorkspace(): Promise<void> {
   let scanned = 0;
   for (const uri of files) {
     const document = await vscode.workspace.openTextDocument(uri);
-    await scanDocument(document, { includeL2: true, includeL3: true, replaceAll: true });
+    // Remote workspace-wide L3 review needs a separate budget and consent flow.
+    await scanDocument(document, { includeL2: true, includeL3: false, replaceAll: true });
     scanned += 1;
   }
   updateStatus();
   void vscode.window.showInformationMessage(`VibeGuard scanned ${scanned} files.`);
+}
+
+function createL3PanelHost(): L3PanelHost {
+  return {
+    activeDocument: () => {
+      const document = vscode.window.activeTextEditor?.document;
+      return document && isSupportedDocument(document) ? document : undefined;
+    },
+    config: panelConfig,
+    approveRemoteReview: approveRemoteReview,
+    review: reviewDocumentWithAi,
+    finding: (document, findingId) => (findingsByUri.get(document.uri.toString()) ?? []).find((finding) => finding.id === findingId),
+    openFinding,
+    applyFindingFix,
+    ignoreFinding,
+    configureApiKey: setLlmApiKey,
+    openSettings: async () => {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "vibeguard.llmProvider");
+    }
+  };
+}
+
+async function panelConfig(document: vscode.TextDocument): Promise<L3PanelConfig> {
+  const loadedConfig = await loadConfiguredVibeGuardConfig(document);
+  const provider = configuredLlmProvider(loadedConfig.config);
+  const model = configuredOptionalString("llmModel") ?? defaultLlmModel(provider);
+  const endpoint = provider === "vibeguard" ? defaultLlmBaseUrl(provider) : configuredOptionalString("llmBaseUrl") ?? defaultLlmBaseUrl(provider);
+  const secret = provider === "local" ? undefined : await extensionContext.secrets.get(llmSecretKey(provider));
+  const hasApiKey = provider === "local" || Boolean(secret ?? getLlmApiKeyFromEnv(provider));
+  return {
+    provider,
+    model,
+    endpoint,
+    hasApiKey,
+    remoteReviewApproved: provider === "local" || extensionContext.workspaceState.get<boolean>(remoteApprovalKey(provider, endpoint), false)
+  };
+}
+
+async function approveRemoteReview(config: L3PanelConfig): Promise<boolean> {
+  if (config.provider === "local") {
+    return true;
+  }
+  const key = remoteApprovalKey(config.provider, config.endpoint);
+  if (extensionContext.workspaceState.get<boolean>(key, false)) {
+    return true;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `VibeGuard will send the current file to ${config.provider} at ${config.endpoint} for AI security review.`,
+    { modal: true, detail: `Model: ${config.model}. Secret-like values are redacted before remote analysis, but review may still contain proprietary source code.` },
+    "Allow remote review"
+  );
+  if (choice !== "Allow remote review") {
+    return false;
+  }
+  await extensionContext.workspaceState.update(key, true);
+  return true;
+}
+
+function remoteApprovalKey(provider: LlmProvider, endpoint: string): string {
+  return `vibeguard.l3.remoteReviewApproved.${provider}.${Buffer.from(endpoint).toString("base64url")}`;
+}
+
+async function reviewDocumentWithAi(document: vscode.TextDocument, signal: AbortSignal): Promise<L3PanelReviewResult> {
+  const documentVersion = document.version;
+  const scanStartedAt = Date.now();
+  const loadedConfig = await loadConfiguredVibeGuardConfig(document);
+  const provider = configuredLlmProvider(loadedConfig.config);
+  const model = configuredOptionalString("llmModel") ?? defaultLlmModel(provider);
+  const analyzer = await createConfiguredL3Analyzer(loadedConfig.config, signal);
+  const ignoredFindingIds = [
+    ...loadedConfig.config.ignored_findings,
+    ...configuredSettingOr<string[]>("ignoredFindings", [])
+  ];
+  const outcome = await runManualL3Review({
+    source: {
+      filePath: document.uri.fsPath,
+      text: document.getText(),
+      languageId: document.languageId
+    },
+    provider,
+    model,
+    analyzer,
+    remoteApproved: provider === "local" || extensionContext.workspaceState.get<boolean>(
+      remoteApprovalKey(provider, provider === "vibeguard" ? defaultLlmBaseUrl(provider) : configuredOptionalString("llmBaseUrl") ?? defaultLlmBaseUrl(provider)),
+      false
+    ),
+    scanOptions: {
+      ignoreRules: await loadIgnoreRules(ignoreRulesPath()),
+      ignoredFindingIds,
+      dedupWithExistingTools: configuredSettingOr("dedupWithExistingTools", loadedConfig.config.dedup_with_existing_tools)
+    }
+  });
+
+  if (document.version !== documentVersion) {
+    return { outcome, findings: [], stale: true };
+  }
+  if (signal.aborted) {
+    return { outcome: cancelledOutcome(outcome), findings: [], stale: false };
+  }
+  if (outcome.status === "remote" || outcome.status === "local" || outcome.status === "localFallback") {
+    const key = document.uri.toString();
+    const existing = findingsByUri.get(key) ?? [];
+    const merged = mergeFindingsForExecutedLayers(existing, outcome.findings, { l3: true });
+    findingsByUri.set(key, merged);
+    diagnostics.set(document.uri, merged.filter((finding) => !finding.dismissed).map(findingToDiagnostic));
+    findingsProvider.refresh();
+    updateStatus();
+    void persistDocumentFindings(document, merged, scanStartedAt);
+    maybeShowCriticalPopup(document, merged);
+  }
+  return {
+    outcome,
+    findings: outcome.findings.map(panelFinding),
+    stale: false
+  };
+}
+
+function cancelledOutcome(outcome: L3ReviewOutcome): L3ReviewOutcome {
+  return {
+    status: "cancelled",
+    findings: [],
+    provider: outcome.provider,
+    model: outcome.model,
+    elapsedMs: outcome.elapsedMs,
+    filesScanned: 0
+  };
 }
 
 function clearFindings(): void {
@@ -1500,7 +1636,7 @@ async function loadConfiguredVibeGuardConfigForWorkspace(): Promise<LoadedVibeGu
   }
 }
 
-async function createConfiguredL3Analyzer(config: VibeGuardConfig): Promise<LlmSemanticAnalyzer | undefined> {
+async function createConfiguredL3Analyzer(config: VibeGuardConfig, signal?: AbortSignal): Promise<LlmSemanticAnalyzer | undefined> {
   const provider = configuredLlmProvider(config);
   const secret = provider === "local" ? undefined : await extensionContext.secrets.get(llmSecretKey(provider));
   const apiKey = secret ?? getLlmApiKeyFromEnv(provider);
@@ -1511,6 +1647,7 @@ async function createConfiguredL3Analyzer(config: VibeGuardConfig): Promise<LlmS
     provider,
     apiKey,
     model: configuredOptionalString("llmModel"),
+    signal,
     // The Pro credential must never be redirected by untrusted workspace settings.
     baseUrl: provider === "vibeguard" ? undefined : configuredOptionalString("llmBaseUrl")
   });

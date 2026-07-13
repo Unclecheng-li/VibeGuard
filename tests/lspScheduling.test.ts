@@ -435,6 +435,139 @@ test("LSP ignore code actions persist a local rule and clear the matching diagno
   assert.match(savedRules, /line: 1/);
 });
 
+test("LSP manual AI scan requires remote approval and returns a typed L3 outcome", { timeout: 10000 }, async (context) => {
+  const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-manual-l3-"));
+  const fetchHook = await writeMockL3ReplacementFetchHook(temporaryHome);
+  const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      NODE_OPTIONS: `--require=${fetchHook}`
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const client = new LspTestClient(server);
+  context.after(async () => client.stop());
+
+  const initialized = (await client.request("initialize", {
+    processId: null,
+    rootUri: null,
+    capabilities: {},
+    initializationOptions: {
+      vibeguard: {
+        autoSyncPackageCache: false,
+        packageVerification: "off",
+        enableL2: false,
+        enableL3: false,
+        llmProvider: "openai"
+      }
+    }
+  })) as { capabilities?: { executeCommandProvider?: { commands?: string[] } } };
+  assert.equal(initialized.capabilities?.executeCommandProvider?.commands?.includes("vibeguard.scanWithAi"), true);
+  client.notify("initialized", {});
+
+  const uri = pathToFileURL(path.join(temporaryHome, "manual-l3.ts")).toString();
+  client.notify("textDocument/didOpen", {
+    textDocument: {
+      uri,
+      languageId: "typescript",
+      version: 1,
+      text: "const value = unsafeInput;"
+    }
+  });
+  await client.nextDiagnostic(uri);
+
+  const consent = (await client.request("workspace/executeCommand", {
+    command: "vibeguard.scanWithAi",
+    arguments: [{ uri }]
+  })) as { outcome?: { status?: string; errorCode?: string } };
+  assert.equal(consent.outcome?.status, "consentRequired");
+  assert.equal(consent.outcome?.errorCode, "consentRequired");
+
+  client.notify("workspace/didChangeConfiguration", {
+    settings: {
+      vibeguard: {
+        autoSyncPackageCache: false,
+        packageVerification: "off",
+        enableL2: false,
+        enableL3: false,
+        llmProvider: "local",
+        llmBaseUrl: "http://localhost:11434"
+      }
+    }
+  });
+  const manual = (await client.request("workspace/executeCommand", {
+    command: "vibeguard.scanWithAi",
+    arguments: [{ uri, remoteApproved: true }]
+  })) as { outcome?: { status?: string; findings?: Array<{ detection_rule?: string }> }; stale?: boolean };
+  assert.equal(manual.stale, false);
+  assert.equal(manual.outcome?.status, "local");
+  assert.equal(manual.outcome?.findings?.some((finding) => finding.detection_rule === "l3_llm_reviewed_replacement"), true);
+});
+
+test("LSP cancels an in-flight manual L3 review through its command protocol", { timeout: 10000 }, async (context) => {
+  const temporaryHome = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-manual-cancel-"));
+  const fetchHook = await writeAbortableL3FetchHook(temporaryHome);
+  const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: temporaryHome,
+      USERPROFILE: temporaryHome,
+      OPENAI_API_KEY: "test-key",
+      NODE_OPTIONS: `--require=${fetchHook}`
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const client = new LspTestClient(server);
+  context.after(async () => client.stop());
+
+  const initialized = (await client.request("initialize", {
+    processId: null,
+    rootUri: null,
+    capabilities: {},
+    initializationOptions: {
+      vibeguard: {
+        autoSyncPackageCache: false,
+        packageVerification: "off",
+        enableL2: false,
+        enableL3: false,
+        llmProvider: "openai"
+      }
+    }
+  })) as { capabilities?: { executeCommandProvider?: { commands?: string[] } } };
+  assert.equal(initialized.capabilities?.executeCommandProvider?.commands?.includes("vibeguard.cancelAiScan"), true);
+  client.notify("initialized", {});
+
+  const uri = pathToFileURL(path.join(temporaryHome, "manual-l3-cancel.ts")).toString();
+  client.notify("textDocument/didOpen", {
+    textDocument: {
+      uri,
+      languageId: "typescript",
+      version: 1,
+      text: "const value = unsafeInput;"
+    }
+  });
+  await client.nextDiagnostic(uri);
+
+  const reviewId = client.startRequest("workspace/executeCommand", {
+    command: "vibeguard.scanWithAi",
+    arguments: [{ uri, remoteApproved: true }]
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const cancelled = (await client.request("workspace/executeCommand", {
+    command: "vibeguard.cancelAiScan",
+    arguments: [{ uri }]
+  })) as { cancelled?: boolean };
+  assert.equal(cancelled.cancelled, true);
+
+  const review = (await client.waitForResponse(reviewId)) as { outcome?: { status?: string; findings?: unknown[] } };
+  assert.equal(review.outcome?.status, "cancelled");
+  assert.deepEqual(review.outcome?.findings, []);
+});
+
 test("LSP runs local L3 immediately when a document is saved", { timeout: 10000 }, async (context) => {
   const temporaryHome = await import("node:fs/promises").then((fs) => fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-lsp-")));
   const server = spawn(process.execPath, [path.resolve("out/src/lspServer.js"), "--stdio"], {
@@ -875,9 +1008,28 @@ async function writeMockL3ReplacementFetchHook(temporaryHome: string): Promise<s
   return fetchHook;
 }
 
+async function writeAbortableL3FetchHook(temporaryHome: string): Promise<string> {
+  const fetchHook = path.join(temporaryHome, "mock-abortable-l3-fetch.cjs");
+  await fs.writeFile(
+    fetchHook,
+    `globalThis.fetch = async (_input, init) => new Promise((_resolve, reject) => {
+  const signal = init && init.signal;
+  const abort = () => reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+  if (signal && signal.aborted) {
+    abort();
+    return;
+  }
+  signal && signal.addEventListener("abort", abort, { once: true });
+});\n`,
+    "utf8"
+  );
+  return fetchHook;
+}
+
 class LspTestClient {
   private buffer = "";
   private readonly messages: JsonRpcMessage[] = [];
+  private readonly responses = new Map<number, JsonRpcMessage>();
   private readonly stderr: string[] = [];
   private nextId = 1;
   private cursor = 0;
@@ -901,8 +1053,19 @@ class LspTestClient {
   }
 
   async waitForResponse(id: number): Promise<unknown> {
-    const message = await this.waitFor((item) => item.id === id);
-    return message.result;
+    const timeoutAt = Date.now() + 8000;
+    while (Date.now() < timeoutAt) {
+      const message = this.responses.get(id);
+      if (message) {
+        this.responses.delete(id);
+        return message.result;
+      }
+      if (this.server.exitCode !== null) {
+        assert.fail(`VibeGuard LSP exited unexpectedly: ${this.stderr.join("")}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`Timed out waiting for LSP response. stderr: ${this.stderr.join("")}`);
   }
 
   notify(method: string, params: Record<string, unknown>): void {
@@ -1015,6 +1178,9 @@ class LspTestClient {
       this.buffer = this.buffer.slice(start + length);
       const message = JSON.parse(body) as JsonRpcMessage;
       this.messages.push(message);
+      if (typeof message.id === "number" && !message.method) {
+        this.responses.set(message.id, message);
+      }
       if (message.method === "window/workDoneProgress/create" && message.id !== undefined) {
         this.send({ jsonrpc: "2.0", id: message.id, result: null });
       }

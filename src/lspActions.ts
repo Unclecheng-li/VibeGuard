@@ -4,6 +4,8 @@ import type { Finding } from "./types";
 export const lspIgnoreFindingCommand = "vibeguard.ignoreFinding";
 export const lspApplyFixCommand = "vibeguard.applyFix";
 export const lspApplyL3FixCommand = "vibeguard.applyL3Fix";
+export const lspManualL3ReviewCommand = "vibeguard.scanWithAi";
+export const lspCancelManualL3ReviewCommand = "vibeguard.cancelAiScan";
 export type LspIgnoreScope = "line" | "file" | "global" | "package";
 
 export interface LspIgnoreFindingCommandArgument {
@@ -18,6 +20,10 @@ export interface LspApplyL3FixCommandArgument {
 
 export interface LspApplyFixCommandArgument extends LspApplyL3FixCommandArgument {
   fixIndex: number;
+}
+
+export interface LspCancelManualL3ReviewCommandArgument {
+  uri: string;
 }
 
 export function createCodeActionsForFindings(uri: string, findings: Finding[], diagnostics: Diagnostic[]): CodeAction[] {

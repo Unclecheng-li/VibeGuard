@@ -17,5 +17,9 @@
   <extensions defaultExtensionNs="com.intellij">
     <platform.lsp.serverSupportProvider
         implementation="dev.vibeguard.jetbrains.VibeGuardLspServerSupportProvider"/>
+    <toolWindow id="VibeGuard"
+                anchor="right"
+                icon="dev.vibeguard.jetbrains.icons.VibeGuardIcons.ToolWindow"
+                factoryClass="dev.vibeguard.jetbrains.ui.VibeGuardToolWindowFactory"/>
   </extensions>
 </idea-plugin>

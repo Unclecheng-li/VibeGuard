@@ -20,6 +20,28 @@ export type DetectionLayer = "L1" | "L2" | "L3";
 
 export type PackageRegistry = "npm" | "pypi" | "cargo" | "gomod" | "maven";
 
+export type LlmProvider = "deepseek" | "claude" | "openai" | "local" | "vibeguard";
+
+export type L3ReviewStatus = "remote" | "local" | "localFallback" | "notConfigured" | "consentRequired" | "cancelled" | "failed";
+
+export interface LlmUsageStats {
+  provider: LlmProvider;
+  model: string;
+  tokensIn?: number;
+  tokensOut?: number;
+}
+
+export interface L3ReviewOutcome {
+  status: L3ReviewStatus;
+  findings: Finding[];
+  provider: LlmProvider;
+  model: string;
+  elapsedMs: number;
+  usage?: LlmUsageStats;
+  errorCode?: "notConfigured" | "consentRequired" | "remoteFailed";
+  filesScanned: number;
+}
+
 export interface TextEdit {
   startLine: number;
   startColumn: number;
@@ -206,7 +228,7 @@ export interface VibeGuardConfig {
     l3: boolean;
   };
   package_verification: "off" | "seed" | "remote";
-  llm_provider?: "deepseek" | "claude" | "openai" | "local" | "vibeguard";
+  llm_provider?: LlmProvider;
   llm_api_key_stored?: boolean;
   llm_api_key?: null;
   dedup_with_existing_tools: boolean;

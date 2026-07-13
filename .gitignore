@@ -1,12 +1,44 @@
+# Dependencies
 node_modules/
+
+# Build output
 out/
 dist/
+
+# VSIX packages
 *.vsix
+
+# Test / coverage
 .vscode-test/
-.DS_Store
-npm-debug.log*
 coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+npm-debug.log*
+*.log
+
+# Rust
 rust-lsp/target/
+
+# VibeGuard local data
 .vibeguard/
+
+# JetBrains
 jetbrains/.gradle/
 jetbrains/build/
+jetbrains/.intellijPlatform/
+
+# IDE temporary files
+.idea/
+*.iml
+.vscode/*.tmp
+
+# Docs (internal)
+doc/
+
+# Environment files
+*.env
+!*.env.example

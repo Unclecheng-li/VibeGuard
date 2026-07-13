@@ -24,15 +24,19 @@ import { loadCustomRules } from "./customRules";
 import { redactedSecretFixStillMatchesSource } from "./fixValidation";
 import { appendIgnoreRule, defaultIgnoreRulesPath, ensureIgnoreRulesFile, loadIgnoreRules, scopedIgnoreReason } from "./ignore";
 import { readStoredLlmCredential } from "./l3/credentials";
-import { getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
+import { defaultLlmBaseUrl, defaultLlmModel, getLlmApiKeyFromEnv, LlmSemanticAnalyzer, type LlmProvider } from "./l3/llm";
+import { runManualL3Review } from "./l3/manualReview";
 import { mergeFindingsForExecutedLayers, type ExecutedLayers } from "./layers";
 import {
   createCodeActionsForFindings,
   lspApplyFixCommand,
   lspApplyL3FixCommand,
+  lspCancelManualL3ReviewCommand,
   lspIgnoreFindingCommand,
+  lspManualL3ReviewCommand,
   type LspApplyFixCommandArgument,
   type LspApplyL3FixCommandArgument,
+  type LspCancelManualL3ReviewCommandArgument,
   type LspIgnoreFindingCommandArgument,
   type LspIgnoreScope
 } from "./lspActions";
@@ -46,7 +50,7 @@ import { isRequirementsManifestPath } from "./package/packageParser";
 import { PackageVerifier } from "./package/packageVerifier";
 import { createPackageStorage } from "./package/storage";
 import { scanSourceFile } from "./scanner";
-import type { CodeFix, Finding, PackageRegistry, Severity, VibeGuardConfig } from "./types";
+import type { CodeFix, Finding, L3ReviewOutcome, PackageRegistry, Severity, VibeGuardConfig } from "./types";
 
 interface LspSettings {
   enabled: boolean;
@@ -100,6 +104,7 @@ const l3Timers = new Map<string, NodeJS.Timeout>();
 const remotePackageTimers = new Map<string, NodeJS.Timeout>();
 const documentRevisions = new Map<string, number>();
 const criticalPopupSeenByUri = new Map<string, Set<string>>();
+const manualL3Controllers = new Map<string, AbortController>();
 let workspaceRoots: string[] = [];
 let packageSyncInFlight = false;
 let packageSyncQueued = false;
@@ -119,7 +124,13 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         codeActionKinds: [CodeActionKind.QuickFix]
       },
       executeCommandProvider: {
-        commands: [lspIgnoreFindingCommand, lspApplyFixCommand, lspApplyL3FixCommand]
+        commands: [
+          lspIgnoreFindingCommand,
+          lspApplyFixCommand,
+          lspApplyL3FixCommand,
+          lspManualL3ReviewCommand,
+          lspCancelManualL3ReviewCommand
+        ]
       }
     },
     serverInfo: {
@@ -155,6 +166,8 @@ documents.onDidSave((event) => {
 
 documents.onDidClose((event) => {
   clearDocumentTimers(event.document.uri);
+  manualL3Controllers.get(event.document.uri)?.abort();
+  manualL3Controllers.delete(event.document.uri);
   documentRevisions.delete(event.document.uri);
   findingsByUri.delete(event.document.uri);
   criticalPopupSeenByUri.delete(event.document.uri);
@@ -169,7 +182,7 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
   return createCodeActionsForFindings(params.textDocument.uri, findings, params.context.diagnostics);
 });
 
-connection.onExecuteCommand(async (params: ExecuteCommandParams): Promise<void> => {
+connection.onExecuteCommand(async (params: ExecuteCommandParams): Promise<unknown> => {
   if (params.command === lspIgnoreFindingCommand) {
     await executeLspIgnoreFinding(params.arguments?.[0]);
     return;
@@ -180,8 +193,152 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams): Promise<void> 
   }
   if (params.command === lspApplyL3FixCommand) {
     await executeLspL3Fix(params.arguments?.[0]);
+    return;
+  }
+  if (params.command === lspManualL3ReviewCommand) {
+    return executeLspManualL3Review(params.arguments?.[0]);
+  }
+  if (params.command === lspCancelManualL3ReviewCommand) {
+    return executeLspCancelManualL3Review(params.arguments?.[0]);
   }
 });
+
+interface LspManualL3ReviewArgument {
+  uri: string;
+  remoteApproved?: boolean;
+}
+
+interface LspManualL3ReviewResult {
+  outcome: L3ReviewOutcome;
+  stale: boolean;
+  endpoint: string;
+}
+
+async function executeLspManualL3Review(value: unknown): Promise<LspManualL3ReviewResult> {
+  const argument = parseLspManualL3ReviewArgument(value);
+  const provider = settings.llmProvider ?? "deepseek";
+  const model = settings.llmModel ?? defaultLlmModel(provider);
+  const endpoint = provider === "vibeguard" ? defaultLlmBaseUrl(provider) : settings.llmBaseUrl ?? defaultLlmBaseUrl(provider);
+  if (!argument) {
+    return unavailableManualL3Review(provider, model, endpoint, "Remote review requires a valid open document URI.");
+  }
+  const document = documents.get(argument.uri);
+  if (!document) {
+    return unavailableManualL3Review(provider, model, endpoint, "Open the file in the editor before starting an AI deep scan.");
+  }
+  if (!settings.enabled) {
+    return unavailableManualL3Review(provider, model, endpoint, "VibeGuard scanning is disabled for this workspace.");
+  }
+  if (provider !== "local" && argument.remoteApproved !== true) {
+    return {
+      outcome: {
+        status: "consentRequired",
+        findings: [],
+        provider,
+        model,
+        elapsedMs: 0,
+        errorCode: "consentRequired",
+        filesScanned: 0
+      },
+      stale: false,
+      endpoint
+    };
+  }
+
+  manualL3Controllers.get(document.uri)?.abort();
+  const controller = new AbortController();
+  manualL3Controllers.set(document.uri, controller);
+  try {
+    const documentVersion = document.version;
+    const analyzer = await createLspL3Analyzer(true, controller.signal);
+    const outcome = await runManualL3Review({
+      source: {
+        filePath: filePathFromUri(document.uri),
+        text: document.getText(),
+        languageId: document.languageId
+      },
+      provider,
+      model,
+      analyzer,
+      remoteApproved: provider === "local" || argument.remoteApproved === true,
+      scanOptions: {
+        ignoreRules: await loadIgnoreRules(settings.ignoreRulesPath?.trim() || defaultIgnoreRulesPath()),
+        ignoredFindingIds: settings.ignoredFindings,
+        dedupWithExistingTools: settings.dedupWithExistingTools
+      }
+    });
+    if (documents.get(document.uri)?.version !== documentVersion) {
+      return { outcome, stale: true, endpoint };
+    }
+    if (outcome.status === "remote" || outcome.status === "local" || outcome.status === "localFallback") {
+      const existing = findingsByUri.get(document.uri) ?? [];
+      const findings = mergeFindingsForExecutedLayers(existing, outcome.findings, { l3: true });
+      findingsByUri.set(document.uri, findings);
+      connection.sendDiagnostics({
+        uri: document.uri,
+        diagnostics: findings.filter((finding) => !finding.dismissed).map(toDiagnostic)
+      });
+      maybeShowCriticalPopup(document.uri, findings);
+    }
+    return { outcome, stale: false, endpoint };
+  } finally {
+    if (manualL3Controllers.get(document.uri) === controller) {
+      manualL3Controllers.delete(document.uri);
+    }
+  }
+}
+
+function parseLspManualL3ReviewArgument(value: unknown): LspManualL3ReviewArgument | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input.uri !== "string" || input.uri.length === 0 || input.uri.length > 4096) {
+    return undefined;
+  }
+  return {
+    uri: input.uri,
+    remoteApproved: input.remoteApproved === true
+  };
+}
+
+function executeLspCancelManualL3Review(value: unknown): { cancelled: boolean } {
+  const argument = parseLspCancelManualL3ReviewArgument(value);
+  if (!argument) {
+    return { cancelled: false };
+  }
+  const controller = manualL3Controllers.get(argument.uri);
+  if (!controller) {
+    return { cancelled: false };
+  }
+  controller.abort();
+  return { cancelled: true };
+}
+
+function parseLspCancelManualL3ReviewArgument(value: unknown): LspCancelManualL3ReviewCommandArgument | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const uri = (value as Record<string, unknown>).uri;
+  return typeof uri === "string" && uri.length > 0 && uri.length <= 4096 ? { uri } : undefined;
+}
+
+function unavailableManualL3Review(provider: LlmProvider, model: string, endpoint: string, message: string): LspManualL3ReviewResult {
+  connection.console.warn(`VibeGuard AI deep scan unavailable: ${message}`);
+  return {
+    outcome: {
+      status: "failed",
+      findings: [],
+      provider,
+      model,
+      elapsedMs: 0,
+      errorCode: "remoteFailed",
+      filesScanned: 0
+    },
+    stale: false,
+    endpoint
+  };
+}
 
 async function executeLspIgnoreFinding(value: unknown): Promise<void> {
   const argument = parseLspIgnoreCommandArgument(value);
@@ -1070,8 +1227,8 @@ async function loadConfiguredCustomRules() {
   }
 }
 
-async function createLspL3Analyzer(): Promise<LlmSemanticAnalyzer | undefined> {
-  if (!settings.enableL3) {
+async function createLspL3Analyzer(allowManual = false, signal?: AbortSignal): Promise<LlmSemanticAnalyzer | undefined> {
+  if (!settings.enableL3 && !allowManual) {
     return undefined;
   }
   const provider = settings.llmProvider ?? "deepseek";
@@ -1085,6 +1242,7 @@ async function createLspL3Analyzer(): Promise<LlmSemanticAnalyzer | undefined> {
     provider,
     apiKey,
     model: settings.llmModel,
+    signal,
     // LSP settings may come from a workspace; keep a Pro credential on its configured service origin.
     baseUrl: provider === "vibeguard" ? undefined : settings.llmBaseUrl
   });
