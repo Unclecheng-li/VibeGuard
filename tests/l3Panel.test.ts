@@ -36,7 +36,11 @@ test("VSCode registers the AI Deep Scan panel and preserves L1/L2 while replacin
   ]);
   const packageJson = JSON.parse(manifest) as {
     activationEvents: string[];
-    contributes: { commands: Array<{ command: string }>; views: Record<string, Array<{ id: string; type?: string }>> };
+    contributes: {
+      commands: Array<{ command: string }>;
+      views: Record<string, Array<{ id: string; type?: string }>>;
+      viewsContainers: { activitybar: Array<{ id: string; icon: string }> };
+    };
   };
 
   assert.match(extension, /registerWebviewViewProvider\("vibeguardL3Panel", l3Panel\)/);
@@ -49,4 +53,7 @@ test("VSCode registers the AI Deep Scan panel and preserves L1/L2 while replacin
   assert.equal(packageJson.activationEvents.includes("onView:vibeguardL3Panel"), true);
   assert.equal(packageJson.contributes.commands.some((command) => command.command === "vibeguard.scanWithAi"), true);
   assert.equal(packageJson.contributes.views.vibeguard.some((view) => view.id === "vibeguardL3Panel" && view.type === "webview"), true);
+  const activityBar = packageJson.contributes.viewsContainers.activitybar.find((container) => container.id === "vibeguard");
+  assert.equal(activityBar?.icon, "media/VibeGuardIcon.svg");
+  await fs.access(activityBar?.icon ?? "");
 });
