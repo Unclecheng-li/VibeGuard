@@ -9,10 +9,10 @@
 <p>Catch what AI missed — hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes — right in your editor, in real time.</p>
 
 <p>
-  <a href="https://github.com/vibeguard/vibeguard/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/vibeguard/vibeguard/ci.yml?branch=main&logo=github&label=CI" alt="CI"></a>
-  <a href="https://github.com/vibeguard/vibeguard/releases"><img src="https://img.shields.io/github/v/release/vibeguard/vibeguard?display_name=tag&logo=github" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/vibeguard/vibeguard?color=blue" alt="License"></a>
-  <a href="https://github.com/vibeguard/vibeguard/stargazers"><img src="https://img.shields.io/github/stars/vibeguard/vibeguard?style=social" alt="Stars"></a>
+  <a href="https://github.com/Unclecheng-li/VibeGuard/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Unclecheng-li/VibeGuard/ci.yml?branch=main&logo=github&label=CI" alt="CI"></a>
+  <a href="https://github.com/Unclecheng-li/VibeGuard/releases"><img src="https://img.shields.io/github/v/release/Unclecheng-li/VibeGuard?display_name=tag&logo=github" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Unclecheng-li/VibeGuard?color=blue" alt="License"></a>
+  <a href="https://github.com/Unclecheng-li/VibeGuard/stargazers"><img src="https://img.shields.io/github/stars/Unclecheng-li/VibeGuard?style=social" alt="Stars"></a>
 </p>
 
 <p>
