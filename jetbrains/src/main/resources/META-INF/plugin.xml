@@ -2,6 +2,7 @@
   <id>dev.vibeguard.jetbrains</id>
   <name>VibeGuard</name>
   <vendor url="https://github.com/vibeguard/vibeguard">VibeGuard</vendor>
+  <icon>icon.png</icon>
 
   <description><![CDATA[
     <p>VibeGuard scans AI-generated code for hallucinated dependencies, hardcoded secrets,

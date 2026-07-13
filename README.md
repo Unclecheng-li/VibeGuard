@@ -27,6 +27,31 @@
 
 ---
 
+## Screenshots
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>Real-time diagnostics</b></td>
+<td align="center"><b>Hover for details</b></td>
+</tr>
+<tr>
+<td><img src="media/demonstration%20png/1-Underline%20the%20error%20with%20a%20wavy%20line..png" alt="Real-time diagnostics" width="400"></td>
+<td><img src="media/demonstration%20png/2.png" alt="Hover tooltip" width="400"></td>
+</tr>
+<tr>
+<td align="center"><b>Quick Fix menu</b></td>
+<td align="center"><b>Problems panel</b></td>
+</tr>
+<tr>
+<td><img src="media/demonstration%20png/3-QuickFix.png" alt="Quick Fix menu" width="400"></td>
+<td><img src="media/demonstration%20png/4-viewproblem.png" alt="Problems panel" width="400"></td>
+</tr>
+</table>
+</div>
+
+---
+
 ## Why VibeGuard?
 
 AI coding assistants are fast — but they hallucinate packages, leak secrets, and skip security controls. VibeGuard catches those mistakes **as you type**, before they reach production.

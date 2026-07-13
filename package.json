@@ -1,9 +1,9 @@
 {
-  "name": "vibeguard",
-  "displayName": "VibeGuard",
+  "name": "vibeguard-security",
+  "displayName": "VibeGuard AI Security",
   "description": "AI-generated code security scanner for hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes.",
-  "version": "0.1.0",
-  "publisher": "vibeguard",
+  "version": "0.1.1",
+  "publisher": "unclecheng",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,6 +11,7 @@
   },
   "private": true,
   "type": "commonjs",
+  "icon": "media/VibeGuardIcon.png",
   "main": "./dist/extension.js",
   "bin": {
     "vibeguard": "./dist/cli.js",
@@ -22,7 +23,7 @@
   "categories": [
     "Linters",
     "Programming Languages",
-    "Security"
+    "Other"
   ],
   "extensionKind": [
     "workspace"
