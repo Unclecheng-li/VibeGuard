@@ -2,7 +2,7 @@
   "name": "vibeguard-security",
   "displayName": "VibeGuard AI Security",
   "description": "AI-generated code security scanner for hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "unclecheng",
   "license": "MIT",
   "repository": {
@@ -328,7 +328,7 @@
         {
           "id": "vibeguard",
           "title": "VibeGuard",
-          "icon": "media/VibeGuardIcon.svg"
+          "icon": "$(shield)"
         }
       ]
     },
@@ -353,7 +353,7 @@
     "test": "node scripts/assert-node-lts.js && npm run compile && node --test \"out/tests/**/*.test.js\"",
     "lint": "tsc --noEmit -p ./",
     "vscode:prepublish": "npm run build",
-    "package:vsix": "vsce package --out vibeguard-0.1.0.vsix"
+    "package:vsix": "node scripts/package-vsix.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

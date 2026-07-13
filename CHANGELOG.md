@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5
+
+- Fixed the VibeGuard VS Code Activity Bar entry by using the platform-provided shield icon instead of an extension SVG resource that could be absent or fail to render.
+- Release packaging now names VSIX files from the package version instead of a stale hard-coded version.
+
 ## 0.1.0
 
 - Initial VibeGuard MVP extension package.

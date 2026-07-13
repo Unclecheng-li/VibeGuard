@@ -29,10 +29,11 @@ test("L3 panel HTML uses a restrictive CSP and text-only finding rendering", () 
 });
 
 test("VSCode registers the AI Deep Scan panel and preserves L1/L2 while replacing L3", async () => {
-  const [extension, manifest, provider] = await Promise.all([
+  const [extension, manifest, provider, packageScript] = await Promise.all([
     fs.readFile("src/extension.ts", "utf8"),
     fs.readFile("package.json", "utf8"),
-    fs.readFile("src/panel/l3PanelProvider.ts", "utf8")
+    fs.readFile("src/panel/l3PanelProvider.ts", "utf8"),
+    fs.readFile("scripts/package-vsix.js", "utf8")
   ]);
   const packageJson = JSON.parse(manifest) as {
     activationEvents: string[];
@@ -54,6 +55,8 @@ test("VSCode registers the AI Deep Scan panel and preserves L1/L2 while replacin
   assert.equal(packageJson.contributes.commands.some((command) => command.command === "vibeguard.scanWithAi"), true);
   assert.equal(packageJson.contributes.views.vibeguard.some((view) => view.id === "vibeguardL3Panel" && view.type === "webview"), true);
   const activityBar = packageJson.contributes.viewsContainers.activitybar.find((container) => container.id === "vibeguard");
-  assert.equal(activityBar?.icon, "media/VibeGuardIcon.svg");
-  await fs.access(activityBar?.icon ?? "");
+  assert.equal(activityBar?.icon, "$(shield)");
+  assert.match(packageScript, /vibeguard-\$\{version\}\.vsix/);
+  assert.match(packageScript, /process\.platform === "win32" \? "npm\.cmd" : "npm"/);
+  assert.match(packageScript, /shell: process\.platform === "win32"/);
 });
