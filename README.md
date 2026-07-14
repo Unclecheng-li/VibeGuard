@@ -4,7 +4,7 @@
 
 <h1>VibeGuard</h1>
 
-Uploading VibeGuard brand video.mp4…
+https://github.com/user-attachments/assets/2eaa5b6a-20f4-462f-8f3b-4a5c74c56542
 
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
 
