@@ -4,8 +4,6 @@
 
 <h1>VibeGuard</h1>
 
-https://github.com/user-attachments/assets/2eaa5b6a-20f4-462f-8f3b-4a5c74c56542
-
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
 
 <p>Catch what AI missed — hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes — right in your editor, in real time.</p>
@@ -51,6 +49,8 @@ https://github.com/user-attachments/assets/2eaa5b6a-20f4-462f-8f3b-4a5c74c56542
 </tr>
 </table>
 </div>
+
+https://github.com/user-attachments/assets/2eaa5b6a-20f4-462f-8f3b-4a5c74c56542
 
 ---
 
