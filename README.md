@@ -6,6 +6,10 @@
 
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
 
+<br>
+Official Website：https://unclecheng-li.github.io/vibeguard.com/
+<br>
+
 <p>Catch what AI missed — hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes — right in your editor, in real time.</p>
 
 <p>
