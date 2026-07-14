@@ -6,7 +6,6 @@
 
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
 
-<br>
 Official Website：https://unclecheng-li.github.io/vibeguard.com/
 <br>
 
