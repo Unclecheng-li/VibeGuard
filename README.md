@@ -5,9 +5,7 @@
 <h1>VibeGuard</h1>
 
 <p>
-  <video src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/VibeGuard%20brand%20video.mp4" width="640" controls muted autoplay loop>
-    Your browser does not support the video tag.
-  </video>
+  <img src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/vibeguard-brand.gif" width="640" alt="VibeGuard Brand Video">
 </p>
 
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
