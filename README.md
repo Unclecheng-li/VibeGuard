@@ -4,6 +4,12 @@
 
 <h1>VibeGuard</h1>
 
+<p>
+  <video src="https://raw.githubusercontent.com/Unclecheng-li/VibeGuard/main/media/VibeGuard%20brand%20video.mp4" width="640" controls muted autoplay loop>
+    Your browser does not support the video tag.
+  </video>
+</p>
+
 <p><strong>IDE-first security scanner for AI-generated code</strong></p>
 
 <p>Catch what AI missed — hallucinated packages, hardcoded secrets, unsafe configs, and common AI coding mistakes — right in your editor, in real time.</p>
